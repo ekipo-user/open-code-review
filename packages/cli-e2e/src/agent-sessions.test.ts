@@ -394,9 +394,14 @@ describe("ocr session liveness sweep", () => {
 
   it("leaves a row whose heartbeat was just bumped untouched", async () => {
     const project = tracked(createInitializedProject());
+    // 5s threshold (vs the 1s used in the orphan-path test) buys headroom
+    // for the beat → next start-instance window on slow CI runners. With
+    // 1s, two sequential CLI invocations (~700-800ms each on hosted
+    // macOS/Ubuntu) push the sweep past the threshold and the row gets
+    // wrongly reclassified.
     writeConfigYaml(
       project,
-      `runtime:\n  agent_heartbeat_seconds: 1\n`,
+      `runtime:\n  agent_heartbeat_seconds: 5\n`,
     );
 
     const workflowId = await initWorkflow(project);
@@ -418,7 +423,10 @@ describe("ocr session liveness sweep", () => {
     );
     const agentId = start.stdout.trim();
 
-    await new Promise((r) => setTimeout(r, 2_500));
+    // Wait past the threshold so the original heartbeat is unambiguously
+    // stale; the test then proves that `session beat` revives the row
+    // before the next sweep would orphan it.
+    await new Promise((r) => setTimeout(r, 6_000));
     // Bump heartbeat — row should NOT be reclassified
     await spawnCli(["session", "beat", agentId], { cwd: project.dir });
 
