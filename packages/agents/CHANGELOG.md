@@ -1,3 +1,7 @@
+## 1.11.0 (2026-05-06)
+
+This was a version bump only for agents to align it with other projects, there were no code changes.
+
 ## 1.10.4 (2026-04-07)
 
 This was a version bump only for agents to align it with other projects, there were no code changes.

@@ -1,6 +1,6 @@
 {
   "name": "@open-code-review/cli",
-  "version": "1.10.4",
+  "version": "1.11.0",
   "description": "CLI for Open Code Review - Multi-environment setup and progress tracking",
   "type": "module",
   "bin": {

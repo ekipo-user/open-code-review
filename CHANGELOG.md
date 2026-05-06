@@ -1,3 +1,41 @@
+## 1.11.0 (2026-05-06)
+
+### 🚀 Features
+
+- **cli:** ocr session subcommands for AI lifecycle journaling ([ca9c8a3](https://github.com/spencermarx/open-code-review/commit/ca9c8a3))
+- **cli:** ocr models list with bundled fallbacks per vendor ([14753cb](https://github.com/spencermarx/open-code-review/commit/14753cb))
+- **cli:** ocr team resolve/set with three-form schema ([bb290d2](https://github.com/spencermarx/open-code-review/commit/bb290d2))
+- **cli:** ocr review --resume support ([41ef300](https://github.com/spencermarx/open-code-review/commit/41ef300))
+- **cli:** shared vendor-resume helper for argv + display strings ([80f7377](https://github.com/spencermarx/open-code-review/commit/80f7377))
+- **cli/db:** collapse agent_sessions journal into command_executions ([17fb83f](https://github.com/spencermarx/open-code-review/commit/17fb83f))
+- **cli/db:** single-owner workflow_id linkage + durable spawn marker ([e3e2b55](https://github.com/spencermarx/open-code-review/commit/e3e2b55))
+- **dashboard:** ai-cli adapter listModels + per-task model + workflow session_id capture ([5e0f06c](https://github.com/spencermarx/open-code-review/commit/5e0f06c))
+- **dashboard:** agent-sessions API, handoff route, WAL hygiene, sweep ([34e7a8e](https://github.com/spencermarx/open-code-review/commit/34e7a8e))
+- **dashboard:** team config API and hooks ([4b676b6](https://github.com/spencermarx/open-code-review/commit/4b676b6))
+- **dashboard/server:** adapter contract for resume + per-task model ([42d2ad0](https://github.com/spencermarx/open-code-review/commit/42d2ad0))
+- **dashboard/server:** SessionCaptureService façade + thin handoff route ([861275e](https://github.com/spencermarx/open-code-review/commit/861275e))
+- **dashboard/server:** per-execution event journal + events API ([2824863](https://github.com/spencermarx/open-code-review/commit/2824863))
+- **dashboard/server:** durable spawn lifecycle + UTF-8 safety + prompt-injection guards ([87e2a5d](https://github.com/spencermarx/open-code-review/commit/87e2a5d))
+- **dashboard/server:** normalize final.md verdict labels ([283332b](https://github.com/spencermarx/open-code-review/commit/283332b))
+- **dashboard/ui:** ModelSelect dropdown matching design system ([1317605](https://github.com/spencermarx/open-code-review/commit/1317605))
+- **dashboard/ui:** default team management on the Team page ([1ca4b94](https://github.com/spencermarx/open-code-review/commit/1ca4b94))
+- **dashboard/ui:** session liveness, resume, and terminal-handoff panel ([8a26bbe](https://github.com/spencermarx/open-code-review/commit/8a26bbe))
+- **dashboard/ui:** command-history surfaces stalled/orphaned + terminal handoff ([f037432](https://github.com/spencermarx/open-code-review/commit/f037432))
+- **dashboard/ui:** live event-stream timeline renderer ([8ddff99](https://github.com/spencermarx/open-code-review/commit/8ddff99))
+- **dashboard/ui:** terminal-handoff panel + structured failure rendering ([a8460eb](https://github.com/spencermarx/open-code-review/commit/a8460eb))
+
+### 🩹 Fixes
+
+- **dashboard:** vite proxy logger filters benign EPIPE/ECONNRESET noise ([d94e4ba](https://github.com/spencermarx/open-code-review/commit/d94e4ba))
+- **dashboard:** vitest resolves @open-code-review/cli/vendor-resume to source ([ee90acf](https://github.com/spencermarx/open-code-review/commit/ee90acf))
+- **dashboard:** esbuild resolves @open-code-review/cli/* via source condition ([9765620](https://github.com/spencermarx/open-code-review/commit/9765620))
+- **dashboard/server:** syncAgentSessions detects workflow_id + vendor_session_id changes ([3ce00c3](https://github.com/spencermarx/open-code-review/commit/3ce00c3))
+
+### ❤️ Thank You
+
+- claude-flow @agentic-org
+- Spencer Marx
+
 ## 1.10.4 (2026-04-07)
 
 ### 🩹 Fixes

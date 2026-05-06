@@ -10,7 +10,7 @@ compatibility: |
   environments. Requires git. Optional: gh CLI for GitHub integration.
 metadata:
   author: spencermarx
-  version: "1.10.4" # double quotes required — automated sync via nx release
+  version: "1.11.0" # double quotes required — automated sync via nx release
   repository: https://github.com/spencermarx/open-code-review
 ---
 
