@@ -36,6 +36,24 @@ ocr dashboard --no-open        # Don't auto-open browser
   <img src="../../assets/ocr-tool-manage-reviewers-team.png" alt="OCR Team page for managing reviewer personas" width="700" />
 </p>
 
+- **Default team composition** — Pick which personas show up on every review and how many instances of each. Saved to `.ocr/config.yaml`.
+
+<p align="center">
+  <img src="../../assets/ocr-default-team-composition.png" alt="OCR default team composition editor" width="700" />
+</p>
+
+- **Per-reviewer model configuration** — Assign different models to different reviewers. The dashboard auto-discovers every model your installed vendor (Claude Code or OpenCode) offers.
+
+<p align="center">
+  <img src="../../assets/ocr-default-reviewer-model-configuration.png" alt="Per-reviewer model configuration on the Team page" width="700" />
+</p>
+
+- **Per-review model overrides** — Swap personas and models for a single review from the Command Center without touching your saved defaults.
+
+<p align="center">
+  <img src="../../assets/ocr-per-review-model-configuration.png" alt="Per-review model configuration in the Command Center" width="700" />
+</p>
+
 - **Review detail** — Read individual reviewer findings, discourse, and final synthesis with rendered markdown
 - **Review triage** — Set status on each review round (needs review, in progress, changes made, acknowledged, dismissed) with filtering and sorting
 

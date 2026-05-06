@@ -111,6 +111,8 @@ Famous Engineer personas review through the lens of each engineer's published wo
 
 **Ephemeral reviewers** can be added per-review with `--reviewer` — no persistence required. See the `review.md` command spec for details.
 
+**Multi-model teams** — assign different models to different reviewers via `.ocr/config.yaml`. Three forms (`shorthand`, `{ count, model }`, per-instance list), optional model aliases, and an optional workspace default. See the [main README](../../README.md#multi-model-teams) for details.
+
 ### Map Agent Personas
 
 The `/ocr:map` command uses specialized agents:

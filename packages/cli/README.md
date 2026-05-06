@@ -31,9 +31,31 @@ Run `ocr doctor` to verify your setup at any time.
 
 ## Reviewer Library
 
-OCR ships with 20+ reviewer personas across four tiers — holistic generalists (Principal, Staff Engineer, Architect), domain specialists (Security, Testing, Frontend, Performance, and more), and famous engineer personas (Martin Fowler, Kent Beck, Sandi Metz, and others) who review through the lens of their published work.
+OCR ships with 28 reviewer personas across four tiers — holistic generalists (Principal, Staff Engineer, Architect), domain specialists (Security, Testing, Frontend, Performance, and more), and famous engineer personas (Martin Fowler, Kent Beck, Sandi Metz, and others) who review through the lens of their published work.
 
 Add ephemeral one-off reviewers with `--reviewer`, or create persistent custom reviewers with `/ocr:create-reviewer`.
+
+## Multi-Model Teams
+
+Different reviewers can run on different models. Pair a fast generalist with a deeper specialist, or mix vendors across a single team:
+
+```yaml
+# .ocr/config.yaml
+models:
+  aliases:
+    workhorse: claude-sonnet-4-6
+    big-brain: claude-opus-4-7
+  default: claude-sonnet-4-6
+
+default_team:
+  principal:                            # per-instance models
+    - { model: big-brain }
+    - { model: workhorse, name: principal-balanced }
+  security: { count: 1, model: big-brain }   # one model, multiple instances
+  quality: 2                            # default model
+```
+
+Override per-review from the dashboard's Command Center, or via `--team` on the CLI. The dashboard auto-discovers every model your installed vendor (Claude Code or OpenCode) offers.
 
 ## Commands
 

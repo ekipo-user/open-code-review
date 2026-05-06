@@ -89,6 +89,7 @@ When you ask an AI to "review my code," you get a single perspective — one pas
 - [IDE & CLI Workflows](#ide--cli-workflows)
 - [Features](#features)
   - [Multi-Agent Review](#multi-agent-review)
+  - [Multi-Model Teams](#multi-model-teams)
   - [Code Review Maps](#code-review-maps)
   - [Requirements-Aware Review](#requirements-aware-review)
   - [Reviewer Discourse](#reviewer-discourse)
@@ -157,6 +158,30 @@ The **Team** page lets you browse all 28 reviewer personas grouped by tier (Gene
 
 <p align="center">
   <img src="assets/ocr-tool-manage-reviewers-team.png" alt="OCR Team page for managing reviewer personas" width="700" />
+</p>
+
+### Set your default team composition
+
+Pick which personas show up on every review and how many instances of each — your default lineup, persisted to `.ocr/config.yaml`.
+
+<p align="center">
+  <img src="assets/ocr-default-team-composition.png" alt="OCR default team composition editor" width="700" />
+</p>
+
+### Assign models per reviewer
+
+Different reviewers, different models. Pair a fast model on a generalist with a deeper model on a specialist, mix vendors across a single team, or set a workspace-wide default. The dashboard discovers your installed vendor (Claude Code or OpenCode) and lists every model it offers.
+
+<p align="center">
+  <img src="assets/ocr-default-reviewer-model-configuration.png" alt="Per-reviewer model configuration on the Team page" width="700" />
+</p>
+
+### Override the team for a single review
+
+Need a heavier-hitting model for one risky changeset? The Command Center lets you swap personas and models per-review without touching your saved defaults.
+
+<p align="center">
+  <img src="assets/ocr-per-review-model-configuration.png" alt="Per-review model configuration in the Command Center" width="700" />
 </p>
 
 ### Address Feedback
@@ -249,6 +274,33 @@ OCR follows an 8-phase workflow orchestrated by a Tech Lead agent:
 | 6. Discourse | Reviewers challenge, validate, and connect findings |
 | 7. Synthesis | Produce prioritized, deduplicated final review |
 | 8. Presentation | Display results; optionally post to GitHub |
+
+### Multi-Model Teams
+
+Different reviewers can run on different models. Pair a fast generalist on Sonnet with a deep specialist on Opus, share a single model across a redundancy pair, or define personal aliases like `workhorse`/`big-brain` so config reads naturally.
+
+```yaml
+# .ocr/config.yaml
+models:
+  aliases:
+    workhorse: claude-sonnet-4-6
+    big-brain: claude-opus-4-7
+  default: claude-sonnet-4-6   # used when an instance has no explicit model
+
+default_team:
+  # Form 1 — shorthand: N instances, default model
+  quality: 2
+
+  # Form 2 — object: N instances, all sharing one model
+  security: { count: 1, model: big-brain }
+
+  # Form 3 — list: per-instance model and optional name
+  principal:
+    - { model: big-brain }
+    - { model: workhorse, name: principal-balanced }
+```
+
+Override per-review from the Command Center, or via `--team` on the command line. The dashboard auto-discovers every model your installed vendor (Claude Code or OpenCode) offers — no need to memorize identifiers.
 
 ### Code Review Maps
 
@@ -401,13 +453,20 @@ context: |
   Critical: All public APIs must be backwards compatible
 
 # Customize your reviewer team composition
+# Three forms — see "Multi-Model Teams" above for the full variants.
 default_team:
   principal: 2       # Architecture, design patterns
   quality: 2         # Code style, best practices
   # security: 1      # Auto-added for auth/data changes
   # testing: 1       # Auto-added for logic changes
   # martin-fowler: 1 # Famous engineer persona
-  # sandi-metz: 1    # Famous engineer persona
+
+# Optional: model aliases + workspace default
+# models:
+#   aliases:
+#     workhorse: claude-sonnet-4-6
+#     big-brain: claude-opus-4-7
+#   default: claude-sonnet-4-6
 
 # Context discovery
 context_discovery:
