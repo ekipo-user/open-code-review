@@ -661,12 +661,30 @@ export function deleteNote(db: Database, noteId: number): void {
 
 // ── Command execution queries ──
 
-export function getCommandHistory(db: Database, limit = 50): CommandExecutionRow[] {
-  return resultToRows<CommandExecutionRow>(
+/**
+ * Like {@link CommandExecutionRow} but with the linked workflow's status
+ * projected on as `workflow_status` (via LEFT JOIN sessions). Used by the
+ * commands history route to derive the {@link CommandOutcome} per row in
+ * one round-trip rather than N+1 lookups. `null` when the row has no
+ * `workflow_id` or the workflow row was deleted.
+ */
+export type CommandExecutionRowWithWorkflowStatus = CommandExecutionRow & {
+  workflow_status: 'active' | 'closed' | null
+}
+
+export function getCommandHistory(
+  db: Database,
+  limit = 50,
+): CommandExecutionRowWithWorkflowStatus[] {
+  return resultToRows<CommandExecutionRowWithWorkflowStatus>(
     db.exec(
-      'SELECT * FROM command_executions ORDER BY started_at DESC LIMIT ?',
-      [limit]
-    )
+      `SELECT ce.*, s.status AS workflow_status
+         FROM command_executions ce
+         LEFT JOIN sessions s ON s.id = ce.workflow_id
+        ORDER BY ce.started_at DESC
+        LIMIT ?`,
+      [limit],
+    ),
   )
 }
 

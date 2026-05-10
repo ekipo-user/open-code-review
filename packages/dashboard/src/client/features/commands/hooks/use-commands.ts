@@ -11,6 +11,13 @@ export type CommandHistoryEntry = {
   duration_ms: number | null
   exit_code: number | null
   output: string
+  /**
+   * Server-derived from (exit_code, linked workflow.status). Distinguishes
+   * a workflow that exited cleanly from one that exited 0 mid-flight (e.g.
+   * macOS sleep dropped the streaming connection before the AI ever called
+   * `ocr state close-session`). Absent on rows from older server builds.
+   */
+  outcome?: 'success' | 'incomplete' | 'failed' | 'cancelled' | null
   // ── Agent-session journal fields (added by migration v11) ──
   workflow_id?: string | null
   vendor?: string | null

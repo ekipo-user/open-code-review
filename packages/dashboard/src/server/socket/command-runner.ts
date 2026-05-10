@@ -16,6 +16,10 @@ import { dirname, join } from 'node:path'
 import type { Server as SocketIOServer, Socket } from 'socket.io'
 import type { Database } from 'sql.js'
 import { saveDb } from '../db.js'
+import {
+  deriveCommandOutcome,
+  getWorkflowStatusForExecution,
+} from '../services/command-outcome.js'
 import type { SessionCaptureService } from '../services/capture/session-capture-service.js'
 import {
   AiCliService,
@@ -1112,6 +1116,14 @@ function finishExecution(
   )
   saveDb(db, ocrDir)
 
+  // Cross-check workflow lifecycle so the UI can distinguish a cleanly
+  // finished workflow from one whose parent process exited 0 mid-flight
+  // (the macOS-sleep / network-drop case). Read AFTER the exit_code
+  // UPDATE above so the lookup sees current data; the JOIN handles the
+  // common no-workflow case (utility commands).
+  const workflowStatus = getWorkflowStatusForExecution(db, executionId)
+  const outcome = deriveCommandOutcome(code, workflowStatus)
+
   // Best-effort JSONL backup
   if (entry?.uid) {
     appendCommandLog(ocrDir, {
@@ -1133,6 +1145,7 @@ function finishExecution(
     execution_id: executionId,
     exitCode: code,
     finished_at: finishedAt,
+    outcome,
   })
 
   activeCommands.delete(executionId)
