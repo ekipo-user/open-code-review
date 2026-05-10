@@ -923,6 +923,71 @@ describe("stateRoundComplete", () => {
     expect(rcEvent?.round).toBe(3);
   });
 
+  it("prefers OCR_DASHBOARD_EXECUTION_UID linkage over latest-active fallback", async () => {
+    // Reproduces the auto-detect ambiguity bug: with multiple active
+    // sessions, the latest-active fallback would pick the wrong one.
+    // The dashboard sets OCR_DASHBOARD_EXECUTION_UID for the AI it spawns,
+    // and the capture service binds that uid -> command_executions.workflow_id.
+    // round-complete must follow that linkage.
+
+    // Older "right" session — what the dashboard actually spawned the AI for.
+    const rightDir = sessionDir("right-session");
+    await stateInit({
+      sessionId: "right-session",
+      branch: "feat/right",
+      workflowType: "review",
+      sessionDir: rightDir,
+      ocrDir,
+    });
+
+    // Newer "wrong" session — would win latest-active auto-detect because
+    // its started_at is later. Simulates an unrelated session a user kicked
+    // off in the same project shortly after.
+    await new Promise((r) => setTimeout(r, 1100));
+    const wrongDir = sessionDir("wrong-session");
+    await stateInit({
+      sessionId: "wrong-session",
+      branch: "feat/wrong",
+      workflowType: "review",
+      sessionDir: wrongDir,
+      ocrDir,
+    });
+
+    // Seed a command_executions row linked to the right session, mirroring
+    // what the SessionCaptureService produces when the dashboard binds.
+    const { ensureDatabase: getDb } = await import("../../db/index.js");
+    const db = await getDb(ocrDir);
+    db.run(
+      `INSERT INTO command_executions
+         (uid, command, args, started_at, vendor, workflow_id)
+       VALUES (?, 'review', '[]', datetime('now'), 'claude', ?)`,
+      ["dash-uid-test", "right-session"],
+    );
+
+    const meta = makeRoundMeta({ verdict: "APPROVE", reviewers: [] });
+    const filePath = writeRoundMeta(rightDir, meta);
+
+    const prevEnv = process.env["OCR_DASHBOARD_EXECUTION_UID"];
+    process.env["OCR_DASHBOARD_EXECUTION_UID"] = "dash-uid-test";
+    try {
+      const result = await stateRoundComplete({
+        source: "file",
+        ocrDir,
+        filePath,
+      });
+      expect(result.sessionId).toBe("right-session");
+    } finally {
+      if (prevEnv === undefined) delete process.env["OCR_DASHBOARD_EXECUTION_UID"];
+      else process.env["OCR_DASHBOARD_EXECUTION_UID"] = prevEnv;
+    }
+
+    // Wrong session must NOT have a round_completed event.
+    const wrongShow = await stateShow(ocrDir, "wrong-session");
+    expect(
+      wrongShow?.events.find((e) => e.event_type === "round_completed"),
+    ).toBeUndefined();
+  });
+
   it("allows targeting a closed session via explicit session-id", async () => {
     const dir = sessionDir("closed-target");
     await stateInit({

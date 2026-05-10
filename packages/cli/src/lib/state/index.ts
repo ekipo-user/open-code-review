@@ -364,7 +364,17 @@ function parseRawJson(raw: string, label: string): unknown {
 
 /**
  * Resolve the active session for a completion command.
- * Uses explicit ID if provided, otherwise falls back to the latest active session.
+ *
+ * Resolution order, most-specific to least:
+ *   1. Explicit `--session-id` argument — caller knows exactly which row.
+ *   2. `OCR_DASHBOARD_EXECUTION_UID` env var → `command_executions.workflow_id`.
+ *      Set by the dashboard when it spawns the AI; lets `state round-complete`
+ *      and `state close-session` find their workflow even when several
+ *      sessions are stale-active in the DB. Without this, the latest-active
+ *      fallback can pick a wrong recently-modified session — see the
+ *      "session auto-detect picked the wrong row" failure mode.
+ *   3. `getLatestActiveSession` — works fine for direct CLI use where there
+ *      is typically only one active session in a project.
  */
 function resolveSessionForCompletion(
   db: Database,
@@ -379,6 +389,29 @@ function resolveSessionForCompletion(
       current_round: existing.current_round,
       current_map_run: existing.current_map_run,
     };
+  }
+  // Path 2 — env var linkage. Skip silently when not running under the
+  // dashboard (env var absent) or when the linkage hasn't been recorded
+  // yet (race window before the dashboard binds the workflow).
+  const dashboardUid = process.env["OCR_DASHBOARD_EXECUTION_UID"];
+  if (dashboardUid) {
+    const result = db.exec(
+      "SELECT workflow_id FROM command_executions WHERE uid = ?",
+      [dashboardUid],
+    );
+    const row = result[0]?.values[0];
+    const workflowId = row?.[0] as string | null | undefined;
+    if (workflowId) {
+      const existing = getSession(db, workflowId);
+      if (existing) {
+        return {
+          id: existing.id,
+          session_dir: existing.session_dir,
+          current_round: existing.current_round,
+          current_map_run: existing.current_map_run,
+        };
+      }
+    }
   }
   const active = getLatestActiveSession(db);
   if (!active) throw new Error("No active session found");
