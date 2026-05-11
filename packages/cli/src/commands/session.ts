@@ -87,8 +87,10 @@ const startInstanceSubcommand = new Command("start-instance")
       const db = await ensureDatabase(ocrDir);
 
       try {
-        const workflowId = options.workflow
-          ?? (await resolveActiveSession(ocrDir)).id;
+        const { id: workflowId } = await resolveActiveSession(
+          ocrDir,
+          options.workflow,
+        );
 
         const id = randomUUID();
         const persona = options.persona ?? null;
@@ -235,8 +237,10 @@ const listSubcommand = new Command("list")
     const db = await ensureDatabase(ocrDir);
 
     try {
-      const workflowId = options.workflow
-        ?? (await resolveActiveSession(ocrDir)).id;
+      const { id: workflowId } = await resolveActiveSession(
+        ocrDir,
+        options.workflow,
+      );
       const rows = listAgentSessionsForWorkflow(db, workflowId);
 
       if (options.json) {

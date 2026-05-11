@@ -249,18 +249,20 @@ const transitionSubcommand = new Command("transition")
       requireOcrSetup(targetDir);
       const ocrDir = join(targetDir, ".ocr");
 
-      const VALID_PHASES = new Set<string>([
-        "context", "change-context", "analysis", "reviews",
-        "aggregation", "discourse", "synthesis", "complete",
-        "map-context", "topology", "flow-analysis", "requirements-mapping",
-      ]);
-      if (!VALID_PHASES.has(options.phase)) {
-        throw new Error(`Invalid phase: "${options.phase}". Must be one of: ${[...VALID_PHASES].join(", ")}`);
-      }
-
       try {
-        const sessionId = options.sessionId
-          ?? (await resolveActiveSession(ocrDir)).id;
+        // Phase validation now lives in stateTransition itself, where it
+        // can see the session's workflow_type and check legal transitions
+        // against the workflow-typed phase graph (review vs map). The
+        // previous flat VALID_PHASES set let a review workflow transition
+        // to map phases (e.g. "topology") without complaint.
+        // Single auto-detect path (resolveActiveSession is the back-compat
+        // shim over resolveSession). Threading the explicit id through
+        // gives us validation of bad ids AND the stderr announcement when
+        // we auto-detect.
+        const { id: sessionId } = await resolveActiveSession(
+          ocrDir,
+          options.sessionId,
+        );
 
         await stateTransition({
           sessionId,
@@ -289,15 +291,17 @@ const transitionSubcommand = new Command("transition")
 
 const closeSubcommand = new Command("close")
   .description("Close a session")
-  .option("--session-id <id>", "Session ID (auto-detects latest active if omitted)")
+  .option("--session-id <id>", "Session ID (auto-detects latest active if omitted; refuses on ambiguity)")
   .action(async (options: { sessionId?: string }) => {
     const targetDir = process.cwd();
     requireOcrSetup(targetDir);
     const ocrDir = join(targetDir, ".ocr");
 
     try {
-      const sessionId = options.sessionId
-        ?? (await resolveActiveSession(ocrDir)).id;
+      const { id: sessionId } = await resolveActiveSession(
+        ocrDir,
+        options.sessionId,
+      );
 
       await stateClose({
         sessionId,

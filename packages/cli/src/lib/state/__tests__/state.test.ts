@@ -152,6 +152,13 @@ describe("stateTransition", () => {
       ocrDir,
     });
 
+    // Walk through legal phases (the graph rejects context → analysis).
+    await stateTransition({
+      sessionId: "phase-event",
+      phase: "change-context",
+      phaseNumber: 2,
+      ocrDir,
+    });
     await stateTransition({
       sessionId: "phase-event",
       phase: "analysis",
@@ -162,7 +169,7 @@ describe("stateTransition", () => {
     const result = await stateShow(ocrDir, "phase-event");
     const events = result?.events ?? [];
     const transitionEvent = events.find(
-      (e) => e.event_type === "phase_transition",
+      (e) => e.event_type === "phase_transition" && e.phase === "analysis",
     );
     expect(transitionEvent).toBeDefined();
     expect(transitionEvent?.phase).toBe("analysis");
@@ -407,10 +414,11 @@ describe("stateShow", () => {
       ocrDir,
     });
 
+    // Walk a legal edge (context → change-context).
     await stateTransition({
       sessionId: "events-show",
-      phase: "analysis",
-      phaseNumber: 3,
+      phase: "change-context",
+      phaseNumber: 2,
       ocrDir,
     });
 
@@ -597,6 +605,275 @@ describe("resolveActiveSession", () => {
     await expect(resolveActiveSession(ocrDir)).rejects.toThrow(
       "No active session found",
     );
+  });
+
+  it("refuses ambiguous auto-detect when multiple active sessions exist", async () => {
+    // Two active sessions; no env var; no explicit id → must refuse
+    // rather than silently pick one. This is the structural fix for
+    // the "wrong session got closed" failure mode.
+    await stateInit({
+      sessionId: "amb-one",
+      branch: "feat/a",
+      workflowType: "review",
+      sessionDir: sessionDir("amb-one"),
+      ocrDir,
+    });
+    await stateInit({
+      sessionId: "amb-two",
+      branch: "feat/b",
+      workflowType: "review",
+      sessionDir: sessionDir("amb-two"),
+      ocrDir,
+    });
+
+    await expect(resolveActiveSession(ocrDir)).rejects.toThrow(
+      /Ambiguous auto-detect/,
+    );
+  });
+
+  it("disambiguates via OCR_DASHBOARD_EXECUTION_UID even with multiple active sessions", async () => {
+    // Same setup as the ambiguity test, but with the env var pointing at
+    // a command_executions row linked to the right session. The resolver
+    // must follow that linkage instead of throwing.
+    await stateInit({
+      sessionId: "uid-right",
+      branch: "feat/r",
+      workflowType: "review",
+      sessionDir: sessionDir("uid-right"),
+      ocrDir,
+    });
+    await stateInit({
+      sessionId: "uid-wrong",
+      branch: "feat/w",
+      workflowType: "review",
+      sessionDir: sessionDir("uid-wrong"),
+      ocrDir,
+    });
+
+    const { ensureDatabase: getDb } = await import("../../db/index.js");
+    const db = await getDb(ocrDir);
+    db.run(
+      `INSERT INTO command_executions (uid, command, args, started_at, workflow_id)
+       VALUES (?, 'review', '[]', datetime('now'), ?)`,
+      ["dash-uid-disambig", "uid-right"],
+    );
+
+    const prev = process.env["OCR_DASHBOARD_EXECUTION_UID"];
+    process.env["OCR_DASHBOARD_EXECUTION_UID"] = "dash-uid-disambig";
+    try {
+      const r = await resolveActiveSession(ocrDir);
+      expect(r.id).toBe("uid-right");
+      expect(r.decision).toBe("dashboard-uid");
+    } finally {
+      if (prev === undefined) delete process.env["OCR_DASHBOARD_EXECUTION_UID"];
+      else process.env["OCR_DASHBOARD_EXECUTION_UID"] = prev;
+    }
+  });
+});
+
+describe("stateTransition — phase graph", () => {
+  it("rejects illegal phase jumps (reviews → complete) on a review workflow", async () => {
+    const dir = sessionDir("phase-jump-review");
+    await stateInit({
+      sessionId: "phase-jump-review",
+      branch: "feat/pj",
+      workflowType: "review",
+      sessionDir: dir,
+      ocrDir,
+    });
+    // Walk legal phases up to `reviews` first.
+    for (const [phase, n] of [
+      ["change-context", 2],
+      ["analysis", 3],
+      ["reviews", 4],
+    ] as const) {
+      await stateTransition({
+        sessionId: "phase-jump-review",
+        phase,
+        phaseNumber: n,
+        ocrDir,
+      });
+    }
+    await expect(
+      stateTransition({
+        sessionId: "phase-jump-review",
+        phase: "complete",
+        phaseNumber: 8,
+        ocrDir,
+      }),
+    ).rejects.toThrow(/Illegal phase transition: reviews → complete/);
+  });
+
+  it("rejects cross-workflow-type phases (topology on a review workflow)", async () => {
+    const dir = sessionDir("cross-type");
+    await stateInit({
+      sessionId: "cross-type",
+      branch: "feat/ct",
+      workflowType: "review",
+      sessionDir: dir,
+      ocrDir,
+    });
+    await expect(
+      stateTransition({
+        sessionId: "cross-type",
+        // @ts-expect-error — intentionally passing a map phase
+        phase: "topology",
+        phaseNumber: 2,
+        ocrDir,
+      }),
+    ).rejects.toThrow(/Invalid phase "topology" for workflow_type "review"/);
+  });
+
+  it("allows round-boundary transitions to reset to context", async () => {
+    const dir = sessionDir("round-boundary");
+    await stateInit({
+      sessionId: "round-boundary",
+      branch: "feat/rb",
+      workflowType: "review",
+      sessionDir: dir,
+      ocrDir,
+    });
+    // Walk to complete legitimately.
+    for (const [phase, n] of [
+      ["change-context", 2],
+      ["analysis", 3],
+      ["reviews", 4],
+      ["aggregation", 5],
+      ["discourse", 6],
+      ["synthesis", 7],
+      ["complete", 8],
+    ] as const) {
+      await stateTransition({
+        sessionId: "round-boundary",
+        phase,
+        phaseNumber: n,
+        ocrDir,
+      });
+    }
+    // Start round 2 by jumping back to context with explicit round bump.
+    await expect(
+      stateTransition({
+        sessionId: "round-boundary",
+        phase: "context",
+        phaseNumber: 1,
+        round: 2,
+        ocrDir,
+      }),
+    ).resolves.toBeUndefined();
+  });
+});
+
+describe("stateClose — cascade + idempotency", () => {
+  it("is idempotent on already-closed sessions", async () => {
+    const dir = sessionDir("idemp");
+    await stateInit({
+      sessionId: "idemp",
+      branch: "feat/idemp",
+      workflowType: "review",
+      sessionDir: dir,
+      ocrDir,
+    });
+    await stateClose({ sessionId: "idemp", ocrDir });
+    // Second close: must not throw, must not write a duplicate event.
+    await expect(
+      stateClose({ sessionId: "idemp", ocrDir }),
+    ).resolves.toBeUndefined();
+
+    const show = await stateShow(ocrDir, "idemp");
+    const closeEvents =
+      show?.events.filter((e) => e.event_type === "session_closed") ?? [];
+    expect(closeEvents.length).toBe(1);
+  });
+
+  it("cascade-closes in-flight dependent command_executions", async () => {
+    const dir = sessionDir("cascade");
+    await stateInit({
+      sessionId: "cascade",
+      branch: "feat/c",
+      workflowType: "review",
+      sessionDir: dir,
+      ocrDir,
+    });
+
+    const { ensureDatabase: getDb } = await import("../../db/index.js");
+    const db = await getDb(ocrDir);
+    db.run(
+      `INSERT INTO command_executions (uid, command, args, started_at, workflow_id, last_heartbeat_at)
+       VALUES (?, 'review', '[]', datetime('now'), ?, datetime('now'))`,
+      ["dash-cascade-uid", "cascade"],
+    );
+
+    await stateClose({ sessionId: "cascade", ocrDir });
+
+    const result = db.exec(
+      `SELECT exit_code, finished_at, notes
+         FROM command_executions
+        WHERE uid = ?`,
+      ["dash-cascade-uid"],
+    );
+    const row = result[0]?.values[0];
+    expect(row).toBeDefined();
+    expect(row?.[0]).toBe(-4); // CASCADE_CLOSE_EXIT_CODE
+    expect(row?.[1]).toBeTruthy(); // finished_at populated
+    expect(String(row?.[2] ?? "")).toMatch(/closed by parent workflow close/);
+  });
+});
+
+describe("stateInit — re-open derives round from events", () => {
+  it("derives next round from MAX(round_completed.round) + 1, ignoring filesystem", async () => {
+    // Setup: complete round 1 via stateRoundComplete, then re-init.
+    const dir = sessionDir("round-from-events");
+    await stateInit({
+      sessionId: "round-from-events",
+      branch: "feat/rfe",
+      workflowType: "review",
+      sessionDir: dir,
+      ocrDir,
+    });
+    const meta = makeRoundMeta({ verdict: "APPROVE", reviewers: [] });
+    const filePath = writeRoundMeta(dir, meta);
+    await stateRoundComplete({
+      source: "file",
+      ocrDir,
+      filePath,
+      sessionId: "round-from-events",
+    });
+    await stateClose({ sessionId: "round-from-events", ocrDir });
+
+    // No filesystem round directories — only the round-meta.json we wrote
+    // is in `dir`, not a `rounds/round-N/` layout. Filesystem inference
+    // would say round 1. Event-based derivation says round 2.
+    const sid = await stateInit({
+      sessionId: "round-from-events",
+      branch: "feat/rfe",
+      workflowType: "review",
+      sessionDir: dir,
+      ocrDir,
+    });
+    expect(sid).toBe("round-from-events");
+    const show = await stateShow(ocrDir, "round-from-events");
+    expect(show?.session.current_round).toBe(2);
+  });
+
+  it("rejects re-open with mismatched workflow_type", async () => {
+    const dir = sessionDir("type-mismatch");
+    await stateInit({
+      sessionId: "type-mismatch",
+      branch: "feat/tm",
+      workflowType: "review",
+      sessionDir: dir,
+      ocrDir,
+    });
+    await stateClose({ sessionId: "type-mismatch", ocrDir });
+    await expect(
+      stateInit({
+        sessionId: "type-mismatch",
+        branch: "feat/tm",
+        workflowType: "map",
+        sessionDir: dir,
+        ocrDir,
+      }),
+    ).rejects.toThrow(/Cannot re-open session/);
   });
 });
 

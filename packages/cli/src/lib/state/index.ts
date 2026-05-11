@@ -66,6 +66,30 @@ export type {
 
 // ── Helpers ──
 
+/**
+ * Derive the next round number from `round_completed` events.
+ *
+ * Events are authoritative — they record what actually happened. The
+ * filesystem is observational and may drift. If the highest completed
+ * round is N, the next round is N+1. If no rounds have completed yet,
+ * the next round is the session's current_round (i.e. still on the
+ * current round — caller is resuming, not advancing).
+ */
+function deriveNextRound(
+  db: Database,
+  sessionId: string,
+  fallbackRound: number,
+): number {
+  const result = db.exec(
+    `SELECT MAX(round) FROM orchestration_events
+       WHERE session_id = ? AND event_type = 'round_completed'`,
+    [sessionId],
+  );
+  const max = result[0]?.values[0]?.[0];
+  if (typeof max === "number") return max + 1;
+  return fallbackRound;
+}
+
 /** Returns true if the directory contains at least one .md or .json file (recursively). */
 function hasArtifacts(dir: string): boolean {
   try {
@@ -97,29 +121,32 @@ export async function stateInit(params: InitParams): Promise<string> {
   const existing = getSession(db, sessionId);
 
   if (existing) {
-    // Session exists — determine the correct round from filesystem
-    const roundsDir = join(sessionDir, "rounds");
-    let nextRound = 1;
-
-    if (existsSync(roundsDir)) {
-      const roundDirs = readdirSync(roundsDir)
-        .filter((d) => /^round-\d+$/.test(d))
-        .map((d) => parseInt(d.replace("round-", ""), 10))
-        .sort((a, b) => a - b);
-
-      if (roundDirs.length > 0) {
-        const highest = roundDirs[roundDirs.length - 1]!;
-        const hasFinal = existsSync(
-          join(roundsDir, `round-${highest}`, "final.md"),
-        );
-        nextRound = hasFinal ? highest + 1 : highest;
-      }
+    // Workflow type compatibility: re-opening with a different type would
+    // corrupt phase semantics (review vs map have disjoint phase graphs).
+    if (existing.workflow_type !== workflowType) {
+      throw new Error(
+        `Cannot re-open session ${sessionId} as workflow_type "${workflowType}": ` +
+          `existing workflow_type is "${existing.workflow_type}". ` +
+          `Maps and reviews have disjoint phase graphs.`,
+      );
     }
+
+    // Session exists — derive next round from DB events (authoritative)
+    // rather than filesystem (observational). Previously this read
+    // rounds/round-N/final.md presence on disk, which broke if the disk
+    // state was missing or out-of-sync with the DB. Events are the
+    // system of record; filesystem is a side-effect.
+    const nextRound = deriveNextRound(db, sessionId, existing.current_round);
+
+    // Each workflow type starts at its own initial phase. The phase
+    // graph treats review and map vocabularies as disjoint — using the
+    // wrong one here causes every subsequent transition to be rejected.
+    const initialPhase = workflowType === "map" ? "map-context" : "context";
 
     // Re-open the session for the next round
     updateSession(db, sessionId, {
       status: "active",
-      current_phase: "context",
+      current_phase: initialPhase,
       phase_number: 1,
       current_round: nextRound,
     });
@@ -130,7 +157,7 @@ export async function stateInit(params: InitParams): Promise<string> {
         nextRound > (existing.current_round ?? 1)
           ? "round_started"
           : "session_resumed",
-      phase: "context",
+      phase: initialPhase,
       phase_number: 1,
       round: nextRound,
     });
@@ -139,12 +166,14 @@ export async function stateInit(params: InitParams): Promise<string> {
     return sessionId;
   }
 
+  const initialPhase = workflowType === "map" ? "map-context" : "context";
+
   // New session — original path
   insertSession(db, {
     id: sessionId,
     branch,
     workflow_type: workflowType,
-    current_phase: "context",
+    current_phase: initialPhase,
     phase_number: 1,
     current_round: 1,
     current_map_run: 1,
@@ -154,7 +183,7 @@ export async function stateInit(params: InitParams): Promise<string> {
   insertEvent(db, {
     session_id: sessionId,
     event_type: "session_created",
-    phase: "context",
+    phase: initialPhase,
     phase_number: 1,
     round: 1,
   });
@@ -162,6 +191,82 @@ export async function stateInit(params: InitParams): Promise<string> {
   saveDatabase(db, dbPath);
 
   return sessionId;
+}
+
+/**
+ * Phase-progression graphs. Each entry maps a phase to the set of phases
+ * legally reachable from it. Self-loops (idempotent re-entry of the same
+ * phase) are always allowed and don't need to appear in the map.
+ *
+ * `complete` loops back to the initial phase to allow a new round/run.
+ *
+ * Why enforce this: without a transition graph, the AI could jump from
+ * `reviews` straight to `complete`, skipping aggregation/discourse/
+ * synthesis. The dashboard's outcome derivation (sessions.status) would
+ * still mark the workflow closed, masking the gap. Treating the phase
+ * sequence as a state machine makes that class of bug impossible.
+ */
+const REVIEW_PHASE_GRAPH: Record<string, ReadonlyArray<string>> = {
+  context: ["change-context"],
+  "change-context": ["analysis"],
+  analysis: ["reviews"],
+  reviews: ["aggregation"],
+  aggregation: ["discourse"],
+  discourse: ["synthesis"],
+  synthesis: ["complete"],
+  complete: ["context"],
+};
+
+const MAP_PHASE_GRAPH: Record<string, ReadonlyArray<string>> = {
+  "map-context": ["topology"],
+  topology: ["flow-analysis"],
+  "flow-analysis": ["requirements-mapping"],
+  "requirements-mapping": ["synthesis"],
+  synthesis: ["complete"],
+  complete: ["map-context"],
+};
+
+function graphFor(
+  workflowType: "review" | "map",
+): Record<string, ReadonlyArray<string>> {
+  return workflowType === "review" ? REVIEW_PHASE_GRAPH : MAP_PHASE_GRAPH;
+}
+
+/**
+ * Validate that `target` is a legal next phase given `source` and the
+ * workflow's type. Self-loops are always allowed. Round/mapRun bumps
+ * are treated as a permitted reset back to the first phase regardless
+ * of source (a new round legitimately starts over at `context`).
+ */
+function validatePhaseTransition(
+  workflowType: "review" | "map",
+  source: string,
+  target: string,
+  isRoundBoundary: boolean,
+): void {
+  const graph = graphFor(workflowType);
+  // Target must belong to this workflow_type's phase vocabulary.
+  if (!(target in graph)) {
+    const validPhases = Object.keys(graph).join(", ");
+    throw new Error(
+      `Invalid phase "${target}" for workflow_type "${workflowType}". ` +
+        `Valid phases: ${validPhases}`,
+    );
+  }
+  // Same-phase re-entry: always allowed (retries, idempotent calls).
+  if (source === target) return;
+  // Round/mapRun boundary: any phase of the same workflow is reachable.
+  if (isRoundBoundary) return;
+  const allowed = graph[source];
+  if (!allowed || !allowed.includes(target)) {
+    throw new Error(
+      `Illegal phase transition: ${source} → ${target}. ` +
+        `From "${source}", only ${
+          allowed && allowed.length > 0 ? allowed.join(", ") : "(no edges)"
+        } are reachable. ` +
+        `Pass --current-round to start a new round if the workflow is resetting.`,
+    );
+  }
 }
 
 /**
@@ -178,6 +283,17 @@ export async function stateTransition(params: TransitionParams): Promise<void> {
   }
 
   const previousRound = existing.current_round;
+  const previousMapRun = existing.current_map_run;
+  const isRoundBoundary =
+    (round !== undefined && round !== previousRound) ||
+    (mapRun !== undefined && mapRun !== previousMapRun);
+
+  validatePhaseTransition(
+    existing.workflow_type,
+    existing.current_phase,
+    phase,
+    isRoundBoundary,
+  );
 
   updateSession(db, sessionId, {
     current_phase: phase,
@@ -208,8 +324,22 @@ export async function stateTransition(params: TransitionParams): Promise<void> {
   saveDatabase(db, dbPath);
 }
 
+/** Sentinel exit code stamped on dependent rows cascade-closed by a
+ *  parent stateClose. Distinct from -2 (user cancel) and -3 (orphaned by
+ *  liveness sweep) so triage can tell the cause apart. */
+const CASCADE_CLOSE_EXIT_CODE = -4;
+
 /**
  * Close a session in SQLite.
+ *
+ * Idempotent: if the session is already `closed`, returns without writing
+ * a second `session_closed` event.
+ *
+ * Cascades to dependent `command_executions` rows: any still in flight
+ * (finished_at IS NULL) for this workflow are stamped terminal with
+ * exit_code = -4 and a structured note. Without this, closing a workflow
+ * left stranded child rows whose only cleanup path was the heartbeat
+ * liveness sweep — and that sweep depends on the dashboard running.
  */
 export async function stateClose(params: CloseParams): Promise<void> {
   const { sessionId, ocrDir } = params;
@@ -219,6 +349,14 @@ export async function stateClose(params: CloseParams): Promise<void> {
   const existing = getSession(db, sessionId);
   if (!existing) {
     throw new Error(`Session not found: ${sessionId}`);
+  }
+
+  if (existing.status === "closed") {
+    // Idempotent no-op. Caller still gets a clean exit; the stderr
+    // notice tells them their action had no effect — useful when the AI
+    // accidentally retries close after a successful first attempt.
+    console.error(`[ocr] Session already closed: ${sessionId}`);
+    return;
   }
 
   updateSession(db, sessionId, {
@@ -233,6 +371,22 @@ export async function stateClose(params: CloseParams): Promise<void> {
     phase_number: existing.phase_number,
     round: existing.current_round,
   });
+
+  // Cascade: terminate any dependent command_executions rows still in
+  // flight. Without this, a workflow close leaves orphan rows that only
+  // the heartbeat sweep can recover — and that sweep needs the dashboard
+  // running. Doing it here makes close authoritative.
+  const note = "closed by parent workflow close";
+  db.run(
+    `UPDATE command_executions
+       SET finished_at = datetime('now'),
+           exit_code   = ?,
+           pid         = NULL,
+           notes       = COALESCE(notes || char(10), '') || ?
+     WHERE workflow_id = ?
+       AND finished_at IS NULL`,
+    [CASCADE_CLOSE_EXIT_CODE, note, sessionId],
+  );
 
   saveDatabase(db, dbPath);
 }
@@ -315,20 +469,138 @@ export async function stateList(
 }
 
 /**
- * Resolves the active session ID from SQLite.
- * Throws if no active session is found.
+ * How the resolver arrived at the chosen session. Surfaced on the
+ * result so callers (and tests) can verify the decision path. Also
+ * printed to stderr by {@link announceResolveDecision} so users see
+ * which session a command will affect when they omit `--session-id`.
+ */
+export type ResolveDecision = "explicit" | "dashboard-uid" | "latest-active";
+
+export type ResolveSessionResult = {
+  id: string;
+  session_dir: string;
+  current_round: number;
+  current_map_run: number;
+  workflow_type: "review" | "map";
+  decision: ResolveDecision;
+};
+
+/**
+ * Single source of truth for "which session does this CLI invocation
+ * apply to?". Replaces the two parallel helpers that previously diverged
+ * (resolveActiveSession + resolveSessionForCompletion). Used by every
+ * `state` and `session` subcommand that accepts an optional `--session-id`.
+ *
+ * Resolution order, most-specific to least:
+ *   1. `explicitId`         — caller passed `--session-id`
+ *   2. `OCR_DASHBOARD_EXECUTION_UID` env var → `command_executions.workflow_id`.
+ *      Set by the dashboard when it spawns the AI; the SessionCaptureService
+ *      binds that uid to the workflow_id once the AI calls `state init`.
+ *   3. latest-active fallback — only when exactly one active session exists.
+ *      With >1 active sessions and no env var, this throws an ambiguity
+ *      error rather than silently picking one. Brittle auto-detect is the
+ *      root cause of the "wrong session got closed" failure mode.
+ */
+export function resolveSession(
+  db: Database,
+  explicitId?: string,
+): ResolveSessionResult {
+  // 1. Explicit
+  if (explicitId) {
+    const s = getSession(db, explicitId);
+    if (!s) throw new Error(`Session not found: ${explicitId}`);
+    return {
+      id: s.id,
+      session_dir: s.session_dir,
+      current_round: s.current_round,
+      current_map_run: s.current_map_run,
+      workflow_type: s.workflow_type,
+      decision: "explicit",
+    };
+  }
+
+  // 2. Dashboard execution UID
+  const uid = process.env["OCR_DASHBOARD_EXECUTION_UID"];
+  if (uid) {
+    const result = db.exec(
+      "SELECT workflow_id FROM command_executions WHERE uid = ?",
+      [uid],
+    );
+    const workflowId = result[0]?.values[0]?.[0] as string | null | undefined;
+    if (workflowId) {
+      const s = getSession(db, workflowId);
+      if (s) {
+        return {
+          id: s.id,
+          session_dir: s.session_dir,
+          current_round: s.current_round,
+          current_map_run: s.current_map_run,
+          workflow_type: s.workflow_type,
+          decision: "dashboard-uid",
+        };
+      }
+    }
+    // env var present but no linkage yet (race window before the
+    // capture service binds workflow_id). Fall through to latest-active.
+  }
+
+  // 3. Latest-active. Refuse if ambiguous.
+  const activeRows = db.exec(
+    `SELECT id, session_dir, current_round, current_map_run, workflow_type
+       FROM sessions
+      WHERE status = 'active'
+      ORDER BY started_at DESC`,
+  );
+  const rows = activeRows[0]?.values ?? [];
+  if (rows.length === 0) throw new Error("No active session found");
+  if (rows.length > 1) {
+    const ids = rows.map((r) => r[0] as string);
+    throw new Error(
+      `Ambiguous auto-detect: ${rows.length} active sessions exist. ` +
+        `Pass --session-id explicitly. Candidates: ${ids.join(", ")}`,
+    );
+  }
+  const row = rows[0]!;
+  return {
+    id: row[0] as string,
+    session_dir: row[1] as string,
+    current_round: row[2] as number,
+    current_map_run: row[3] as number,
+    workflow_type: row[4] as "review" | "map",
+    decision: "latest-active",
+  };
+}
+
+/**
+ * Print the auto-detect decision to stderr so a user running a CLI
+ * subcommand without `--session-id` sees which session they're acting on.
+ * No-op when the caller passed an explicit id — they already know.
+ */
+export function announceResolveDecision(r: ResolveSessionResult): void {
+  if (r.decision === "explicit") return;
+  const path =
+    r.decision === "dashboard-uid"
+      ? "via OCR_DASHBOARD_EXECUTION_UID"
+      : "via latest-active";
+  console.error(`[ocr] Auto-detected session: ${r.id} (${path})`);
+}
+
+/**
+ * Backward-compat shim for callers that still take `ocrDir` instead of
+ * a Database handle (CLI subcommands in state.ts / session.ts). New code
+ * should prefer {@link resolveSession} directly.
  */
 export async function resolveActiveSession(
   ocrDir: string,
-): Promise<{ id: string; sessionDir: string }> {
+  explicitId?: string,
+): Promise<{ id: string; sessionDir: string; decision: ResolveDecision }> {
   const db = await ensureDatabase(ocrDir);
-  const session = getLatestActiveSession(db);
-  if (!session) {
-    throw new Error("No active session found");
-  }
+  const result = resolveSession(db, explicitId);
+  announceResolveDecision(result);
   return {
-    id: session.id,
-    sessionDir: session.session_dir,
+    id: result.id,
+    sessionDir: result.session_dir,
+    decision: result.decision,
   };
 }
 
@@ -362,66 +634,6 @@ function parseRawJson(raw: string, label: string): unknown {
   }
 }
 
-/**
- * Resolve the active session for a completion command.
- *
- * Resolution order, most-specific to least:
- *   1. Explicit `--session-id` argument — caller knows exactly which row.
- *   2. `OCR_DASHBOARD_EXECUTION_UID` env var → `command_executions.workflow_id`.
- *      Set by the dashboard when it spawns the AI; lets `state round-complete`
- *      and `state close-session` find their workflow even when several
- *      sessions are stale-active in the DB. Without this, the latest-active
- *      fallback can pick a wrong recently-modified session — see the
- *      "session auto-detect picked the wrong row" failure mode.
- *   3. `getLatestActiveSession` — works fine for direct CLI use where there
- *      is typically only one active session in a project.
- */
-function resolveSessionForCompletion(
-  db: Database,
-  explicitId?: string,
-): { id: string; session_dir: string; current_round: number; current_map_run: number } {
-  if (explicitId) {
-    const existing = getSession(db, explicitId);
-    if (!existing) throw new Error(`Session not found: ${explicitId}`);
-    return {
-      id: existing.id,
-      session_dir: existing.session_dir,
-      current_round: existing.current_round,
-      current_map_run: existing.current_map_run,
-    };
-  }
-  // Path 2 — env var linkage. Skip silently when not running under the
-  // dashboard (env var absent) or when the linkage hasn't been recorded
-  // yet (race window before the dashboard binds the workflow).
-  const dashboardUid = process.env["OCR_DASHBOARD_EXECUTION_UID"];
-  if (dashboardUid) {
-    const result = db.exec(
-      "SELECT workflow_id FROM command_executions WHERE uid = ?",
-      [dashboardUid],
-    );
-    const row = result[0]?.values[0];
-    const workflowId = row?.[0] as string | null | undefined;
-    if (workflowId) {
-      const existing = getSession(db, workflowId);
-      if (existing) {
-        return {
-          id: existing.id,
-          session_dir: existing.session_dir,
-          current_round: existing.current_round,
-          current_map_run: existing.current_map_run,
-        };
-      }
-    }
-  }
-  const active = getLatestActiveSession(db);
-  if (!active) throw new Error("No active session found");
-  return {
-    id: active.id,
-    session_dir: active.session_dir,
-    current_round: active.current_round,
-    current_map_run: active.current_map_run,
-  };
-}
 
 // ── Round-meta validation helpers ──
 
@@ -587,7 +799,7 @@ export async function stateRoundComplete(
   const counts = computeRoundCounts(meta);
 
   // ── 3. Resolve session and round ──
-  const session = resolveSessionForCompletion(db, params.sessionId);
+  const session = resolveSession(db, params.sessionId);
   const roundNumber = params.round ?? session.current_round;
 
   // ── 4. Write round-meta.json when source is stdin ──
@@ -616,6 +828,14 @@ export async function stateRoundComplete(
       source: "orchestrator",
     }),
   });
+
+  // ── 6. Advance current_round on the session row. Without this, the
+  // sessions table lags the events log — the next stateInit re-open
+  // would have to re-derive round each time. Keeping the column in
+  // sync with the event log lets the dashboard read it directly.
+  if (roundNumber >= session.current_round) {
+    updateSession(db, session.id, { current_round: roundNumber });
+  }
 
   saveDatabase(db, dbPath);
 
@@ -724,7 +944,7 @@ export async function stateMapComplete(
   const counts = computeMapCounts(meta);
 
   // ── 3. Resolve session and map run ──
-  const session = resolveSessionForCompletion(db, params.sessionId);
+  const session = resolveSession(db, params.sessionId);
   const mapRunNumber = params.mapRun ?? session.current_map_run;
 
   // ── 4. Write map-meta.json when source is stdin ──
@@ -804,20 +1024,35 @@ export async function stateSync(ocrDir: string): Promise<number> {
     const branchMatch = dirName.match(/^\d{4}-\d{2}-\d{2}-(.+)$/);
     const branch = branchMatch?.[1] ?? dirName;
 
-    // Determine completion phase from filesystem artifacts.
-    // Sessions with a final.md (review) or map.md (map) in their latest
-    // round/run are complete.
+    // Reconstruct the most-likely terminal state from artifacts.
+    // Sessions with a final.md (review) / map.md (map) in their latest
+    // round/run are complete; phase_number tracks the workflow's terminal
+    // phase index so the dashboard renders the same progress as a session
+    // that closed cleanly.
     let inferredPhase = "context";
+    let inferredPhaseNumber = 1;
+    let inferredRound = 1;
+    let inferredMapRun = 1;
 
     if (workflowType === "review") {
       const roundsDir = join(dirPath, "rounds");
       if (existsSync(roundsDir)) {
         const roundDirs = readdirSync(roundsDir)
           .filter((d) => /^round-\d+$/.test(d))
-          .sort((a, b) => parseInt(a.replace(/^\D+-/, ""), 10) - parseInt(b.replace(/^\D+-/, ""), 10));
-        const latestRound = roundDirs[roundDirs.length - 1];
-        if (latestRound && existsSync(join(roundsDir, latestRound, "final.md"))) {
-          inferredPhase = "complete";
+          .map((d) => parseInt(d.replace("round-", ""), 10))
+          .filter((n) => Number.isFinite(n))
+          .sort((a, b) => a - b);
+        const latestRoundNum = roundDirs[roundDirs.length - 1];
+        if (latestRoundNum !== undefined) {
+          inferredRound = latestRoundNum;
+          if (
+            existsSync(
+              join(roundsDir, `round-${latestRoundNum}`, "final.md"),
+            )
+          ) {
+            inferredPhase = "complete";
+            inferredPhaseNumber = 8;
+          }
         }
       }
     } else if (workflowType === "map") {
@@ -825,10 +1060,18 @@ export async function stateSync(ocrDir: string): Promise<number> {
       if (existsSync(runsDir)) {
         const runDirs = readdirSync(runsDir)
           .filter((d) => /^run-\d+$/.test(d))
-          .sort((a, b) => parseInt(a.replace(/^\D+-/, ""), 10) - parseInt(b.replace(/^\D+-/, ""), 10));
-        const latestRun = runDirs[runDirs.length - 1];
-        if (latestRun && existsSync(join(runsDir, latestRun, "map.md"))) {
-          inferredPhase = "complete";
+          .map((d) => parseInt(d.replace("run-", ""), 10))
+          .filter((n) => Number.isFinite(n))
+          .sort((a, b) => a - b);
+        const latestRunNum = runDirs[runDirs.length - 1];
+        if (latestRunNum !== undefined) {
+          inferredMapRun = latestRunNum;
+          if (
+            existsSync(join(runsDir, `run-${latestRunNum}`, "map.md"))
+          ) {
+            inferredPhase = "complete";
+            inferredPhaseNumber = 6;
+          }
         }
       }
     }
@@ -838,9 +1081,9 @@ export async function stateSync(ocrDir: string): Promise<number> {
       branch,
       workflow_type: workflowType,
       current_phase: inferredPhase,
-      phase_number: 1,
-      current_round: 1,
-      current_map_run: 1,
+      phase_number: inferredPhaseNumber,
+      current_round: inferredRound,
+      current_map_run: inferredMapRun,
       session_dir: dirPath,
     });
 
