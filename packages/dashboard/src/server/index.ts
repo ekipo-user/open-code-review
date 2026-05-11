@@ -38,7 +38,12 @@ import { registerCommandHandlers } from './socket/command-runner.js'
 import { registerChatHandlers, cleanupAllChats } from './socket/chat-handler.js'
 import { registerPostHandlers, cleanupAllPostGenerations } from './socket/post-handler.js'
 import { flushSave } from './routes/progress.js'
-import { replayCommandLog, sweepStaleAgentSessions, walCheckpointTruncate } from '@open-code-review/cli/db'
+import {
+  replayCommandLog,
+  sweepStaleAgentSessions,
+  sweepStaleSessions,
+  walCheckpointTruncate,
+} from '@open-code-review/cli/db'
 import { getAgentHeartbeatSeconds } from '@open-code-review/cli/runtime-config'
 
 import { homedir } from 'node:os'
@@ -301,7 +306,8 @@ export async function startServer(options: StartServerOptions = {}): Promise<voi
   // ── Agent-session liveness sweep ──
   // Reclassifies `running` agent_sessions rows whose heartbeat has gone stale
   // past the configured threshold to `orphaned`. Fires on dashboard startup
-  // (and again on each new agent-session insert) — no background timer.
+  // AND via a periodic timer below — so long-running dashboards don't
+  // accumulate stranded rows.
   const heartbeatSeconds = getAgentHeartbeatSeconds(ocrDir)
   const sweepResult = sweepStaleAgentSessions(db, heartbeatSeconds)
   if (sweepResult.orphanedIds.length > 0) {
@@ -310,6 +316,49 @@ export async function startServer(options: StartServerOptions = {}): Promise<voi
       `  Cleaned up ${sweepResult.orphanedIds.length} stale agent session(s) (heartbeat threshold ${heartbeatSeconds}s)`
     )
   }
+
+  // ── Stale-active sessions sweep ──
+  // Closes sessions.status='active' rows that have had no events past the
+  // threshold AND have no in-flight dependent rows. Without this, sessions
+  // that crashed early (or initialised but never advanced) accumulate
+  // forever and poison auto-detect (latest-active picks wrong).
+  const STALE_SESSION_THRESHOLD_SECONDS = 7 * 24 * 60 * 60 // 7 days
+  const staleSessionResult = sweepStaleSessions(
+    db,
+    STALE_SESSION_THRESHOLD_SECONDS,
+  )
+  if (staleSessionResult.closedSessionIds.length > 0) {
+    saveDb(db, ocrDir)
+    console.log(
+      `  Auto-closed ${staleSessionResult.closedSessionIds.length} stale active session(s) (threshold 7 days)`
+    )
+  }
+
+  // ── Periodic sweep timer ──
+  // Runs every 5 minutes inside the running dashboard so liveness and
+  // stale-session cleanup keep happening without a restart. Each sweep
+  // is cheap (single SQL update per sweep type); 5 min keeps the cadence
+  // responsive without DB pressure.
+  const SWEEP_INTERVAL_MS = 5 * 60 * 1000
+  const sweepTimer = setInterval(() => {
+    try {
+      const agentSweep = sweepStaleAgentSessions(db, heartbeatSeconds)
+      const sessionSweep = sweepStaleSessions(
+        db,
+        STALE_SESSION_THRESHOLD_SECONDS,
+      )
+      if (
+        agentSweep.orphanedIds.length > 0 ||
+        sessionSweep.closedSessionIds.length > 0
+      ) {
+        saveDb(db, ocrDir)
+      }
+    } catch (err) {
+      console.error('[sweep] periodic sweep failed:', err)
+    }
+  }, SWEEP_INTERVAL_MS)
+  // Don't block process exit on the timer.
+  sweepTimer.unref()
 
   // ── API Routes ──
 

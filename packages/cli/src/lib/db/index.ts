@@ -54,6 +54,7 @@ export {
   setAgentSessionStatus,
   updateAgentSession,
   sweepStaleAgentSessions,
+  sweepStaleSessions,
 } from "./agent-sessions.js";
 
 export type { WorkflowType, SessionStatus } from "../state/types.js";

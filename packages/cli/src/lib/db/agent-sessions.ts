@@ -487,3 +487,77 @@ export function sweepStaleAgentSessions(
     orphanedIds: stale.map((row) => row.uid ?? String(row.id)),
   };
 }
+
+/**
+ * Sweep stale `sessions.status = 'active'` rows.
+ *
+ * A row is considered stale when ALL of the following hold:
+ *   - status is still 'active'
+ *   - no orchestration_event has been recorded for it within
+ *     `thresholdSeconds` (default 7 days at call sites)
+ *   - no dependent command_executions are still in flight
+ *     (every linked row has finished_at NOT NULL)
+ *
+ * Stale rows are flipped to 'closed' with a `session_auto_closed_stale`
+ * event recording the threshold and the last-event-age. This stops them
+ * from poisoning latest-active auto-detect — the exact failure mode that
+ * caused the "wrong session closed" bug.
+ *
+ * Returns the closed session_ids.
+ */
+export function sweepStaleSessions(
+  db: Database,
+  thresholdSeconds: number,
+): import("./types.js").StaleSessionSweepResult {
+  // Find active sessions whose most recent event is older than the
+  // threshold AND have no in-flight dependent rows.
+  const sql = `
+    SELECT s.id
+      FROM sessions s
+      LEFT JOIN (
+        SELECT session_id, MAX(created_at) AS last_event_at
+          FROM orchestration_events
+         GROUP BY session_id
+      ) e ON e.session_id = s.id
+     WHERE s.status = 'active'
+       AND (
+         e.last_event_at IS NULL
+         OR (julianday('now') - julianday(e.last_event_at)) * 86400 > ?
+       )
+       AND NOT EXISTS (
+         SELECT 1 FROM command_executions ce
+          WHERE ce.workflow_id = s.id
+            AND ce.finished_at IS NULL
+       )
+  `;
+  const rows = resultToRows<{ id: string }>(db.exec(sql, [thresholdSeconds]));
+
+  if (rows.length === 0) {
+    return { closedSessionIds: [] };
+  }
+
+  for (const row of rows) {
+    db.run(
+      `UPDATE sessions
+         SET status = 'closed',
+             current_phase = 'complete',
+             updated_at = datetime('now')
+       WHERE id = ?`,
+      [row.id],
+    );
+    db.run(
+      `INSERT INTO orchestration_events
+         (session_id, event_type, phase, phase_number, round, metadata, created_at)
+       VALUES (?, 'session_auto_closed_stale', 'complete', NULL, NULL, ?, datetime('now'))`,
+      [
+        row.id,
+        JSON.stringify({
+          reason: "no events past threshold; no in-flight dependents",
+          threshold_seconds: thresholdSeconds,
+        }),
+      ],
+    );
+  }
+
+  return { closedSessionIds: rows.map((r) => r.id) };
+}

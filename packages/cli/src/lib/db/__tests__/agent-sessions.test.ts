@@ -15,6 +15,7 @@ import {
   bindVendorSessionIdOpportunistically,
   setAgentSessionStatus,
   sweepStaleAgentSessions,
+  sweepStaleSessions,
 } from "../index.js";
 import { runMigrations } from "../migrations.js";
 import type { Database } from "sql.js";
@@ -281,6 +282,108 @@ describe("sweepStaleAgentSessions", () => {
     expect(result.orphanedIds.sort()).toEqual(["agent-1", "agent-2"]);
     expect(getAgentSession(db, "agent-1")?.status).toBe("orphaned");
     expect(getAgentSession(db, "agent-2")?.status).toBe("orphaned");
+  });
+});
+
+describe("sweepStaleSessions", () => {
+  // Each test seeds its own session and asserts on that session_id
+  // alone — the freshDb's WORKFLOW_ID row has no events and would also
+  // be swept on every run, so we test inclusion rather than strict
+  // array equality.
+
+  it("closes active sessions whose last event is past the threshold", () => {
+    insertSession(db, {
+      id: "stale-old",
+      branch: "feat/stale",
+      workflow_type: "review",
+      session_dir: ".ocr/sessions/stale-old",
+    });
+    // Seed a recent event so this session DOES have history — then
+    // backdate it to look ancient.
+    db.run(
+      `INSERT INTO orchestration_events
+         (session_id, event_type, phase, phase_number, round, created_at)
+       VALUES ('stale-old', 'session_created', 'context', 1, 1, datetime('now', '-30 days'))`,
+    );
+
+    const result = sweepStaleSessions(db, 7 * 24 * 60 * 60);
+
+    expect(result.closedSessionIds).toContain("stale-old");
+    const after = db.exec("SELECT status FROM sessions WHERE id = 'stale-old'");
+    expect(after[0]?.values[0]?.[0]).toBe("closed");
+  });
+
+  it("leaves recently-active sessions alone", () => {
+    insertSession(db, {
+      id: "fresh-session",
+      branch: "feat/fresh",
+      workflow_type: "review",
+      session_dir: ".ocr/sessions/fresh-session",
+    });
+    // Recent event — sweep should leave this session alone.
+    db.run(
+      `INSERT INTO orchestration_events
+         (session_id, event_type, phase, phase_number, round, created_at)
+       VALUES ('fresh-session', 'session_created', 'context', 1, 1, datetime('now'))`,
+    );
+
+    const result = sweepStaleSessions(db, 7 * 24 * 60 * 60);
+    expect(result.closedSessionIds).not.toContain("fresh-session");
+  });
+
+  it("does NOT close a stale-active session that still has in-flight dependents", () => {
+    // The invariant: stale sweep only fires when no command_executions
+    // are still in flight. Protects long-running but quiet workflows
+    // (e.g. an AI thinking for hours without writing a state event).
+    insertSession(db, {
+      id: "stale-with-deps",
+      branch: "feat/sd",
+      workflow_type: "review",
+      session_dir: ".ocr/sessions/stale-with-deps",
+    });
+    db.run(
+      `INSERT INTO orchestration_events
+         (session_id, event_type, phase, phase_number, round, created_at)
+       VALUES ('stale-with-deps', 'session_created', 'context', 1, 1, datetime('now', '-30 days'))`,
+    );
+    // In-flight dependent row: finished_at IS NULL.
+    db.run(
+      `INSERT INTO command_executions (uid, command, args, started_at, workflow_id)
+       VALUES ('live-uid', 'review', '[]', datetime('now'), 'stale-with-deps')`,
+    );
+
+    const result = sweepStaleSessions(db, 7 * 24 * 60 * 60);
+
+    expect(result.closedSessionIds).not.toContain("stale-with-deps");
+    const after = db.exec(
+      "SELECT status FROM sessions WHERE id = 'stale-with-deps'",
+    );
+    expect(after[0]?.values[0]?.[0]).toBe("active");
+  });
+
+  it("writes a session_auto_closed_stale event with the threshold", () => {
+    insertSession(db, {
+      id: "stale-event",
+      branch: "feat/se",
+      workflow_type: "review",
+      session_dir: ".ocr/sessions/stale-event",
+    });
+    db.run(
+      `INSERT INTO orchestration_events
+         (session_id, event_type, phase, phase_number, round, created_at)
+       VALUES ('stale-event', 'session_created', 'context', 1, 1, datetime('now', '-30 days'))`,
+    );
+
+    sweepStaleSessions(db, 7 * 24 * 60 * 60);
+
+    const events = db.exec(
+      `SELECT metadata FROM orchestration_events
+        WHERE session_id = 'stale-event'
+          AND event_type = 'session_auto_closed_stale'`,
+    );
+    expect(events[0]?.values.length).toBe(1);
+    const metadata = JSON.parse(events[0]!.values[0]![0] as string);
+    expect(metadata.threshold_seconds).toBe(7 * 24 * 60 * 60);
   });
 });
 

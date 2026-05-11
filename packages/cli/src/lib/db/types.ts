@@ -113,6 +113,15 @@ export type SweepResult = {
   orphanedIds: string[];
 };
 
+/**
+ * Result of sweepStaleSessions — the workflow_ids that were
+ * auto-closed because they'd been idle past the threshold AND had no
+ * running dependent rows.
+ */
+export type StaleSessionSweepResult = {
+  closedSessionIds: string[];
+};
+
 // ── Migration types ──
 
 export type Migration = {
