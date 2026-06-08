@@ -594,6 +594,14 @@ ocr update --inject      # AGENTS.md/CLAUDE.md only
 - **An AI coding assistant** — Claude Code, Cursor, Windsurf, or [any supported tool](#supported-ai-tools)
 - **GitHub CLI** (`gh`) — Optional, for posting reviews to PRs
 
+> **v2.0 — native SQLite engine**: OCR now stores state with `better-sqlite3`
+> (a native module) for durable, concurrent-safe writes. Prebuilt binaries
+> ship for macOS, Linux, and Windows (x64/arm64) on supported Node versions,
+> so `npm i -g` just works on common platforms. On an unusual platform without
+> a prebuilt binary, install needs a C++ toolchain + Python 3. Run
+> `ocr doctor` — it verifies the engine loaded. Existing databases upgrade
+> automatically on first run (a backup is written to `ocr.db.bak.v<n>`).
+
 Run `ocr doctor` to verify your setup.
 
 > **Important**: The CLI (`npm install -g @open-code-review/cli`) is required for all OCR workflows. Both review and map commands use `ocr state` for progress tracking at every phase transition.
