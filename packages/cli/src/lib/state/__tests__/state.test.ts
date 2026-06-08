@@ -293,9 +293,11 @@ describe("stateClose", () => {
       ocrDir,
     });
 
+    // No completed round — abort is the legitimate way to close it.
     await stateClose({
       sessionId: "close-test",
       ocrDir,
+      abort: true,
     });
 
     const result = await stateShow(ocrDir, "close-test");
@@ -313,6 +315,13 @@ describe("stateClose", () => {
       ocrDir,
     });
 
+    // Finalize a round so a normal (non-abort) close is permitted.
+    await stateRoundComplete({
+      source: "stdin",
+      ocrDir,
+      sessionId: "close-event",
+      data: JSON.stringify({ schema_version: 1, verdict: "APPROVE", reviewers: [] }),
+    });
     await stateClose({
       sessionId: "close-event",
       ocrDir,
@@ -397,6 +406,7 @@ describe("stateShow", () => {
     await stateClose({
       sessionId: "temp",
       ocrDir,
+      abort: true,
     });
 
     // No active sessions now
@@ -600,6 +610,7 @@ describe("resolveActiveSession", () => {
     await stateClose({
       sessionId: "closed-resolve",
       ocrDir,
+      abort: true,
     });
 
     await expect(resolveActiveSession(ocrDir)).rejects.toThrow(
@@ -773,6 +784,12 @@ describe("stateClose — cascade + idempotency", () => {
       sessionDir: dir,
       ocrDir,
     });
+    await stateRoundComplete({
+      source: "stdin",
+      ocrDir,
+      sessionId: "idemp",
+      data: JSON.stringify({ schema_version: 1, verdict: "APPROVE", reviewers: [] }),
+    });
     await stateClose({ sessionId: "idemp", ocrDir });
     // Second close: must not throw, must not write a duplicate event.
     await expect(
@@ -803,7 +820,7 @@ describe("stateClose — cascade + idempotency", () => {
       ["dash-cascade-uid", "cascade"],
     );
 
-    await stateClose({ sessionId: "cascade", ocrDir });
+    await stateClose({ sessionId: "cascade", ocrDir, abort: true });
 
     const result = db.exec(
       `SELECT exit_code, finished_at, notes
@@ -864,7 +881,7 @@ describe("stateInit — re-open derives round from events", () => {
       sessionDir: dir,
       ocrDir,
     });
-    await stateClose({ sessionId: "type-mismatch", ocrDir });
+    await stateClose({ sessionId: "type-mismatch", ocrDir, abort: true });
     await expect(
       stateInit({
         sessionId: "type-mismatch",
@@ -1163,7 +1180,7 @@ describe("stateRoundComplete", () => {
       sessionDir: dir,
       ocrDir,
     });
-    await stateClose({ sessionId: "no-active-rc", ocrDir });
+    await stateClose({ sessionId: "no-active-rc", ocrDir, abort: true });
 
     const meta = makeRoundMeta();
     const filePath = writeRoundMeta(dir, meta);
@@ -1274,7 +1291,7 @@ describe("stateRoundComplete", () => {
       sessionDir: dir,
       ocrDir,
     });
-    await stateClose({ sessionId: "closed-target", ocrDir });
+    await stateClose({ sessionId: "closed-target", ocrDir, abort: true });
 
     const meta = makeRoundMeta({ verdict: "APPROVE", reviewers: [] });
     const filePath = writeRoundMeta(dir, meta);

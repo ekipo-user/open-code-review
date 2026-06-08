@@ -427,6 +427,10 @@ describe("bindVendorSessionIdOpportunistically", () => {
   });
 
   it("ignores rows in inactive workflows", () => {
+    db.run(
+      `INSERT INTO orchestration_events (session_id, event_type, created_at) VALUES (?, 'session_synced', datetime('now'))`,
+      [WORKFLOW_ID],
+    );
     db.run(`UPDATE sessions SET status = 'closed' WHERE id = ?`, [WORKFLOW_ID]);
     insertAgentSession(db, {
       id: "agent-1",

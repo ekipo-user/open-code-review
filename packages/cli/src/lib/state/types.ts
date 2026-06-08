@@ -44,6 +44,12 @@ export type TransitionParams = {
 export type CloseParams = {
   sessionId: string;
   ocrDir: string;
+  /**
+   * Abandon the session instead of completing it. Records a distinct
+   * `session_aborted` terminal event (never reported as success) and
+   * bypasses the completion invariant.
+   */
+  abort?: boolean;
 };
 
 // ── Round Meta (orchestrator-first structured data) ──

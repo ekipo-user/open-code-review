@@ -145,6 +145,8 @@ describe("Session CRUD", () => {
       session_dir: "/tmp/ocr/sessions/test-session-2",
     });
 
+    // A reason event makes the close-guard trigger permit the close.
+    insertEvent(db, { session_id: "test-session-2", event_type: "session_synced" });
     updateSession(db, "test-session-2", {
       status: "closed",
       current_phase: "synthesis",
@@ -191,6 +193,7 @@ describe("Session CRUD", () => {
       workflow_type: "review",
       session_dir: "/tmp/ocr/sessions/closed-session",
     });
+    insertEvent(db, { session_id: "closed-session", event_type: "session_synced" });
     updateSession(db, "closed-session", { status: "closed" });
 
     const latest = getLatestActiveSession(db);

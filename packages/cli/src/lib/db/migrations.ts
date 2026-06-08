@@ -357,6 +357,30 @@ const MIGRATIONS: Migration[] = [
         SELECT RAISE(ABORT, 'unknown orchestration_events.event_type');
       END;
 
+      -- ── Close-guard (DB backstop for the completion invariant) ──
+      -- A session cannot transition active → closed unless its current
+      -- round/run has a terminal artifact event, OR an explicit reason event
+      -- (abort / auto-close-stale / sync / legacy-import) is present. Only a
+      -- *silent* premature close is banned — every legitimate non-artifact
+      -- close carries a reason event and passes. App-level guards in
+      -- stateClose/finish are the primary check; this makes the illegal state
+      -- unrepresentable even via raw SQL.
+      CREATE TRIGGER IF NOT EXISTS trg_sessions_close_guard
+      BEFORE UPDATE OF status ON sessions
+      WHEN NEW.status = 'closed' AND OLD.status <> 'closed'
+        AND NOT EXISTS (
+          SELECT 1 FROM orchestration_events e
+           WHERE e.session_id = NEW.id
+             AND (
+               (NEW.workflow_type = 'review' AND e.event_type = 'round_completed' AND e.round = NEW.current_round)
+               OR (NEW.workflow_type = 'map' AND e.event_type = 'map_completed'   AND e.round = NEW.current_map_run)
+               OR e.event_type IN ('session_aborted','session_auto_closed_stale','session_synced','session_legacy_import')
+             )
+        )
+      BEGIN
+        SELECT RAISE(ABORT, 'cannot close session without a completed round/run or an explicit reason event');
+      END;
+
       -- ── session_completeness view ──
       -- The published contract for "is this session actually complete, and if
       -- not, what's missing". Completion is DERIVED from the event log, never a

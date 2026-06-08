@@ -537,14 +537,7 @@ export function sweepStaleSessions(
   }
 
   for (const row of rows) {
-    db.run(
-      `UPDATE sessions
-         SET status = 'closed',
-             current_phase = 'complete',
-             updated_at = datetime('now')
-       WHERE id = ?`,
-      [row.id],
-    );
+    // Reason event FIRST so the close-guard trigger permits the close.
     db.run(
       `INSERT INTO orchestration_events
          (session_id, event_type, phase, phase_number, round, metadata, created_at)
@@ -556,6 +549,14 @@ export function sweepStaleSessions(
           threshold_seconds: thresholdSeconds,
         }),
       ],
+    );
+    db.run(
+      `UPDATE sessions
+         SET status = 'closed',
+             current_phase = 'complete',
+             updated_at = datetime('now')
+       WHERE id = ?`,
+      [row.id],
     );
   }
 

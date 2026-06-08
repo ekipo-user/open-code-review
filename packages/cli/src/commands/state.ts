@@ -24,7 +24,13 @@ import {
   stateSync,
   stateRoundComplete,
   stateMapComplete,
+  stateBegin,
+  stateAdvance,
+  stateCompleteRound,
+  stateCompleteMap,
+  stateStatus,
   resolveActiveSession,
+  StateError,
 } from "../lib/state/index.js";
 import type { WorkflowType, ReviewPhase, MapPhase, RoundCompleteResult, MapCompleteResult } from "../lib/state/types.js";
 import { replayCommandLog } from "../lib/db/command-log.js";
@@ -623,6 +629,224 @@ const reconcileSubcommand = new Command("reconcile")
     }
   });
 
+// ── Atomic porcelain (the misuse-proof agent API) ──
+
+/** Map a thrown error to its exit code + message, then exit. */
+function exitFromStateError(error: unknown, fallback: string): never {
+  if (error instanceof StateError) {
+    console.error(chalk.red(`Error: ${error.message}`));
+    process.exit(error.code);
+  }
+  console.error(
+    chalk.red(`Error: ${error instanceof Error ? error.message : fallback}`),
+  );
+  process.exit(1);
+}
+
+const beginSubcommand = new Command("begin")
+  .description("Start or resume a workflow and report where it stands")
+  .requiredOption("--session-id <id>", "Session ID")
+  .requiredOption("--branch <branch>", "Branch name")
+  .requiredOption("--workflow-type <type>", "Workflow type (review or map)", (v: string) => {
+    if (v !== "review" && v !== "map") {
+      throw new Error(`Invalid workflow type: "${v}". Must be "review" or "map".`);
+    }
+    return v as WorkflowType;
+  })
+  .option("--session-dir <dir>", "Session directory path (auto-resolved if omitted)")
+  .option("--json", "Output the result as JSON")
+  .action(
+    async (options: {
+      sessionId: string;
+      branch: string;
+      workflowType: WorkflowType;
+      sessionDir?: string;
+      json?: boolean;
+    }) => {
+      const targetDir = process.cwd();
+      requireOcrSetup(targetDir);
+      const ocrDir = join(targetDir, ".ocr");
+      const sessionDir =
+        options.sessionDir ?? join(ocrDir, "sessions", options.sessionId);
+      if (!existsSync(sessionDir)) mkdirSync(sessionDir, { recursive: true });
+      try {
+        const result = await stateBegin({
+          sessionId: options.sessionId,
+          branch: options.branch,
+          workflowType: options.workflowType,
+          sessionDir,
+          ocrDir,
+        });
+        console.log(
+          options.json
+            ? JSON.stringify(result, null, 2)
+            : `${result.session_id}: round ${result.round}, phase ${result.phase} (${result.completeness ?? "unknown"})`,
+        );
+      } catch (error) {
+        exitFromStateError(error, "Failed to begin session");
+      }
+    },
+  );
+
+const advanceSubcommand = new Command("advance")
+  .description("Advance the workflow to a phase (graph-validated; phase number derived)")
+  .requiredOption("--phase <phase>", "Target phase name")
+  .option("--session-id <id>", "Session ID (auto-detects active if omitted)")
+  .option("--current-round <number>", "Round number", parseInt)
+  .option("--current-map-run <number>", "Map run number", parseInt)
+  .action(
+    async (options: {
+      phase: string;
+      sessionId?: string;
+      currentRound?: number;
+      currentMapRun?: number;
+    }) => {
+      const targetDir = process.cwd();
+      requireOcrSetup(targetDir);
+      const ocrDir = join(targetDir, ".ocr");
+      try {
+        const { id: sessionId } = await resolveActiveSession(ocrDir, options.sessionId);
+        await stateAdvance({
+          sessionId,
+          phase: options.phase,
+          round: options.currentRound,
+          mapRun: options.currentMapRun,
+          ocrDir,
+        });
+        console.log(`${sessionId}: ${options.phase}`);
+      } catch (error) {
+        exitFromStateError(error, "Failed to advance");
+      }
+    },
+  );
+
+const completeRoundSubcommand = new Command("complete-round")
+  .description("Atomically finalize a review round (validate + record + transition)")
+  .option("--session-id <id>", "Session ID (auto-detects active if omitted)")
+  .option("--round <number>", "Round number (defaults to current)", parseInt)
+  .option("--stdin", "Read round metadata JSON from stdin")
+  .option("--file <path>", "Read round metadata JSON from a file")
+  .option("--require-final", "Require rounds/round-N/final.md to exist")
+  .option("--json", "Output the result as JSON")
+  .action(
+    async (options: {
+      sessionId?: string;
+      round?: number;
+      stdin?: boolean;
+      file?: string;
+      requireFinal?: boolean;
+      json?: boolean;
+    }) => {
+      const targetDir = process.cwd();
+      requireOcrSetup(targetDir);
+      const ocrDir = join(targetDir, ".ocr");
+      try {
+        const base = options.stdin
+          ? { source: "stdin" as const, data: readFileSync(0, "utf-8") }
+          : options.file
+            ? { source: "file" as const, filePath: options.file }
+            : (() => {
+                throw new StateError(2, "Provide --stdin or --file with round metadata");
+              })();
+        const result = await stateCompleteRound({
+          ...base,
+          ocrDir,
+          sessionId: options.sessionId,
+          round: options.round,
+          requireFinal: options.requireFinal,
+        });
+        console.log(
+          options.json
+            ? JSON.stringify(result, null, 2)
+            : `${result.sessionId}: round ${result.round} complete`,
+        );
+      } catch (error) {
+        exitFromStateError(error, "Failed to complete round");
+      }
+    },
+  );
+
+const completeMapSubcommand = new Command("complete-map")
+  .description("Atomically finalize a map run (validate + record + transition)")
+  .option("--session-id <id>", "Session ID (auto-detects active if omitted)")
+  .option("--map-run <number>", "Map run number (defaults to current)", parseInt)
+  .option("--stdin", "Read map metadata JSON from stdin")
+  .option("--file <path>", "Read map metadata JSON from a file")
+  .option("--json", "Output the result as JSON")
+  .action(
+    async (options: {
+      sessionId?: string;
+      mapRun?: number;
+      stdin?: boolean;
+      file?: string;
+      json?: boolean;
+    }) => {
+      const targetDir = process.cwd();
+      requireOcrSetup(targetDir);
+      const ocrDir = join(targetDir, ".ocr");
+      try {
+        const base = options.stdin
+          ? { source: "stdin" as const, data: readFileSync(0, "utf-8") }
+          : options.file
+            ? { source: "file" as const, filePath: options.file }
+            : (() => {
+                throw new StateError(2, "Provide --stdin or --file with map metadata");
+              })();
+        const result = await stateCompleteMap({
+          ...base,
+          ocrDir,
+          sessionId: options.sessionId,
+          mapRun: options.mapRun,
+        });
+        console.log(
+          options.json
+            ? JSON.stringify(result, null, 2)
+            : `${result.sessionId}: map run ${result.mapRun} complete`,
+        );
+      } catch (error) {
+        exitFromStateError(error, "Failed to complete map");
+      }
+    },
+  );
+
+const finishSubcommand = new Command("finish")
+  .description("Close a workflow (refuses unless the current round/run is complete)")
+  .option("--session-id <id>", "Session ID (auto-detects active if omitted)")
+  .option("--abort", "Abandon the session — records a distinct, non-success terminal")
+  .action(async (options: { sessionId?: string; abort?: boolean }) => {
+    const targetDir = process.cwd();
+    requireOcrSetup(targetDir);
+    const ocrDir = join(targetDir, ".ocr");
+    try {
+      const { id: sessionId } = await resolveActiveSession(ocrDir, options.sessionId);
+      await stateClose({ sessionId, ocrDir, abort: options.abort });
+      console.log(`${sessionId}: ${options.abort ? "aborted" : "finished"}`);
+    } catch (error) {
+      exitFromStateError(error, "Failed to finish");
+    }
+  });
+
+const statusSubcommand = new Command("status")
+  .description("Report whether a session is complete and, if not, what's missing")
+  .option("--session-id <id>", "Session ID (auto-detects active if omitted)")
+  .option("--json", "Output the result as JSON")
+  .action(async (options: { sessionId?: string; json?: boolean }) => {
+    const targetDir = process.cwd();
+    requireOcrSetup(targetDir);
+    const ocrDir = join(targetDir, ".ocr");
+    try {
+      const result = await stateStatus(ocrDir, options.sessionId);
+      if (options.json) {
+        console.log(JSON.stringify(result, null, 2));
+      } else {
+        console.log(`${result.session_id}: ${result.completeness_state}`);
+        console.log(chalk.dim(`  next: ${result.next_action}`));
+      }
+    } catch (error) {
+      exitFromStateError(error, "Failed to read status");
+    }
+  });
+
 // ── Main state command ──
 
 export const stateCommand = new Command("state")
@@ -634,4 +858,11 @@ export const stateCommand = new Command("state")
   .addCommand(syncSubcommand)
   .addCommand(roundCompleteSubcommand)
   .addCommand(mapCompleteSubcommand)
-  .addCommand(reconcileSubcommand);
+  .addCommand(reconcileSubcommand)
+  // Atomic porcelain (preferred agent API).
+  .addCommand(beginSubcommand)
+  .addCommand(advanceSubcommand)
+  .addCommand(completeRoundSubcommand)
+  .addCommand(completeMapSubcommand)
+  .addCommand(finishSubcommand)
+  .addCommand(statusSubcommand);

@@ -96,14 +96,13 @@ describe("migration v12 — session_completeness view", () => {
   });
 
   it("classifies a closed session without an artifact as closed_without_artifact", () => {
-    // The "completed too soon" condition.
-    insertSession(db, {
-      id: "premature",
-      branch: "feat/p",
-      workflow_type: "review",
-      session_dir: ".ocr/sessions/premature",
-    });
-    updateSession(db, "premature", { status: "closed" });
+    // The "completed too soon" condition — a legacy pre-trigger row,
+    // created via direct INSERT (the close-guard governs UPDATEs, not
+    // fixture inserts).
+    db.run(
+      `INSERT INTO sessions (id, branch, status, workflow_type, current_phase, phase_number, current_round, current_map_run, session_dir)
+       VALUES ('premature', 'feat/p', 'closed', 'review', 'complete', 8, 1, 1, '.ocr/sessions/premature')`,
+    );
     expect(classify("premature")).toBe("closed_without_artifact");
   });
 
@@ -132,13 +131,10 @@ describe("migration v12 — session_completeness view", () => {
   });
 
   it("is the canonical detection for closed_without_artifact", () => {
-    insertSession(db, {
-      id: "bad",
-      branch: "feat/b",
-      workflow_type: "review",
-      session_dir: ".ocr/sessions/bad",
-    });
-    updateSession(db, "bad", { status: "closed" });
+    db.run(
+      `INSERT INTO sessions (id, branch, status, workflow_type, current_phase, phase_number, current_round, current_map_run, session_dir)
+       VALUES ('bad', 'feat/b', 'closed', 'review', 'complete', 8, 1, 1, '.ocr/sessions/bad')`,
+    );
     const rows = db.exec(
       "SELECT session_id FROM session_completeness WHERE completeness_state = 'closed_without_artifact'",
     );

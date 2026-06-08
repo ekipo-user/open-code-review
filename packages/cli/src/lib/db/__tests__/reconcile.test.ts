@@ -37,17 +37,31 @@ function seed(
   opts: { workflow_type?: "review" | "map"; round?: number; mapRun?: number } = {},
 ): string {
   const sessionDir = join(".ocr", "sessions", id);
-  insertSession(db, {
-    id,
-    branch: "feat/x",
-    workflow_type: opts.workflow_type ?? "review",
-    session_dir: sessionDir,
-  });
-  // Mirror stateInit: every real session has a session_created event.
-  insertEvent(db, { session_id: id, event_type: "session_created", round: 1 });
-  if (opts.round) updateSession(db, id, { current_round: opts.round });
-  if (opts.mapRun) updateSession(db, id, { current_map_run: opts.mapRun });
-  if (status === "closed") updateSession(db, id, { status: "closed" });
+  const wf = opts.workflow_type ?? "review";
+  if (status === "closed") {
+    // Simulate a legacy pre-trigger row: closed without a terminal/reason
+    // event (the exact "completed too soon" state reconcile must heal).
+    // Direct INSERT bypasses the close-guard, which only governs the
+    // active → closed UPDATE transition, not fixture creation.
+    db.run(
+      `INSERT INTO sessions
+         (id, branch, status, workflow_type, current_phase, phase_number, current_round, current_map_run, session_dir)
+       VALUES (?, 'feat/x', 'closed', ?, 'complete', 8, ?, ?, ?)`,
+      [id, wf, opts.round ?? 1, opts.mapRun ?? 1, sessionDir],
+    );
+    insertEvent(db, { session_id: id, event_type: "session_created", round: 1 });
+  } else {
+    insertSession(db, {
+      id,
+      branch: "feat/x",
+      workflow_type: wf,
+      session_dir: sessionDir,
+    });
+    // Mirror stateInit: every real session has a session_created event.
+    insertEvent(db, { session_id: id, event_type: "session_created", round: 1 });
+    if (opts.round) updateSession(db, id, { current_round: opts.round });
+    if (opts.mapRun) updateSession(db, id, { current_map_run: opts.mapRun });
+  }
   return join(tmpDir, sessionDir);
 }
 

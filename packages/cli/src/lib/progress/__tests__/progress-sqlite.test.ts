@@ -223,9 +223,11 @@ describe("Waiting state", () => {
     });
 
     const { stateClose } = await import("../../state/index.js");
+    // No completed round — abort is the legitimate close for this fixture.
     await stateClose({
       sessionId: "closed-session",
       ocrDir,
+      abort: true,
     });
 
     const dbPath = join(ocrDir, "data", "ocr.db");

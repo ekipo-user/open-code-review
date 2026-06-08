@@ -502,6 +502,14 @@ export class FilesystemSync {
       [sessionId],
     )
     if (session && session['workflow_type'] === 'map' && (session['current_phase'] !== 'complete' || (session['phase_number'] as number) < 6)) {
+      // Reason event first so the close-guard trigger permits this
+      // filesystem-derived backfill close (single-writer: the dashboard's
+      // backfill is a sync, recorded as such).
+      this.db.run(
+        `INSERT INTO orchestration_events (session_id, event_type, phase, phase_number, metadata, created_at)
+         VALUES (?, 'session_synced', 'complete', 6, ?, datetime('now'))`,
+        [sessionId, JSON.stringify({ source: 'filesystem_backfill' })],
+      )
       this.db.run(
         `UPDATE sessions SET current_phase = 'complete', phase_number = 6, status = 'closed', updated_at = datetime('now')
          WHERE id = ?`,
@@ -1136,6 +1144,13 @@ export class FilesystemSync {
       [sessionId],
     )
     if (session && (session['current_phase'] !== 'complete' || (session['phase_number'] as number) < 8)) {
+      // Reason event first so the close-guard trigger permits this
+      // filesystem-derived backfill close.
+      this.db.run(
+        `INSERT INTO orchestration_events (session_id, event_type, phase, phase_number, metadata, created_at)
+         VALUES (?, 'session_synced', 'complete', 8, ?, datetime('now'))`,
+        [sessionId, JSON.stringify({ source: 'filesystem_backfill' })],
+      )
       this.db.run(
         `UPDATE sessions SET current_phase = 'complete', phase_number = 8, status = 'closed', updated_at = datetime('now')
          WHERE id = ?`,
