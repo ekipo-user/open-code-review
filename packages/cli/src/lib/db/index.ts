@@ -12,6 +12,7 @@ import { dirname, join } from "node:path";
 import { openEngine, type Database } from "./engine.js";
 import { runMigrations, getSchemaVersion } from "./migrations.js";
 import { reconcileLegacyState } from "./reconcile.js";
+import type { ReconcileResult } from "./reconcile.js";
 
 /**
  * Schema version that introduces the v2.0 event-sourced lifecycle. Databases
@@ -24,24 +25,59 @@ const V2_SCHEMA_VERSION = 12;
  * the v12 upgrade — cheap, total recoverability for local-first users. A
  * brand-new database (version 0) is skipped. WAL is checkpoint-truncated
  * first so the copied main file is current.
+ *
+ * Returns the backup path when a snapshot was written, else `null`.
  */
-function maybeSnapshotBeforeUpgrade(db: Database, dbPath: string): void {
-  let version: number;
+function maybeSnapshotBeforeUpgrade(
+  db: Database,
+  dbPath: string,
+  fromVersion: number,
+): string | null {
+  if (fromVersion < 1 || fromVersion >= V2_SCHEMA_VERSION) return null;
+  const bakPath = `${dbPath}.bak.v${fromVersion}`;
+  if (existsSync(bakPath)) return bakPath; // already snapshotted on a prior attempt
   try {
-    version = getSchemaVersion(db);
-  } catch {
-    return;
-  }
-  if (version < 1 || version >= V2_SCHEMA_VERSION) return;
-  const bakPath = `${dbPath}.bak.v${version}`;
-  if (existsSync(bakPath)) return; // already snapshotted on a prior attempt
-  try {
-    if (!existsSync(dbPath) || statSync(dbPath).size === 0) return;
+    if (!existsSync(dbPath) || statSync(dbPath).size === 0) return null;
     db.pragma("wal_checkpoint(TRUNCATE)");
     copyFileSync(dbPath, bakPath);
+    return bakPath;
   } catch {
     // Snapshot is best-effort insurance; never block the upgrade on it.
+    return null;
   }
+}
+
+/**
+ * Compose the one-time stderr notice shown when an existing pre-v2 database is
+ * upgraded. Pure + exported so it can be unit-tested. Returns `null` when
+ * there's nothing worth announcing (defensive; the caller only invokes it on a
+ * real upgrade).
+ */
+export function formatUpgradeNotice(
+  bakPath: string | null,
+  reconcile: ReconcileResult | undefined,
+): string | null {
+  const lines = [
+    "Storage upgraded to v2.0 — durable SQLite engine (WAL), event-sourced lifecycle.",
+  ];
+  if (bakPath) {
+    lines.push(`  A backup of your previous database was saved to: ${bakPath}`);
+  }
+  const repairs = (reconcile?.actions ?? []).filter((a) => a.kind !== "ok");
+  if (repairs.length > 0) {
+    const n = (kind: string) => repairs.filter((a) => a.kind === kind).length;
+    const parts: string[] = [];
+    const finalized =
+      n("synthesize-round-completed") + n("synthesize-map-completed");
+    if (finalized > 0) parts.push(`${finalized} finalized from artifacts`);
+    if (n("grandfather") > 0) parts.push(`${n("grandfather")} grandfathered`);
+    if (n("stale-close") > 0) parts.push(`${n("stale-close")} stale closed`);
+    lines.push(
+      `  Reconciled ${repairs.length} legacy session(s): ${parts.join(", ")}.`,
+    );
+  }
+  lines.push("  Run `ocr doctor` to verify the storage engine.");
+  return lines.map((l) => `[ocr] ${l}`).join("\n");
 }
 
 // Re-export public types and functions
@@ -187,21 +223,36 @@ export async function ensureDatabase(ocrDir: string): Promise<Database> {
   } catch {
     before = 0;
   }
-  maybeSnapshotBeforeUpgrade(db, dbPath);
+  // An upgrade of an EXISTING pre-v2 database (not a brand-new install, which
+  // starts at version 0). Used to gate the snapshot, reconciliation, and the
+  // one-time notice — all of which run exactly once per machine because, after
+  // this, `before` is always >= V2_SCHEMA_VERSION.
+  const isLegacyUpgrade = before >= 1 && before < V2_SCHEMA_VERSION;
+
+  const bakPath = maybeSnapshotBeforeUpgrade(db, dbPath, before);
   runMigrations(db);
 
   // On crossing into the v2 event-sourced model, heal legacy state (derive
   // truth from events + filesystem artifacts) once, automatically. Runs after
   // the schema is in place; safe to skip on any error so it never blocks
   // opening the database.
+  let reconcile: ReconcileResult | undefined;
   if (before < V2_SCHEMA_VERSION) {
     try {
-      reconcileLegacyState(db, ocrDir);
+      reconcile = reconcileLegacyState(db, ocrDir);
     } catch (err) {
       console.error(
         `[ocr] legacy reconciliation skipped: ${err instanceof Error ? err.message : String(err)}`,
       );
     }
+  }
+
+  // One-time, hands-off migration visibility. Emitted to STDERR so it never
+  // pollutes machine-readable stdout (e.g. `ocr state status --json`). Fires
+  // only when an existing pre-v2 database was actually upgraded.
+  if (isLegacyUpgrade) {
+    const notice = formatUpgradeNotice(bakPath, reconcile);
+    if (notice) console.error(notice);
   }
 
   saveDatabase(db, dbPath);

@@ -1,7 +1,7 @@
 import { mkdtempSync, rmSync, existsSync } from "node:fs";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
-import { describe, it, expect, beforeEach, afterEach } from "vitest";
+import { describe, it, expect, beforeEach, afterEach, vi } from "vitest";
 import {
   openDatabase,
   ensureDatabase,
@@ -10,6 +10,7 @@ import {
   insertSession,
   insertEvent,
   updateSession,
+  formatUpgradeNotice,
   type Database,
 } from "../index.js";
 
@@ -212,5 +213,60 @@ describe("migration v12 — pre-upgrade snapshot", () => {
     // Re-open: getSchemaVersion now reports 11 → snapshot fires.
     await ensureDatabase(ocrDir);
     expect(existsSync(`${dbPath}.bak.v11`)).toBe(true);
+  });
+});
+
+describe("migration v12 — one-time upgrade notice", () => {
+  it("formats the notice with backup path + reconciliation summary", () => {
+    const notice = formatUpgradeNotice("/p/.ocr/data/ocr.db.bak.v11", {
+      dryRun: false,
+      actions: [
+        { sessionId: "a", kind: "synthesize-round-completed", detail: "" },
+        { sessionId: "b", kind: "grandfather", detail: "" },
+        { sessionId: "c", kind: "stale-close", detail: "" },
+        { sessionId: "d", kind: "ok", detail: "" },
+      ],
+    });
+    expect(notice).toContain("Storage upgraded to v2.0");
+    expect(notice).toContain("ocr.db.bak.v11");
+    expect(notice).toContain("Reconciled 3 legacy session(s)");
+    expect(notice).toContain("1 finalized from artifacts");
+    expect(notice).toContain("1 grandfathered");
+    expect(notice).toContain("1 stale closed");
+    // STDERR-only convention: each line is prefixed for grep-ability.
+    for (const line of notice!.split("\n")) expect(line.startsWith("[ocr] ")).toBe(true);
+  });
+
+  it("omits the reconciliation line when nothing needed repair", () => {
+    const notice = formatUpgradeNotice("/p/ocr.db.bak.v11", { dryRun: false, actions: [] });
+    expect(notice).toContain("Storage upgraded to v2.0");
+    expect(notice).not.toContain("Reconciled");
+  });
+
+  it("emits the notice once on a real upgrade, and never for a brand-new install", async () => {
+    const errSpy = vi.spyOn(console, "error").mockImplementation(() => {});
+    try {
+      // Brand-new install (version 0 → v12): NO upgrade notice.
+      const freshDir = join(tmpDir, "fresh", ".ocr");
+      await ensureDatabase(freshDir);
+      expect(
+        errSpy.mock.calls.flat().some((a) => String(a).includes("Storage upgraded to v2.0")),
+      ).toBe(false);
+
+      // Existing pre-v12 db → upgrade notice fires.
+      const ocrDir = join(tmpDir, "legacy", ".ocr");
+      const conn = await ensureDatabase(ocrDir);
+      conn.run("DELETE FROM schema_version WHERE version = 12");
+      closeAllDatabases();
+      errSpy.mockClear();
+
+      await ensureDatabase(ocrDir); // before = 11 → notice
+      const emitted = errSpy.mock.calls
+        .flat()
+        .filter((a) => String(a).includes("Storage upgraded to v2.0"));
+      expect(emitted.length).toBe(1);
+    } finally {
+      errSpy.mockRestore();
+    }
   });
 });
