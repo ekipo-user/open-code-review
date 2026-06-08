@@ -7,10 +7,41 @@
  * lifecycle, migrations, and re-exports.
  */
 
-import { existsSync, mkdirSync } from "node:fs";
+import { existsSync, mkdirSync, copyFileSync, statSync } from "node:fs";
 import { dirname, join } from "node:path";
 import { openEngine, type Database } from "./engine.js";
-import { runMigrations } from "./migrations.js";
+import { runMigrations, getSchemaVersion } from "./migrations.js";
+
+/**
+ * Schema version that introduces the v2.0 event-sourced lifecycle. Databases
+ * below this are snapshotted before the upgrade (see {@link ensureDatabase}).
+ */
+const V2_SCHEMA_VERSION = 12;
+
+/**
+ * Snapshot an existing pre-v2 database to `ocr.db.bak.v<n>` before applying
+ * the v12 upgrade — cheap, total recoverability for local-first users. A
+ * brand-new database (version 0) is skipped. WAL is checkpoint-truncated
+ * first so the copied main file is current.
+ */
+function maybeSnapshotBeforeUpgrade(db: Database, dbPath: string): void {
+  let version: number;
+  try {
+    version = getSchemaVersion(db);
+  } catch {
+    return;
+  }
+  if (version < 1 || version >= V2_SCHEMA_VERSION) return;
+  const bakPath = `${dbPath}.bak.v${version}`;
+  if (existsSync(bakPath)) return; // already snapshotted on a prior attempt
+  try {
+    if (!existsSync(dbPath) || statSync(dbPath).size === 0) return;
+    db.pragma("wal_checkpoint(TRUNCATE)");
+    copyFileSync(dbPath, bakPath);
+  } catch {
+    // Snapshot is best-effort insurance; never block the upgrade on it.
+  }
+}
 
 // Re-export public types and functions
 export type {
@@ -141,6 +172,7 @@ export async function ensureDatabase(ocrDir: string): Promise<Database> {
 
   const dbPath = join(dataDir, "ocr.db");
   const db = await openDatabase(dbPath);
+  maybeSnapshotBeforeUpgrade(db, dbPath);
   runMigrations(db);
   saveDatabase(db, dbPath);
 

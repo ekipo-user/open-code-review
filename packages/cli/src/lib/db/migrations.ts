@@ -328,6 +328,88 @@ const MIGRATIONS: Migration[] = [
       DROP TABLE IF EXISTS agent_sessions;
     `,
   },
+  {
+    version: 12,
+    description:
+      "Event-sourced lifecycle hardening: event_type taxonomy guard, sweep indexes, session_completeness view",
+    sql: `
+      -- ── Indexes for the now-periodic stale-session sweep + round derivation ──
+      -- The sweep filters sessions by status and rolls up MAX(created_at) per
+      -- session over the event log; deriveNextRound does MAX(round). Index both.
+      CREATE INDEX IF NOT EXISTS idx_sessions_status ON sessions(status);
+      CREATE INDEX IF NOT EXISTS idx_events_session_created
+        ON orchestration_events(session_id, created_at);
+
+      -- ── Event-type taxonomy guard ──
+      -- orchestration_events.event_type is the spine of all lifecycle
+      -- derivation. A typo (e.g. 'round_complete' vs 'round_completed') would
+      -- silently break deriveNextRound and the completeness view. SQLite cannot
+      -- add a CHECK to an existing column without a table rebuild, so enforce
+      -- the closed vocabulary with a BEFORE INSERT trigger instead.
+      CREATE TRIGGER IF NOT EXISTS trg_events_known_type
+      BEFORE INSERT ON orchestration_events
+      WHEN NEW.event_type NOT IN (
+        'session_created', 'session_resumed', 'round_started', 'phase_transition',
+        'round_completed', 'map_completed', 'session_closed', 'session_aborted',
+        'session_auto_closed_stale', 'session_synced', 'session_legacy_import'
+      )
+      BEGIN
+        SELECT RAISE(ABORT, 'unknown orchestration_events.event_type');
+      END;
+
+      -- ── session_completeness view ──
+      -- The published contract for "is this session actually complete, and if
+      -- not, what's missing". Completion is DERIVED from the event log, never a
+      -- mutable flag: a session is complete iff it is closed AND a terminal
+      -- artifact event exists for its current round/run. The dashboard's
+      -- outcome derivation and the agent 'status' command read this view, so
+      -- they cannot disagree.
+      --
+      --   completeness_state:
+      --     'complete'                — closed + terminal artifact for current round/run
+      --     'closed_without_artifact' — closed but no terminal artifact (the
+      --                                 "completed too soon" condition)
+      --     'in_flight'               — open with a dependent process still running
+      --     'open_no_artifact'        — open, no in-flight dependents
+      CREATE VIEW IF NOT EXISTS session_completeness AS
+      SELECT
+        s.id              AS session_id,
+        s.workflow_type   AS workflow_type,
+        s.status          AS status,
+        s.current_round   AS current_round,
+        s.current_map_run AS current_map_run,
+        CASE WHEN EXISTS (
+          SELECT 1 FROM orchestration_events e
+           WHERE e.session_id = s.id
+             AND (
+               (s.workflow_type = 'review' AND e.event_type = 'round_completed' AND e.round = s.current_round)
+               OR (s.workflow_type = 'map' AND e.event_type = 'map_completed'   AND e.round = s.current_map_run)
+             )
+        ) THEN 1 ELSE 0 END AS has_terminal_artifact,
+        CASE WHEN s.status = 'closed' THEN 1 ELSE 0 END AS marked_closed,
+        CASE WHEN NOT EXISTS (
+          SELECT 1 FROM command_executions ce
+           WHERE ce.workflow_id = s.id AND ce.finished_at IS NULL
+        ) THEN 1 ELSE 0 END AS dependents_settled,
+        CASE
+          WHEN s.status = 'closed' AND EXISTS (
+            SELECT 1 FROM orchestration_events e
+             WHERE e.session_id = s.id
+               AND (
+                 (s.workflow_type = 'review' AND e.event_type = 'round_completed' AND e.round = s.current_round)
+                 OR (s.workflow_type = 'map' AND e.event_type = 'map_completed'   AND e.round = s.current_map_run)
+               )
+          ) THEN 'complete'
+          WHEN s.status = 'closed' THEN 'closed_without_artifact'
+          WHEN EXISTS (
+            SELECT 1 FROM command_executions ce
+             WHERE ce.workflow_id = s.id AND ce.finished_at IS NULL
+          ) THEN 'in_flight'
+          ELSE 'open_no_artifact'
+        END AS completeness_state
+      FROM sessions s;
+    `,
+  },
 ];
 
 /**
@@ -341,6 +423,16 @@ function ensureSchemaVersionTable(db: Database): void {
       description TEXT NOT NULL
     );
   `);
+}
+
+/**
+ * Returns the current schema version (0 if no migrations applied). Exposed
+ * so callers (e.g. `ensureDatabase`) can detect a pending major upgrade and
+ * snapshot the database before applying it.
+ */
+export function getSchemaVersion(db: Database): number {
+  ensureSchemaVersionTable(db);
+  return getCurrentVersion(db);
 }
 
 /**

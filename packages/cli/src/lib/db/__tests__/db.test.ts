@@ -227,7 +227,7 @@ describe("Event insertion and querying", () => {
 
     insertEvent(db, {
       session_id: "event-session",
-      event_type: "phase_start",
+      event_type: "phase_transition",
       phase: "context",
       phase_number: 1,
       round: 1,
@@ -235,7 +235,7 @@ describe("Event insertion and querying", () => {
 
     insertEvent(db, {
       session_id: "event-session",
-      event_type: "phase_complete",
+      event_type: "round_completed",
       phase: "context",
       phase_number: 1,
       round: 1,
@@ -244,8 +244,8 @@ describe("Event insertion and querying", () => {
 
     const events = getEventsForSession(db, "event-session");
     expect(events).toHaveLength(2);
-    expect(events[0]?.event_type).toBe("phase_start");
-    expect(events[1]?.event_type).toBe("phase_complete");
+    expect(events[0]?.event_type).toBe("phase_transition");
+    expect(events[1]?.event_type).toBe("round_completed");
     expect(events[1]?.metadata).toBe('{"duration_ms":1200}');
   });
 
@@ -273,7 +273,7 @@ describe("Event insertion and querying", () => {
 
     insertEvent(db, {
       session_id: "event-id-session",
-      event_type: "phase_start",
+      event_type: "phase_transition",
     });
 
     const latestId = getLatestEventId(db);
