@@ -26,9 +26,11 @@ import type {
   UpdateAgentSessionParams,
 } from "./types.js";
 import { resultToRows, resultToRow } from "./result-mapper.js";
+import {
+  CANCELLED_EXIT_CODE,
+  ORPHAN_EXIT_CODE,
+} from "../state/exit-codes.js";
 
-const ORPHAN_EXIT_CODE = -3;
-const CANCELLED_EXIT_CODE = -2;
 const NOTE_ORPHAN_PREFIX = "orphaned by liveness sweep";
 
 /**

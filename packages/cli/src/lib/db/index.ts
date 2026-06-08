@@ -129,6 +129,18 @@ export {
 
 export type { WorkflowType, SessionStatus } from "../state/types.js";
 
+// Canonical exit-code taxonomy, error class, and the negative process
+// sentinels — surfaced through the db barrel so the dashboard (which imports
+// from `@open-code-review/cli/db`) can branch on them without reaching into
+// the state module's internals.
+export {
+  STATE_EXIT,
+  StateError,
+  CANCELLED_EXIT_CODE,
+  ORPHAN_EXIT_CODE,
+  CASCADE_CLOSE_EXIT_CODE,
+} from "../state/exit-codes.js";
+
 export { runMigrations, MIGRATIONS } from "./migrations.js";
 
 export { resultToRows, resultToRow } from "./result-mapper.js";

@@ -1,7 +1,20 @@
 /**
- * OCR State Management Module
+ * OCR State Management Module — barrel + porcelain.
  *
  * Manages session state exclusively through SQLite (.ocr/data/ocr.db).
+ *
+ * This module is the canonical public surface of the state layer. The
+ * cohesive concerns have been extracted into sibling modules; this file keeps
+ * the porcelain mutators (the misuse-proof agent API) and re-exports the full
+ * public surface as a BARREL so every existing importer keeps working
+ * unchanged:
+ *
+ *   - exit-codes.ts  — {@link STATE_EXIT}, {@link StateError}, process sentinels
+ *   - phase-graph.ts — phase numbers, transition graphs, validatePhaseTransition
+ *   - round-meta.ts  — validateRoundMeta, computeRoundCounts
+ *   - map-meta.ts    — validateMapMeta, computeMapCounts
+ *   - projection.ts  — event-fold + completeness helpers
+ *   - meta-util.ts   — shared sanitizeMetadataString
  */
 
 import type { Database } from "../db/engine.js";
@@ -34,7 +47,6 @@ import type {
   RoundCompleteParams,
   RoundCompleteResult,
   RoundMeta,
-  RoundMetaFinding,
   SynthesisCounts,
   MapCompleteParams,
   MapCompleteResult,
@@ -43,6 +55,24 @@ import type {
   ReviewPhase,
   MapPhase,
 } from "./types.js";
+
+import { STATE_EXIT, StateError, CASCADE_CLOSE_EXIT_CODE } from "./exit-codes.js";
+import {
+  phaseNumberFor,
+  validatePhaseTransition,
+} from "./phase-graph.js";
+import { validateRoundMeta, computeRoundCounts } from "./round-meta.js";
+import { validateMapMeta, computeMapCounts } from "./map-meta.js";
+import {
+  hasCompletionInvariant,
+  getCompletenessState,
+} from "./projection.js";
+
+// ── Public re-export barrel ──
+//
+// Surfaces everything the rest of the codebase imports from this module so
+// existing import paths (`../state/index.js`, `../index.js` in tests) keep
+// working unchanged after the module split.
 
 export type {
   InitParams,
@@ -68,34 +98,44 @@ export type {
   MapMetaDependency,
 } from "./types.js";
 
-// ── Typed errors / exit-code taxonomy ──
+// Exit-code taxonomy, error class, and the negative process sentinels live in
+// the leaf `exit-codes.ts`. Re-exported here (and from the db barrel) so both
+// the state layer's consumers and the dashboard can import them canonically.
+export {
+  STATE_EXIT,
+  StateError,
+  CANCELLED_EXIT_CODE,
+  ORPHAN_EXIT_CODE,
+  CASCADE_CLOSE_EXIT_CODE,
+} from "./exit-codes.js";
 
-/**
- * Stable exit codes so an orchestrating agent can branch on the failure
- * class without parsing prose. Mirrored in the CLI command layer.
- */
-export const STATE_EXIT = {
-  OK: 0,
-  USAGE: 2,
-  AMBIGUOUS: 3,
-  NOT_FOUND: 4,
-  ILLEGAL_TRANSITION: 5,
-  INVARIANT_UNMET: 6,
-  SCHEMA_INVALID: 7,
-  /** Database was locked past the bounded retry budget (SQLITE_BUSY). */
-  BUSY: 8,
-} as const;
+// Phase-graph state machine.
+export {
+  REVIEW_PHASE_NUMBERS,
+  MAP_PHASE_NUMBERS,
+  phaseNumberFor,
+  graphFor,
+  initialPhaseFor,
+  validatePhaseTransition,
+} from "./phase-graph.js";
+export type { WorkflowKind } from "./phase-graph.js";
 
-/** An error carrying a {@link STATE_EXIT} code for deterministic CLI mapping. */
-export class StateError extends Error {
-  constructor(
-    readonly code: number,
-    message: string,
-  ) {
-    super(message);
-    this.name = "StateError";
-  }
-}
+// Round-meta / map-meta validation + count helpers.
+export { validateRoundMeta, computeRoundCounts } from "./round-meta.js";
+export { validateMapMeta, computeMapCounts } from "./map-meta.js";
+
+// Shared metadata sanitizer.
+export { sanitizeMetadataString } from "./meta-util.js";
+
+// Event-fold / completeness helpers.
+export {
+  REASON_EVENT_TYPES,
+  TERMINAL_EVENT_TYPES,
+  rebuildSessionProjection,
+  hasCompletionInvariant,
+  getCompletenessState,
+} from "./projection.js";
+export type { DerivedLifecycle } from "./projection.js";
 
 /**
  * Re-export of the atomic reason-close primitive. It physically lives in the
@@ -106,90 +146,7 @@ export class StateError extends Error {
  */
 export { commitReasonClose };
 
-/**
- * The terminal "reason" event types — non-artifact terminals that explain a
- * session close (abort, stale auto-close, filesystem sync, legacy import).
- * Each one independently satisfies the close-guard trigger.
- *
- * Single source of truth shared by {@link TERMINAL_EVENT_TYPES} (the fold)
- * and conceptually by:
- *   - the close-guard trigger SQL (migrations.ts `trg_sessions_close_guard`)
- *   - the known-event-type guard (migrations.ts `trg_events_known_type`)
- *   - reconcile.ts `hasReasonEvent`
- * If this list changes, those SQL definitions MUST be updated in lockstep.
- */
-export const REASON_EVENT_TYPES = [
-  "session_aborted",
-  "session_auto_closed_stale",
-  "session_synced",
-  "session_legacy_import",
-] as const;
-
-// ── Helpers ──
-
-/**
- * Phase → phase_number for each workflow type. Derived so the porcelain
- * `advance` command needs only `--phase` (no desync-prone second field).
- */
-const REVIEW_PHASE_NUMBERS: Record<string, number> = {
-  context: 1,
-  "change-context": 2,
-  analysis: 3,
-  reviews: 4,
-  aggregation: 5,
-  discourse: 6,
-  synthesis: 7,
-  complete: 8,
-};
-const MAP_PHASE_NUMBERS: Record<string, number> = {
-  "map-context": 1,
-  topology: 2,
-  "flow-analysis": 3,
-  "requirements-mapping": 4,
-  synthesis: 5,
-  complete: 6,
-};
-
-function phaseNumberFor(workflowType: "review" | "map", phase: string): number {
-  const map = workflowType === "map" ? MAP_PHASE_NUMBERS : REVIEW_PHASE_NUMBERS;
-  const n = map[phase];
-  if (n === undefined) {
-    throw new StateError(
-      STATE_EXIT.ILLEGAL_TRANSITION,
-      `Invalid phase "${phase}" for workflow_type "${workflowType}". Valid: ${Object.keys(map).join(", ")}`,
-    );
-  }
-  return n;
-}
-
-/**
- * True when the session's current round/run has its terminal artifact event.
- * This is the completion invariant `finish` enforces.
- */
-function hasCompletionInvariant(
-  db: Database,
-  session: { id: string; workflow_type: string; current_round: number; current_map_run: number },
-): boolean {
-  const eventType =
-    session.workflow_type === "map" ? "map_completed" : "round_completed";
-  const round =
-    session.workflow_type === "map" ? session.current_map_run : session.current_round;
-  const r = db.exec(
-    `SELECT 1 FROM orchestration_events
-       WHERE session_id = ? AND event_type = ? AND round = ? LIMIT 1`,
-    [session.id, eventType, round],
-  );
-  return (r[0]?.values.length ?? 0) > 0;
-}
-
-/** Read the session_completeness view's state for a session. */
-function getCompletenessState(db: Database, sessionId: string): string | null {
-  const r = db.exec(
-    "SELECT completeness_state FROM session_completeness WHERE session_id = ?",
-    [sessionId],
-  );
-  return (r[0]?.values[0]?.[0] as string | undefined) ?? null;
-}
+// ── Private helpers ──
 
 /**
  * Derive the next round number from `round_completed` events.
@@ -215,85 +172,6 @@ function deriveNextRound(
   return fallbackRound;
 }
 
-/**
- * The lifecycle facts the `sessions` projection holds, recomputed purely
- * from a session's `orchestration_events`. Proves the projection is a
- * derivable fold over the event log (the system of record), not an
- * independent source that can drift.
- */
-export type DerivedLifecycle = {
-  status: "active" | "closed";
-  current_phase: string;
-  phase_number: number;
-  current_round: number;
-  current_map_run: number;
-};
-
-// `session_closed` (the artifact-backed success terminal) plus every
-// non-artifact reason terminal. `session_synced` was previously missing,
-// causing rebuildSessionProjection to leave a sync-closed session 'active'
-// (Blocker 2). Derived from REASON_EVENT_TYPES so the fold can never drift
-// from the close-guard's reason vocabulary.
-const TERMINAL_EVENT_TYPES = new Set<string>([
-  "session_closed",
-  ...REASON_EVENT_TYPES,
-]);
-
-/**
- * Fold a session's event log into its lifecycle projection, applying the
- * same rules the state mutators use. Returns `null` if the session has no
- * events.
- */
-export function rebuildSessionProjection(
-  db: Database,
-  sessionId: string,
-): DerivedLifecycle | null {
-  const events = getEventsForSession(db, sessionId);
-  if (events.length === 0) return null;
-
-  const acc: DerivedLifecycle = {
-    status: "active",
-    current_phase: "context",
-    phase_number: 1,
-    current_round: 1,
-    current_map_run: 1,
-  };
-
-  for (const e of events) {
-    switch (e.event_type) {
-      case "session_created":
-      case "session_resumed":
-      case "round_started":
-        acc.status = "active";
-        if (e.phase) acc.current_phase = e.phase;
-        if (e.phase_number != null) acc.phase_number = e.phase_number;
-        if (e.round != null) acc.current_round = e.round;
-        break;
-      case "phase_transition":
-        if (e.phase) acc.current_phase = e.phase;
-        if (e.phase_number != null) acc.phase_number = e.phase_number;
-        if (e.round != null) acc.current_round = e.round;
-        break;
-      case "round_completed":
-        if (e.round != null && e.round >= acc.current_round) {
-          acc.current_round = e.round;
-        }
-        break;
-      case "map_completed":
-        if (e.round != null) acc.current_map_run = e.round;
-        break;
-      default:
-        if (TERMINAL_EVENT_TYPES.has(e.event_type)) {
-          acc.status = "closed";
-          acc.current_phase = "complete";
-          if (e.phase_number != null) acc.phase_number = e.phase_number;
-        }
-    }
-  }
-
-  return acc;
-}
-
 /** Returns true if the directory contains at least one .md or .json file (recursively). */
 function hasArtifacts(dir: string): boolean {
   try {
@@ -309,6 +187,37 @@ function hasArtifacts(dir: string): boolean {
   }
   return false;
 }
+
+/**
+ * Read raw JSON string from either a file path or a raw data string.
+ */
+function readJsonFromSource(
+  params: { source: "file"; filePath: string } | { source: "stdin"; data: string },
+): string {
+  if (params.source === "file") {
+    if (!existsSync(params.filePath)) {
+      throw new StateError(STATE_EXIT.NOT_FOUND, `File not found: ${params.filePath}`);
+    }
+    return readFileSync(params.filePath, "utf-8");
+  }
+  return params.data;
+}
+
+/**
+ * Parse a raw JSON string, throwing a descriptive error on failure.
+ */
+function parseRawJson(raw: string, label: string): unknown {
+  try {
+    return JSON.parse(raw);
+  } catch (err) {
+    throw new StateError(
+      STATE_EXIT.SCHEMA_INVALID,
+      `Failed to parse ${label}: ${err instanceof Error ? err.message : "invalid JSON"}`,
+    );
+  }
+}
+
+// ── Lifecycle mutators ──
 
 /**
  * Initialize a session in SQLite.
@@ -399,100 +308,6 @@ export async function stateInit(params: InitParams): Promise<string> {
 }
 
 /**
- * Phase-progression graphs. Each entry maps a phase to the set of phases
- * legally reachable from it. Self-loops (idempotent re-entry of the same
- * phase) are always allowed and don't need to appear in the map.
- *
- * `complete` loops back to the initial phase to allow a new round/run.
- *
- * Why enforce this: without a transition graph, the AI could jump from
- * `reviews` straight to `complete`, skipping aggregation/discourse/
- * synthesis. The dashboard's outcome derivation (sessions.status) would
- * still mark the workflow closed, masking the gap. Treating the phase
- * sequence as a state machine makes that class of bug impossible.
- */
-const REVIEW_PHASE_GRAPH: Record<string, ReadonlyArray<string>> = {
-  context: ["change-context"],
-  "change-context": ["analysis"],
-  analysis: ["reviews"],
-  reviews: ["aggregation"],
-  aggregation: ["discourse"],
-  discourse: ["synthesis"],
-  synthesis: ["complete"],
-  complete: ["context"],
-};
-
-const MAP_PHASE_GRAPH: Record<string, ReadonlyArray<string>> = {
-  "map-context": ["topology"],
-  topology: ["flow-analysis"],
-  "flow-analysis": ["requirements-mapping"],
-  "requirements-mapping": ["synthesis"],
-  synthesis: ["complete"],
-  complete: ["map-context"],
-};
-
-function graphFor(
-  workflowType: "review" | "map",
-): Record<string, ReadonlyArray<string>> {
-  return workflowType === "review" ? REVIEW_PHASE_GRAPH : MAP_PHASE_GRAPH;
-}
-
-/** The first phase a workflow type legally starts (or restarts) at. */
-function initialPhaseFor(workflowType: "review" | "map"): string {
-  return workflowType === "map" ? "map-context" : "context";
-}
-
-/**
- * Validate that `target` is a legal next phase given `source` and the
- * workflow's type. Self-loops are always allowed. A round/mapRun bump is a
- * permitted reset, but ONLY back to the workflow's initial phase — a new
- * round legitimately starts over at `context` (review) / `map-context`
- * (map), never partway through. Allowing an arbitrary target on a round
- * boundary would let the AI skip phases under cover of a round bump.
- */
-function validatePhaseTransition(
-  workflowType: "review" | "map",
-  source: string,
-  target: string,
-  isRoundBoundary: boolean,
-): void {
-  const graph = graphFor(workflowType);
-  // Target must belong to this workflow_type's phase vocabulary.
-  if (!(target in graph)) {
-    const validPhases = Object.keys(graph).join(", ");
-    throw new StateError(
-      STATE_EXIT.ILLEGAL_TRANSITION,
-      `Invalid phase "${target}" for workflow_type "${workflowType}". ` +
-        `Valid phases: ${validPhases}`,
-    );
-  }
-  // Same-phase re-entry: always allowed (retries, idempotent calls).
-  if (source === target) return;
-  // Round/mapRun boundary: a reset is permitted, but only to the initial
-  // phase. Anything else on a boundary is an illegal skip.
-  if (isRoundBoundary) {
-    const initial = initialPhaseFor(workflowType);
-    if (target === initial) return;
-    throw new StateError(
-      STATE_EXIT.ILLEGAL_TRANSITION,
-      `Illegal round-boundary transition: a new round/run must reset to ` +
-        `"${initial}", not "${target}".`,
-    );
-  }
-  const allowed = graph[source];
-  if (!allowed || !allowed.includes(target)) {
-    throw new StateError(
-      STATE_EXIT.ILLEGAL_TRANSITION,
-      `Illegal phase transition: ${source} → ${target}. ` +
-        `From "${source}", only ${
-          allowed && allowed.length > 0 ? allowed.join(", ") : "(no edges)"
-        } are reachable. ` +
-        `Pass --current-round to start a new round if the workflow is resetting.`,
-    );
-  }
-}
-
-/**
  * Transition a session to a new phase in SQLite.
  *
  * Accepts an optional already-open `db` handle so callers that have already
@@ -554,11 +369,6 @@ export async function stateTransition(
     }
   });
 }
-
-/** Sentinel exit code stamped on dependent rows cascade-closed by a
- *  parent stateClose. Distinct from -2 (user cancel) and -3 (orphaned by
- *  liveness sweep) so triage can tell the cause apart. */
-const CASCADE_CLOSE_EXIT_CODE = -4;
 
 /**
  * Close a session in SQLite.
@@ -718,6 +528,8 @@ export async function stateList(
   }));
 }
 
+// ── Session resolution ──
+
 /**
  * How the resolver arrived at the chosen session. Surfaced on the
  * result so callers (and tests) can verify the decision path. Also
@@ -874,200 +686,7 @@ export async function resolveActiveSession(
   };
 }
 
-// ── Shared completion helpers ──
-
-/**
- * Read raw JSON string from either a file path or a raw data string.
- */
-function readJsonFromSource(
-  params: { source: "file"; filePath: string } | { source: "stdin"; data: string },
-): string {
-  if (params.source === "file") {
-    if (!existsSync(params.filePath)) {
-      throw new StateError(STATE_EXIT.NOT_FOUND, `File not found: ${params.filePath}`);
-    }
-    return readFileSync(params.filePath, "utf-8");
-  }
-  return params.data;
-}
-
-/**
- * Parse a raw JSON string, throwing a descriptive error on failure.
- */
-function parseRawJson(raw: string, label: string): unknown {
-  try {
-    return JSON.parse(raw);
-  } catch (err) {
-    throw new StateError(
-      STATE_EXIT.SCHEMA_INVALID,
-      `Failed to parse ${label}: ${err instanceof Error ? err.message : "invalid JSON"}`,
-    );
-  }
-}
-
-
-// ── Round-meta validation helpers ──
-
-const VALID_CATEGORIES = new Set(["blocker", "should_fix", "suggestion", "style"]);
-const VALID_SEVERITIES = new Set(["critical", "high", "medium", "low", "info"]);
-
-const DEFAULT_METADATA_MAX_LEN = 4096;
-
-/**
- * Defang an orchestrator-supplied free-text field before it is persisted and
- * later rendered (dashboard, stderr logs, agent prompts):
- *
- *   - strips C0 control chars (\x00-\x1f) except tab (\t) and newline (\n),
- *     which neutralizes ANSI/escape injection and embedded NULs;
- *   - strips a leading "[ocr]" prefix (case-insensitive), reserved for the
- *     CLI's own machine-readable log lines, so a finding can't spoof one;
- *   - caps the length to `maxLen` to bound storage + render cost.
- */
-function sanitizeMetadataString(
-  s: string,
-  opts: { maxLen?: number } = {},
-): string {
-  const maxLen = opts.maxLen ?? DEFAULT_METADATA_MAX_LEN;
-  // eslint-disable-next-line no-control-regex
-  let out = s.replace(/[\x00-\x08\x0b-\x1f]/g, "");
-  out = out.replace(/^\s*\[ocr\]\s*/i, "");
-  if (out.length > maxLen) out = out.slice(0, maxLen);
-  return out;
-}
-
-function validateRoundMeta(meta: unknown): RoundMeta {
-  if (!meta || typeof meta !== "object") {
-    throw new Error("round-meta.json must be a JSON object");
-  }
-
-  const obj = meta as Record<string, unknown>;
-
-  if (obj.schema_version !== 1) {
-    throw new Error(
-      `Unsupported schema_version: ${String(obj.schema_version)}. Expected 1.`,
-    );
-  }
-
-  if (typeof obj.verdict !== "string" || obj.verdict.trim().length === 0) {
-    throw new Error("round-meta.json must contain a non-empty verdict string");
-  }
-  obj.verdict = sanitizeMetadataString(obj.verdict);
-
-  if (!Array.isArray(obj.reviewers)) {
-    throw new Error("round-meta.json must contain a reviewers array");
-  }
-
-  for (const reviewer of obj.reviewers) {
-    if (!reviewer || typeof reviewer !== "object") {
-      throw new Error("Each reviewer must be an object");
-    }
-    const r = reviewer as Record<string, unknown>;
-    if (typeof r.type !== "string") {
-      throw new Error("Each reviewer must have a type string");
-    }
-    if (typeof r.instance !== "number") {
-      throw new Error("Each reviewer must have an instance number");
-    }
-    if (!Array.isArray(r.findings)) {
-      throw new Error(`Reviewer ${r.type}-${r.instance} must have a findings array`);
-    }
-    for (const finding of r.findings) {
-      if (!finding || typeof finding !== "object") {
-        throw new Error("Each finding must be an object");
-      }
-      const f = finding as Record<string, unknown>;
-      if (typeof f.title !== "string" || f.title.trim().length === 0) {
-        throw new Error("Each finding must have a non-empty title");
-      }
-      f.title = sanitizeMetadataString(f.title);
-      if (typeof f.category !== 'string' || !VALID_CATEGORIES.has(f.category)) {
-        throw new Error(
-          `Finding "${f.title}" has invalid category: "${String(f.category)}". Must be one of: ${[...VALID_CATEGORIES].join(", ")}`,
-        );
-      }
-      if (typeof f.severity !== 'string' || !VALID_SEVERITIES.has(f.severity)) {
-        throw new Error(
-          `Finding "${f.title}" has invalid severity: "${String(f.severity)}". Must be one of: ${[...VALID_SEVERITIES].join(", ")}`,
-        );
-      }
-      if (typeof f.summary !== "string") {
-        throw new Error(`Finding "${f.title}" must have a summary string`);
-      }
-      f.summary = sanitizeMetadataString(f.summary);
-      if (f.file_path !== undefined && typeof f.file_path !== "string") {
-        throw new Error(`Finding "${f.title}" has invalid file_path: expected string`);
-      }
-      if (f.line_start !== undefined && typeof f.line_start !== "number") {
-        throw new Error(`Finding "${f.title}" has invalid line_start: expected number`);
-      }
-      if (f.line_end !== undefined && typeof f.line_end !== "number") {
-        throw new Error(`Finding "${f.title}" has invalid line_end: expected number`);
-      }
-      if (f.flagged_by !== undefined && !Array.isArray(f.flagged_by)) {
-        throw new Error(`Finding "${f.title}" has invalid flagged_by: expected array`);
-      }
-    }
-  }
-
-  // Validate optional synthesis_counts
-  if (obj.synthesis_counts !== undefined) {
-    if (!obj.synthesis_counts || typeof obj.synthesis_counts !== "object") {
-      throw new Error("synthesis_counts must be an object");
-    }
-    const sc = obj.synthesis_counts as Record<string, unknown>;
-    if (typeof sc.blockers !== "number" || sc.blockers < 0) {
-      throw new Error("synthesis_counts.blockers must be a non-negative number");
-    }
-    if (typeof sc.should_fix !== "number" || sc.should_fix < 0) {
-      throw new Error("synthesis_counts.should_fix must be a non-negative number");
-    }
-    if (typeof sc.suggestions !== "number" || sc.suggestions < 0) {
-      throw new Error("synthesis_counts.suggestions must be a non-negative number");
-    }
-  }
-
-  return meta as RoundMeta;
-}
-
-/**
- * Compute counts for a RoundMeta.
- *
- * When `synthesis_counts` is present, those values are preferred because they
- * reflect the **deduplicated, post-synthesis** totals matching `final.md`.
- * The per-reviewer findings array can contain duplicates (the same issue
- * flagged by multiple reviewers), so derived counts may exceed the actual
- * number of unique items in the synthesis.
- *
- * `reviewerCount` and `totalFindingCount` are always derived from the data
- * (they aren't affected by deduplication).
- *
- * Note: `style` findings are intentionally included only in `totalFindingCount`
- * and do not have a separate named counter. The dashboard displays them as part
- * of the total but does not break them out in summary cards.
- */
-export function computeRoundCounts(meta: RoundMeta): {
-  blockerCount: number;
-  shouldFixCount: number;
-  suggestionCount: number;
-  reviewerCount: number;
-  totalFindingCount: number;
-} {
-  const allFindings: RoundMetaFinding[] = [];
-  for (const reviewer of meta.reviewers) {
-    allFindings.push(...reviewer.findings);
-  }
-
-  // Prefer explicit synthesis counts (deduplicated) over derived counts
-  const sc = meta.synthesis_counts;
-
-  return {
-    blockerCount: sc ? sc.blockers : allFindings.filter((f) => f.category === "blocker").length,
-    shouldFixCount: sc ? sc.should_fix : allFindings.filter((f) => f.category === "should_fix").length,
-    suggestionCount: sc ? sc.suggestions : allFindings.filter((f) => f.category === "suggestion").length,
-    reviewerCount: meta.reviewers.length,
-    totalFindingCount: allFindings.length,
-  };
-}
+// ── Round completion ──
 
 /**
  * Import structured review round data into SQLite.
@@ -1137,87 +756,7 @@ export async function stateRoundComplete(
   return { sessionId: session.id, round: roundNumber, metaPath, schema_version: 1 };
 }
 
-// ── Map-meta validation helpers ──
-
-function validateMapMeta(meta: unknown): MapMeta {
-  if (!meta || typeof meta !== "object") {
-    throw new Error("map-meta.json must be a JSON object");
-  }
-
-  const obj = meta as Record<string, unknown>;
-
-  if (obj.schema_version !== 1) {
-    throw new Error(
-      `Unsupported schema_version: ${String(obj.schema_version)}. Expected 1.`,
-    );
-  }
-
-  if (!Array.isArray(obj.sections)) {
-    throw new Error("map-meta.json must contain a sections array");
-  }
-
-  for (const section of obj.sections) {
-    if (!section || typeof section !== "object") {
-      throw new Error("Each section must be an object");
-    }
-    const s = section as Record<string, unknown>;
-    if (typeof s.section_number !== "number") {
-      throw new Error("Each section must have a section_number");
-    }
-    if (typeof s.title !== "string" || s.title.trim().length === 0) {
-      throw new Error("Each section must have a non-empty title");
-    }
-    s.title = sanitizeMetadataString(s.title);
-    if (s.description !== undefined) {
-      if (typeof s.description !== "string") {
-        throw new Error(`Section "${s.title}" description must be a string if provided`);
-      }
-      s.description = sanitizeMetadataString(s.description);
-    }
-    if (!Array.isArray(s.files)) {
-      throw new Error(`Section "${s.title}" must have a files array`);
-    }
-    for (const file of s.files) {
-      if (!file || typeof file !== "object") {
-        throw new Error("Each file must be an object");
-      }
-      const f = file as Record<string, unknown>;
-      if (typeof f.file_path !== "string" || f.file_path.trim().length === 0) {
-        throw new Error("Each file must have a non-empty file_path");
-      }
-      if (typeof f.role !== "string") {
-        throw new Error(`File "${f.file_path}" must have a role string`);
-      }
-      f.role = sanitizeMetadataString(f.role);
-      if (typeof f.lines_added !== "number") {
-        throw new Error(`File "${f.file_path}" must have a lines_added number`);
-      }
-      if (typeof f.lines_deleted !== "number") {
-        throw new Error(`File "${f.file_path}" must have a lines_deleted number`);
-      }
-    }
-  }
-
-  if (obj.dependencies !== undefined && !Array.isArray(obj.dependencies)) {
-    throw new Error("map-meta.json dependencies must be an array if provided");
-  }
-
-  return meta as MapMeta;
-}
-
-/**
- * Compute derived counts from the sections array in a MapMeta.
- * Counts are NEVER self-reported — always derived from the data.
- */
-export function computeMapCounts(meta: MapMeta): {
-  sectionCount: number;
-  fileCount: number;
-} {
-  return {
-    sectionCount: meta.sections.length,
-    fileCount: meta.sections.reduce((sum, s) => sum + s.files.length, 0),
-  };
-}
+// ── Map completion ──
 
 /**
  * Import structured map run data into SQLite.
@@ -1543,6 +1082,8 @@ export async function stateCompleteMap(
   return { sessionId: resolved.id, mapRun: mapRunNumber, metaPath, schema_version: 1 };
 }
 
+// ── Status ──
+
 /**
  * Machine-branchable counterpart to the prose `next_action`. Lets an
  * orchestrating agent dispatch on the next step without parsing English.
@@ -1637,6 +1178,8 @@ export async function stateStatus(
     next_action_kind: nextActionKind,
   };
 }
+
+// ── Filesystem sync ──
 
 /**
  * Sync filesystem sessions into SQLite.
