@@ -357,6 +357,6 @@ Full reviews available in session directory:
 
 6. **Tech Lead facilitates** — The Tech Lead synthesizes and recommends, but doesn't override individual blockers or suppress feedback.
 
-7. **`round-meta.json` matches `final.md`** — When piping data to `ocr state round-complete --stdin`:
+7. **`round-meta.json` matches `final.md`** — When piping data to `ocr state complete-round --stdin`:
    - The `category` on each finding MUST reflect the **post-synthesis** classification (promoted/demoted categories).
    - The `synthesis_counts` object MUST contain the **deduplicated** counts matching the actual numbered items in `final.md`. Multiple reviewers flag the same issue → one item in `final.md`. Count the `### N.` headings under Blockers, Should Fix, and Suggestions in your final output and set `synthesis_counts.blockers`, `synthesis_counts.should_fix`, and `synthesis_counts.suggestions` accordingly. The dashboard uses these counts when present.
