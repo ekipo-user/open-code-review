@@ -107,6 +107,54 @@ async function readStdin(): Promise<string> {
   return data;
 }
 
+/**
+ * Late-link the dashboard's parent `command_executions` row to a freshly
+ * created session so the dashboard can bind outcome + offer a resume command.
+ *
+ * Resolves the dashboard uid by reliability: `--dashboard-uid` flag →
+ * `OCR_DASHBOARD_EXECUTION_UID` env var → filesystem spawn marker. Non-fatal:
+ * the session is created either way; only resume discoverability suffers.
+ *
+ * Shared by `init` and `begin` so both wire up dashboard linkage identically
+ * — `begin` is a true superset of `init`.
+ */
+async function linkDashboardInvocation(
+  ocrDir: string,
+  sessionId: string,
+  explicitUid: string | undefined,
+  label: string,
+): Promise<void> {
+  const markerUid = readDashboardSpawnMarker(ocrDir)?.execution_uid;
+  const dashboardUid =
+    explicitUid ?? process.env["OCR_DASHBOARD_EXECUTION_UID"] ?? markerUid;
+  if (!dashboardUid) {
+    console.error(
+      chalk.gray(
+        `[state ${label}] no dashboard linkage available (flag, env var, and marker file all absent — CLI-only invocation)`,
+      ),
+    );
+    return;
+  }
+  try {
+    const db = await getDb(ocrDir);
+    linkDashboardInvocationToWorkflow(db, dashboardUid, sessionId);
+    saveDatabase(db, join(ocrDir, "data", "ocr.db"));
+    console.error(
+      chalk.gray(
+        `[state ${label}] linked workflow_id=${sessionId} → dashboard uid=${dashboardUid}`,
+      ),
+    );
+  } catch (linkErr) {
+    console.error(
+      chalk.yellow(
+        `Warning: failed to link dashboard command_execution to session: ${
+          linkErr instanceof Error ? linkErr.message : String(linkErr)
+        }`,
+      ),
+    );
+  }
+}
+
 // ── init ──
 
 const initSubcommand = new Command("init")
@@ -159,69 +207,10 @@ const initSubcommand = new Command("init")
         });
 
         // Late-link the dashboard's parent command_execution row to this
-        // newly-created session.
-        //
-        // When the dashboard spawns an AI workflow it puts its own
-        // command_executions.uid into `OCR_DASHBOARD_EXECUTION_UID`. The
-        // session row didn't exist at that point, so workflow_id was
-        // unset on the parent row. Now that the AI has created it, fill
-        // the linkage in. After this UPDATE, the parent row has both
-        // `workflow_id` (set here) AND `vendor_session_id` (bound by
-        // command-runner from Claude's stdout) — which is what the
-        // handoff route's `getLatestAgentSessionWithVendorId` lookup
-        // needs to surface a resume command.
-        // Three-source resolution, ordered by reliability:
-        //   1. `--dashboard-uid` flag — explicit, set by command-runner's
-        //      prompt injection. Survives shell stripping.
-        //   2. `OCR_DASHBOARD_EXECUTION_UID` env var — depends on the
-        //      AI's shell preserving unfamiliar env vars; sandboxed
-        //      shells can strip these.
-        //   3. Filesystem spawn marker — written by the dashboard at
-        //      spawn time. This is the durable, guaranteed path: it
-        //      doesn't depend on env-var inheritance or prompt-following.
-        //      Used as the fallback when (1) and (2) miss.
-        const markerUid = readDashboardSpawnMarker(ocrDir)?.execution_uid;
-        const dashboardUid =
-          options.dashboardUid ??
-          process.env["OCR_DASHBOARD_EXECUTION_UID"] ??
-          markerUid;
-        if (dashboardUid) {
-          try {
-            // Linkage flows through the single-owner CLI db helper
-            // (`linkDashboardInvocationToWorkflow`) — same primitive the
-            // dashboard's SessionCaptureService uses. No direct SQL here.
-            const db = await getDb(ocrDir);
-            linkDashboardInvocationToWorkflow(db, dashboardUid, sessionId);
-            saveDatabase(db, join(ocrDir, "data", "ocr.db"));
-            // Diagnostic log so dashboard-linkage failures are visible in
-            // the events JSONL: silently succeeding looks identical to
-            // silently skipping when the env var is missing — and that
-            // ambiguity hid a class of bugs through several iterations.
-            console.error(
-              chalk.gray(
-                `[state init] linked workflow_id=${sessionId} → dashboard uid=${dashboardUid}`,
-              ),
-            );
-          } catch (linkErr) {
-            // Non-fatal — the session is created either way; only resume
-            // discoverability suffers without the linkage.
-            console.error(
-              chalk.yellow(
-                `Warning: failed to link dashboard command_execution to session: ${
-                  linkErr instanceof Error ? linkErr.message : String(linkErr)
-                }`,
-              ),
-            );
-          }
-        } else {
-          // No flag, no env var, no marker. Running outside the
-          // dashboard — leave the parent execution row unlinked.
-          console.error(
-            chalk.gray(
-              `[state init] no dashboard linkage available (flag, env var, and marker file all absent — CLI-only invocation)`,
-            ),
-          );
-        }
+        // newly-created session (flag → env → spawn marker). After this the
+        // parent row has both `workflow_id` and `vendor_session_id`, which is
+        // what the handoff route needs to surface a resume command.
+        await linkDashboardInvocation(ocrDir, sessionId, options.dashboardUid, "init");
 
         console.log(sessionId);
       } catch (error) {
@@ -653,6 +642,10 @@ const beginSubcommand = new Command("begin")
     return v as WorkflowType;
   })
   .option("--session-dir <dir>", "Session directory path (auto-resolved if omitted)")
+  .option(
+    "--dashboard-uid <uid>",
+    "Dashboard command_executions uid to link this workflow to (takes precedence over OCR_DASHBOARD_EXECUTION_UID)",
+  )
   .option("--json", "Output the result as JSON")
   .action(
     async (options: {
@@ -660,6 +653,7 @@ const beginSubcommand = new Command("begin")
       branch: string;
       workflowType: WorkflowType;
       sessionDir?: string;
+      dashboardUid?: string;
       json?: boolean;
     }) => {
       const targetDir = process.cwd();
@@ -676,6 +670,9 @@ const beginSubcommand = new Command("begin")
           sessionDir,
           ocrDir,
         });
+        // Superset of `init`: wire up dashboard linkage so the dashboard can
+        // bind outcome + offer resume.
+        await linkDashboardInvocation(ocrDir, result.session_id, options.dashboardUid, "begin");
         console.log(
           options.json
             ? JSON.stringify(result, null, 2)
@@ -693,12 +690,16 @@ const advanceSubcommand = new Command("advance")
   .option("--session-id <id>", "Session ID (auto-detects active if omitted)")
   .option("--current-round <number>", "Round number", parseInt)
   .option("--current-map-run <number>", "Map run number", parseInt)
+  // Accepted but ignored — the phase number is DERIVED from the phase, so it
+  // can never desync. Tolerated so the `transition`-era flag remains valid.
+  .option("--phase-number <number>", "(ignored — derived from --phase)", parseInt)
   .action(
     async (options: {
       phase: string;
       sessionId?: string;
       currentRound?: number;
       currentMapRun?: number;
+      phaseNumber?: number;
     }) => {
       const targetDir = process.cwd();
       requireOcrSetup(targetDir);
