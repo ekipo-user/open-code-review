@@ -6,30 +6,28 @@
  */
 
 /**
- * ## Dual-Writer Ownership Model
+ * ## Single-Writer Ownership Model
  *
- * Two processes can write to `ocr.db`:
+ * The CLI and dashboard share ONE on-disk database (`better-sqlite3` + WAL).
+ * Native WAL locking serializes writes across both processes — there is no
+ * in-memory copy, no merge layer, and no save hooks.
  *
- * - **CLI** (`ocr state init/transition/close`) — owns workflow state:
- *   `sessions`, `orchestration_events`. Writes happen during review/map
- *   workflows when the AI agent calls `ocr state` commands.
+ * - **CLI** (`ocr state begin/advance/...`) — sole writer of the workflow
+ *   lifecycle tables: `sessions`, `orchestration_events`. The dashboard
+ *   reads these and only touches them through the bounded filesystem-sync
+ *   "legacy/backfill reconciler" (see `services/filesystem-sync.ts`), which
+ *   routes its rare lifecycle closes through the CLI's `commitReasonClose`
+ *   helper so the close-guard trigger ordering is respected.
  *
- * - **Dashboard** (this server) — owns user-interaction tables:
- *   `user_file_progress`, `user_finding_progress`, `user_round_progress`,
- *   `user_notes`, `command_executions`, `chat_conversations`, `chat_messages`.
- *   Also writes parsed artifact data: `review_rounds`, `reviewer_outputs`,
- *   `review_findings`, `map_runs`, `map_sections`, `map_files`,
- *   `markdown_artifacts`.
+ * - **Dashboard** (this server) — owns supervision state
+ *   (`command_executions`) and UX state: `user_file_progress`,
+ *   `user_finding_progress`, `user_round_progress`, `user_notes`,
+ *   `chat_conversations`, `chat_messages`. Also writes parsed artifact data:
+ *   `review_rounds`, `reviewer_outputs`, `review_findings`, `map_runs`,
+ *   `map_sections`, `map_files`, `markdown_artifacts`.
  *
- * Concurrency is managed via:
- * 1. **Atomic writes** — temp file + rename prevents partial reads
- * 2. **Merge-before-write** — dashboard calls `DbSyncWatcher.syncFromDisk()`
- *    before saving to pull in CLI changes
- * 3. **File watching** — `DbSyncWatcher` detects external writes and reloads
- *
- * Both processes use sql.js (in-memory WASM SQLite), so there is no
- * file-level locking. The merge-before-write pattern prevents data loss
- * under normal usage but is not a full MVCC solution.
+ * Durability is the engine's job: writes are persisted on commit and
+ * serialized by WAL locking — no explicit flush, merge, or watermarking.
  */
 
 import {
@@ -227,27 +225,6 @@ export type ChatMessageRow = {
 let cachedDb: Database | null = null
 let cachedDbPath: string | null = null
 
-// ── Pre/post-save hooks ──
-// Registered once at startup by index.ts so every saveDb() call
-// automatically merges CLI changes before writing (pre) and
-// marks its own write to avoid re-triggering the file watcher (post).
-
-/**
- * No-op shim retained for call-site compatibility.
- *
- * Under the prior sql.js engine, the dashboard merged CLI changes before
- * every write (merge-before-write) and marked its own writes to avoid
- * re-triggering the file watcher. With better-sqlite3 + WAL, the CLI and
- * dashboard share the same on-disk database with native locking, so there
- * is nothing to merge and no save hooks to run.
- */
-export function registerSaveHooks(
-  _preSave: () => void,
-  _postSave: () => void,
-): void {
-  // Intentionally empty — superseded by native WAL locking.
-}
-
 /**
  * Opens the OCR database at the given `.ocr/` directory path via the shared
  * CLI engine (better-sqlite3 + WAL), creating it and running migrations on
@@ -259,17 +236,6 @@ export async function openDb(ocrDir: string): Promise<Database> {
   cachedDb = db
   cachedDbPath = dbPath
   return db
-}
-
-/**
- * No-op persistence shim.
- *
- * better-sqlite3 + WAL persists writes on commit, so there is nothing to
- * flush. Retained as a symbol so the many existing `saveDb(db, ocrDir)`
- * call sites do not all need editing; durability is the engine's job.
- */
-export function saveDb(_db: Database, _ocrDir: string): void {
-  // Intentionally empty — better-sqlite3 + WAL persists on commit.
 }
 
 /**

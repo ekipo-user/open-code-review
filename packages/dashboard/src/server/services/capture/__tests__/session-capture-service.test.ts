@@ -3,8 +3,8 @@
  *
  * These lock in the current behavior of session-id capture and resume-
  * context resolution before downstream call sites are migrated. They
- * exercise the service against a real sql.js database (Khorikov classical
- * school — no internal mocks).
+ * exercise the service against a real better-sqlite3 database (Khorikov
+ * classical school — no internal mocks).
  */
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 import { mkdtempSync, rmSync, mkdirSync } from 'node:fs'

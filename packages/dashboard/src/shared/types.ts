@@ -8,7 +8,7 @@ export type SessionStatus = 'active' | 'closed'
  * (exit_code, linked workflow's session.status). Surfaced to the client
  * so the UI can distinguish a workflow that exited cleanly from one that
  * exited 0 mid-flight (e.g. parent process died on macOS sleep before the
- * AI ever called `ocr state close-session`).
+ * AI ever called `ocr state finish`).
  *
  *  - 'success'    — exit 0 AND (no linked workflow | workflow.status='closed')
  *  - 'incomplete' — exit 0 BUT workflow exists and is still 'active'

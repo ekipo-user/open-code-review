@@ -95,7 +95,7 @@ export type SpawnOptions = {
   /**
    * Extra environment variables merged into the spawned process. Used to
    * propagate context the AI's child `ocr` invocations need — currently
-   * `OCR_DASHBOARD_EXECUTION_UID`, which lets `ocr state init` link the
+   * `OCR_DASHBOARD_EXECUTION_UID`, which lets `ocr state begin` link the
    * new session row's id back to the dashboard's parent command_execution
    * row (so the handoff lookup can resolve the captured vendor_session_id).
    */

@@ -41,10 +41,9 @@ export class DbSyncWatcher {
     private db: Database,
     private dbFilePath: string,
     private io: SocketIOServer,
-    private onSync?: () => void,
     /**
      * Fired exactly once per newly-observed `sessions` row (written by the
-     * CLI's `ocr state` init/begin). Used to server-side auto-link the
+     * CLI's `ocr state begin`). Used to server-side auto-link the
      * dashboard's parent execution row to the workflow — robust against the
      * AI orchestrator failing to carry `OCR_DASHBOARD_EXECUTION_UID`.
      */
@@ -134,7 +133,6 @@ export class DbSyncWatcher {
       this.detectSessionChanges()
       this.detectNewEvents()
       this.detectCommandChanges()
-      this.onSync?.()
     } catch (err) {
       console.error('[DbSyncWatcher] Error scanning for changes:', err)
     }
@@ -355,13 +353,6 @@ export class DbSyncWatcher {
     })
   }
 
-  /**
-   * No-op retained for call-site compatibility. The merge-before-write
-   * watermark it once maintained is obsolete under the shared native engine.
-   */
-  markOwnWrite(): void {
-    // Intentionally empty — no in-memory copy to reconcile.
-  }
 }
 
 function sessionFingerprint(row: Row): string {

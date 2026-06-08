@@ -15,7 +15,6 @@ import { readFileSync, writeFileSync, unlinkSync, mkdirSync, existsSync } from '
 import { dirname, join } from 'node:path'
 import type { Server as SocketIOServer, Socket } from 'socket.io'
 import type { Database } from '@open-code-review/cli/db'
-import { saveDb } from '../db.js'
 import {
   deriveCommandOutcome,
   getWorkflowCompletenessForExecution,
@@ -162,7 +161,7 @@ export type BuildPromptOptions = {
   commandContent: string
   /** Dashboard execution uid. When present (and `localCli` is non-null),
    *  emit the "Dashboard Linkage" trusted block telling the AI to pass
-   *  `--dashboard-uid <uid>` on its first `state init`. */
+   *  `--dashboard-uid <uid>` on its first `state begin`. */
   executionUid: string | null | undefined
   /** Resolved path to the local CLI bundle, or null when running
    *  outside the monorepo. Drives both "CLI Resolution" and
@@ -271,8 +270,8 @@ export function buildPrompt(opts: BuildPromptOptions): {
       '',
       'Examples:',
       `- Instead of \`ocr state show\`, run: \`node ${localCli} state show\``,
-      `- Instead of \`ocr state init ...\`, run: \`node ${localCli} state init ...\``,
-      `- Instead of \`ocr state transition ...\`, run: \`node ${localCli} state transition ...\``,
+      `- Instead of \`ocr state begin ...\`, run: \`node ${localCli} state begin ...\``,
+      `- Instead of \`ocr state advance ...\`, run: \`node ${localCli} state advance ...\``,
       '',
       'This applies to every `ocr` invocation. Do NOT use bare `ocr` commands.',
     )
@@ -284,7 +283,7 @@ export function buildPrompt(opts: BuildPromptOptions): {
       '',
       '## Dashboard Linkage (REQUIRED for terminal handoff)',
       '',
-      'You are running inside the OCR dashboard. To enable the "Pick up in terminal" affordance for this review, your first `ocr state init` invocation MUST include this flag:',
+      'You are running inside the OCR dashboard. To enable the "Pick up in terminal" affordance for this review, your first `ocr state begin` invocation MUST include this flag:',
       '',
       '```',
       `--dashboard-uid ${executionUid}`,
@@ -293,7 +292,7 @@ export function buildPrompt(opts: BuildPromptOptions): {
       'Full example:',
       '',
       '```',
-      `node ${localCli} state init --session-id <id> --branch <branch> --workflow-type review --dashboard-uid ${executionUid}`,
+      `node ${localCli} state begin --session-id <id> --branch <branch> --workflow-type review --dashboard-uid ${executionUid}`,
       '```',
       '',
       'Without this flag the dashboard cannot link your review session to its execution row, and the resume command will not be available.',
@@ -379,12 +378,12 @@ const activeCommands = new Map<number, ProcessEntry>()
  * Path of the dashboard spawn marker file.
  *
  * The dashboard writes one marker per active AI workflow spawn at
- * `.ocr/data/dashboard-active-spawn.json`. The CLI's `ocr state init`
+ * `.ocr/data/dashboard-active-spawn.json`. The CLI's `ocr state begin`
  * reads this file to know which dashboard `command_executions.uid` to
  * bind its newly-created session to. Single-marker design is right for
  * the local-first single-user case; concurrent reviews from one user
  * would overwrite the marker (last-write-wins is acceptable — the
- * earlier review's state init that hasn't run yet might link to the
+ * earlier review's state begin that hasn't run yet might link to the
  * wrong execution, but that scenario is pathological for one user).
  */
 function spawnMarkerPath(ocrDir: string): string {
@@ -394,7 +393,7 @@ function spawnMarkerPath(ocrDir: string): string {
 /**
  * Write the spawn marker. Called immediately after the AI process is
  * spawned and its PID is captured. Synchronous on purpose — the AI
- * may run `ocr state init` within milliseconds, and the marker MUST
+ * may run `ocr state begin` within milliseconds, and the marker MUST
  * exist when it does.
  */
 function writeSpawnMarker(ocrDir: string, executionUid: string, pid: number): void {
@@ -802,7 +801,7 @@ function spawnAiCommand(
   // 5a. Spawn via adapter.
   //
   // We pass our own command_executions.uid through as
-  // `OCR_DASHBOARD_EXECUTION_UID` so the AI's child `ocr state init` call
+  // `OCR_DASHBOARD_EXECUTION_UID` so the AI's child `ocr state begin` call
   // can link the new session row's id back to this row by setting
   // `workflow_id`. Without that linkage the handoff route can't resolve
   // the captured `vendor_session_id` for resume because it queries by
@@ -836,7 +835,7 @@ function spawnAiCommand(
   }
 
   // Durable spawn marker. Written to disk synchronously BEFORE the AI
-  // can issue its first `ocr state init` call. The CLI's state init
+  // can issue its first `ocr state begin` call. The CLI's state begin
   // reads this marker to bind `workflow_id` on the dashboard's parent
   // execution row.
   //
@@ -865,7 +864,7 @@ function spawnAiCommand(
 
   // Auxiliary post-spawn polling — secondary defense for cases where
   // the marker is consumed but the link doesn't take (e.g. session
-  // row not yet visible in memory when state init runs). Polls every
+  // row not yet visible in memory when state begin runs). Polls every
   // 2s for up to 5 min; stops as soon as the link is bound or the
   // process finishes. With the marker in place this is rarely needed,
   // but it costs almost nothing and closes any remaining race window.
@@ -1039,7 +1038,7 @@ function spawnAiCommand(
       clearInterval(entry.linkPoll)
       entry.linkPoll = undefined
     }
-    // Remove the spawn marker so the next `ocr state init` (likely
+    // Remove the spawn marker so the next `ocr state begin` (likely
     // from a CLI-only invocation outside the dashboard) doesn't
     // mistakenly link to this finished execution.
     clearSpawnMarker(ocrDir)
@@ -1114,7 +1113,6 @@ function finishExecution(
      WHERE id = ?`,
     [code, finishedAt, output, executionId]
   )
-  saveDb(db, ocrDir)
 
   // Cross-check workflow completeness (event-derived, via the
   // session_completeness view) so the UI distinguishes a genuinely finished

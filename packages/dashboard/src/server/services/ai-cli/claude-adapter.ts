@@ -75,7 +75,7 @@ export class ClaudeCodeAdapter implements AiCliAdapter {
     const isWorkflow = opts.mode === 'workflow'
     // Workflow turn budget needs to cover the whole 8-phase orchestration
     // plus per-reviewer fan-out. A 6-reviewer round measured at roughly
-    // 45–50 turns just to reach `synthesis` (every `ocr state transition`,
+    // 45–50 turns just to reach `synthesis` (every `ocr state advance`,
     // `session start-instance`, Task spawn, `bind-vendor-id`,
     // `end-instance` is one turn). The previous cap of 50 hit mid-`reviews`
     // and Claude Code stopped cleanly with exit 0 — surface fine, but the

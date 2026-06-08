@@ -10,7 +10,6 @@ import {
   insertNote,
   updateNote,
   deleteNote,
-  saveDb,
   type NoteRow,
 } from '../db.js'
 
@@ -23,7 +22,7 @@ const VALID_TARGET_TYPES = new Set<NoteRow['target_type']>([
   'file',
 ])
 
-export function createNotesRouter(db: Database, ocrDir: string): Router {
+export function createNotesRouter(db: Database): Router {
   const router = Router()
 
   // GET /api/notes?target_type=...&target_id=... — Get notes for target
@@ -76,7 +75,6 @@ export function createNotesRouter(db: Database, ocrDir: string): Router {
       }
 
       const noteId = insertNote(db, target_type as NoteRow['target_type'], target_id, content)
-      saveDb(db, ocrDir)
 
       const note = getNote(db, noteId)
       res.status(201).json(note)
@@ -108,7 +106,6 @@ export function createNotesRouter(db: Database, ocrDir: string): Router {
       }
 
       updateNote(db, noteId, content)
-      saveDb(db, ocrDir)
 
       const note = getNote(db, noteId)
       res.json(note)
@@ -134,7 +131,6 @@ export function createNotesRouter(db: Database, ocrDir: string): Router {
       }
 
       deleteNote(db, noteId)
-      saveDb(db, ocrDir)
       res.status(200).json({ deleted: true })
     } catch (err) {
       console.error('Failed to delete note:', err)

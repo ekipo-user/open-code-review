@@ -26,7 +26,6 @@ import {
   linkDashboardInvocationToWorkflow,
   recordVendorSessionIdForExecution,
 } from '@open-code-review/cli/db'
-import { saveDb } from '../../db.js'
 import type { AiCliService } from '../ai-cli/index.js'
 import { microcopyFor } from './unresumable-microcopy.js'
 import { recoverFromEventsJsonl } from './recover-from-events.js'
@@ -180,7 +179,6 @@ export function createSessionCaptureService(deps: SessionCaptureDeps) {
         return
       }
       recordVendorSessionIdForExecution(db, executionId, vendorSessionId)
-      saveDb(db, ocrDir)
     } catch (err) {
       console.error(
         `[session-capture] recordSessionId failed for execution ${executionId} → ${vendorSessionId}:`,
@@ -191,11 +189,11 @@ export function createSessionCaptureService(deps: SessionCaptureDeps) {
 
   /**
    * Late-links the dashboard's parent command_executions row to a
-   * workflow created by the AI's `ocr state init`. Identified by the
+   * workflow created by the AI's `ocr state begin`. Identified by the
    * dashboard-supplied uid via the `OCR_DASHBOARD_EXECUTION_UID` env var
    * or the `--dashboard-uid` flag.
    *
-   * Note: today's CLI runs `ocr state init` in its own process and
+   * Note: today's CLI runs `ocr state begin` in its own process and
    * delegates to `linkDashboardInvocationToWorkflow` directly. This
    * server-side method exists for completeness — it lets in-process
    * callers (future supervisor work) link without shelling out.
@@ -203,7 +201,6 @@ export function createSessionCaptureService(deps: SessionCaptureDeps) {
   function linkInvocationToWorkflow(uid: string, workflowId: string): void {
     try {
       linkDashboardInvocationToWorkflow(db, uid, workflowId)
-      saveDb(db, ocrDir)
     } catch (err) {
       console.error('[session-capture] linkInvocationToWorkflow failed:', err)
     }
@@ -279,7 +276,7 @@ export function createSessionCaptureService(deps: SessionCaptureDeps) {
 
   /**
    * Server-side auto-link: when a new `sessions` row is observed (via
-   * the CLI's `ocr state init`), find the most recent dashboard-spawned
+   * the CLI's `ocr state begin`), find the most recent dashboard-spawned
    * `command_executions` row that is still missing a `workflow_id` and
    * bind it to the new workflow.
    *

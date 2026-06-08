@@ -11,7 +11,6 @@ import { dirname } from 'node:path'
 import type { Server as SocketIOServer, Socket } from 'socket.io'
 import type { Database } from '@open-code-review/cli/db'
 import {
-  saveDb,
   getConversation,
   getMessages,
   insertMessage,
@@ -74,14 +73,12 @@ function cleanupChat(conversationId: string): void {
 function resetIdleTimer(
   conversationId: string,
   db: Database,
-  ocrDir: string
 ): void {
   const chat = activeChats.get(conversationId)
   if (chat) {
     clearTimeout(chat.timer)
     chat.timer = setTimeout(() => {
       updateConversationStatus(db, conversationId, 'expired')
-      saveDb(db, ocrDir)
       cleanupChat(conversationId)
     }, IDLE_TIMEOUT_MS)
   }
@@ -124,11 +121,9 @@ export function registerChatHandlers(
 
       // Ensure conversation exists in DB
       upsertConversation(db, conversationId, sessionId, targetType, targetId)
-      saveDb(db, ocrDir)
 
       // Store user message
       insertMessage(db, conversationId, 'user', message)
-      saveDb(db, ocrDir)
 
       // Check if conversation has a Claude session to resume
       const conversation = getConversation(db, conversationId)
@@ -179,7 +174,6 @@ export function registerChatHandlers(
       // Track the process
       const timer = setTimeout(() => {
         updateConversationStatus(db, conversationId, 'expired')
-        saveDb(db, ocrDir)
         cleanupChat(conversationId)
       }, IDLE_TIMEOUT_MS)
 
@@ -294,7 +288,6 @@ export function registerChatHandlers(
         if (assistantText.trim()) {
           insertMessage(db, conversationId, 'assistant', assistantText.trim())
         }
-        saveDb(db, ocrDir)
 
         if (code === 0) {
           tracker.appendOutput('\n✓ Response complete\n')
@@ -311,7 +304,7 @@ export function registerChatHandlers(
         }
 
         // Reset idle timer (keep entry for session tracking)
-        resetIdleTimer(conversationId, db, ocrDir)
+        resetIdleTimer(conversationId, db)
         // Remove process reference since it's done
         const chat = activeChats.get(conversationId)
         if (chat) {

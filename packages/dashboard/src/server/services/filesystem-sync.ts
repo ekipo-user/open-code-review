@@ -7,7 +7,12 @@
 import { readdirSync, readFileSync, statSync, existsSync } from 'node:fs'
 import { join, basename, dirname, relative } from 'node:path'
 import { watch, type FSWatcher } from 'chokidar'
-import type { Database } from '@open-code-review/cli/db'
+import {
+  commitReasonClose,
+  insertEvent,
+  insertSession,
+  type Database,
+} from '@open-code-review/cli/db'
 import type { Server as SocketIOServer } from 'socket.io'
 import { parseMapMd } from './parsers/map-parser.js'
 import { parseReviewerOutput } from './parsers/reviewer-parser.js'
@@ -73,19 +78,24 @@ function queryScalar(
 
 // ── Main Service ──
 
+/**
+ * The dashboard's bounded "legacy/backfill reconciler". The CLI is the single
+ * writer of the `sessions`/`orchestration_events` lifecycle; this service only
+ * touches those tables to backfill historical sessions discovered on disk (and
+ * to safety-net a session whose terminal artifact landed but whose `ocr state`
+ * close never ran). Every such lifecycle touch routes through the CLI's
+ * event-backed helpers (`insertSession` + `session_created`, `commitReasonClose`)
+ * so the close-guard trigger ordering and projection invariants are respected.
+ */
 export class FilesystemSync {
   private watcher: FSWatcher | null = null
   private debounceTimers = new Map<string, ReturnType<typeof setTimeout>>()
-  private onSync?: () => void
 
   constructor(
     private db: Database,
     private sessionsDir: string,
     private io?: SocketIOServer,
-    onSync?: () => void,
-  ) {
-    this.onSync = onSync
-  }
+  ) {}
 
   // ── 6.1: Full Scan ──
 
@@ -284,8 +294,11 @@ export class FilesystemSync {
 
     if (existing) {
       // The CLI's DB is authoritative for phase/status — DbSyncWatcher handles
-      // syncing those fields. FilesystemSync only updates round/run counts
-      // (derived from directory structure) to keep those in sync.
+      // syncing those fields. As the bounded reconciler, FilesystemSync only
+      // updates round/run counts (derived from directory structure) here — a
+      // benign projection sync, NOT a close. (Not routed through the CLI's
+      // updateSession because that helper doesn't always bump round/run and
+      // this raw UPDATE is not a close-guard concern.)
       this.db.run(
         `UPDATE sessions SET current_round = ?, current_map_run = ?, updated_at = datetime('now')
          WHERE id = ?`,
@@ -296,15 +309,49 @@ export class FilesystemSync {
       // ghost sessions with nothing to show in the dashboard.
       if (!this.hasArtifacts(sessionDir)) return
 
-      this.db.run(
-        `INSERT INTO sessions (id, branch, workflow_type, current_phase, phase_number, current_round, current_map_run, session_dir, status)
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
-        [sessionId, branch, workflowType, phase, phaseNumber, currentRound, currentMapRun, sessionDir, status],
-      )
+      // Backfill reconciler: create an EVENT-BACKED session row. Without a
+      // `session_created` event the projection rebuild would return null for
+      // this row forever, so the INSERT + seed event are committed together.
+      // insertSession always creates the row `active`; if the on-disk
+      // artifacts indicate the workflow is already complete, the close is
+      // routed through commitReasonClose below so the close-guard trigger
+      // ordering is honored.
+      this.db.transaction(() => {
+        insertSession(this.db, {
+          id: sessionId,
+          branch,
+          workflow_type: workflowType,
+          current_phase: phase,
+          phase_number: phaseNumber,
+          current_round: currentRound,
+          current_map_run: currentMapRun,
+          session_dir: sessionDir,
+        })
+        insertEvent(this.db, {
+          session_id: sessionId,
+          event_type: 'session_created',
+          phase,
+          phase_number: 1,
+          round: 1,
+        })
+      })
+
+      if (status === 'closed') {
+        commitReasonClose(
+          this.db,
+          sessionId,
+          {
+            event_type: 'session_synced',
+            phase,
+            phase_number: phaseNumber,
+            metadata: JSON.stringify({ source: 'filesystem_backfill' }),
+          },
+          { status: 'closed', current_phase: phase, phase_number: phaseNumber },
+        )
+      }
+
       this.io?.emit('session:created', { id: sessionId, branch, workflow_type: workflowType, status, current_phase: phase })
     }
-
-    this.onSync?.()
   }
 
   // ── Artifact Check ──
@@ -495,25 +542,27 @@ export class FilesystemSync {
 
     // Safety net: if map.md exists but the session is stuck at an earlier phase,
     // advance to "complete". Handles cases where the AI agent wrote map.md
-    // but crashed or was cancelled before calling `ocr state transition`.
+    // but crashed or was cancelled before calling `ocr state advance`.
     const session = queryFirst(
       this.db,
       'SELECT current_phase, phase_number, workflow_type FROM sessions WHERE id = ?',
       [sessionId],
     )
     if (session && session['workflow_type'] === 'map' && (session['current_phase'] !== 'complete' || (session['phase_number'] as number) < 6)) {
-      // Reason event first so the close-guard trigger permits this
-      // filesystem-derived backfill close (single-writer: the dashboard's
-      // backfill is a sync, recorded as such).
-      this.db.run(
-        `INSERT INTO orchestration_events (session_id, event_type, phase, phase_number, metadata, created_at)
-         VALUES (?, 'session_synced', 'complete', 6, ?, datetime('now'))`,
-        [sessionId, JSON.stringify({ source: 'filesystem_backfill' })],
-      )
-      this.db.run(
-        `UPDATE sessions SET current_phase = 'complete', phase_number = 6, status = 'closed', updated_at = datetime('now')
-         WHERE id = ?`,
-        [sessionId],
+      // Bounded reconciler close: route through the CLI's commitReasonClose
+      // so the reason event lands BEFORE the status flip in one transaction,
+      // satisfying the close-guard trigger. This is one of filesystem-sync's
+      // only lifecycle touches — the CLI remains the single lifecycle writer.
+      commitReasonClose(
+        this.db,
+        sessionId,
+        {
+          event_type: 'session_synced',
+          phase: 'complete',
+          phase_number: 6,
+          metadata: JSON.stringify({ source: 'filesystem_backfill' }),
+        },
+        { status: 'closed', current_phase: 'complete', phase_number: 6 },
       )
       this.io?.emit('session:updated', {
         id: sessionId,
@@ -1137,24 +1186,27 @@ export class FilesystemSync {
 
     // Safety net: if final.md exists but the session is stuck at an earlier phase,
     // advance to "complete". This handles cases where the AI agent wrote final.md
-    // but crashed or was cancelled before calling `ocr state transition`.
+    // but crashed or was cancelled before calling `ocr state finish`.
     const session = queryFirst(
       this.db,
       'SELECT current_phase, phase_number, status FROM sessions WHERE id = ?',
       [sessionId],
     )
     if (session && (session['current_phase'] !== 'complete' || (session['phase_number'] as number) < 8)) {
-      // Reason event first so the close-guard trigger permits this
-      // filesystem-derived backfill close.
-      this.db.run(
-        `INSERT INTO orchestration_events (session_id, event_type, phase, phase_number, metadata, created_at)
-         VALUES (?, 'session_synced', 'complete', 8, ?, datetime('now'))`,
-        [sessionId, JSON.stringify({ source: 'filesystem_backfill' })],
-      )
-      this.db.run(
-        `UPDATE sessions SET current_phase = 'complete', phase_number = 8, status = 'closed', updated_at = datetime('now')
-         WHERE id = ?`,
-        [sessionId],
+      // Bounded reconciler close: route through the CLI's commitReasonClose
+      // so the reason event lands BEFORE the status flip in one transaction,
+      // satisfying the close-guard trigger. This is one of filesystem-sync's
+      // only lifecycle touches — the CLI remains the single lifecycle writer.
+      commitReasonClose(
+        this.db,
+        sessionId,
+        {
+          event_type: 'session_synced',
+          phase: 'complete',
+          phase_number: 8,
+          metadata: JSON.stringify({ source: 'filesystem_backfill' }),
+        },
+        { status: 'closed', current_phase: 'complete', phase_number: 8 },
       )
       this.io?.emit('session:updated', {
         id: sessionId,
@@ -1250,7 +1302,6 @@ export class FilesystemSync {
         this.debounceTimers.delete(filePath)
         try {
           this.processChangedFile(filePath)
-          this.onSync?.()
         } catch (err) {
           console.error(`[FilesystemSync] Error processing ${filePath}:`, err)
         }

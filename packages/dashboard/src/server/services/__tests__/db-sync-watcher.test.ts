@@ -59,7 +59,7 @@ afterEach(() => {
 describe('DbSyncWatcher change notification', () => {
   it('emits session:created and fires onSessionInserted once for a new session', async () => {
     const inserted: string[] = []
-    const watcher = new DbSyncWatcher(db, dbPath, makeIo(emits), undefined, (s) =>
+    const watcher = new DbSyncWatcher(db, dbPath, makeIo(emits), (s) =>
       inserted.push(s.id),
     )
     await watcher.init() // primes snapshots — nothing seen yet

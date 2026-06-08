@@ -12,10 +12,9 @@ import {
   getConversationsForSession,
   getMessages,
   deleteConversation,
-  saveDb,
 } from '../db.js'
 
-export function createChatRouter(db: Database, ocrDir: string): Router {
+export function createChatRouter(db: Database): Router {
   const router = Router()
 
   // GET /api/sessions/:id/chat — List all conversations for a session
@@ -81,7 +80,6 @@ export function createChatRouter(db: Database, ocrDir: string): Router {
       }
 
       deleteConversation(db, conversationId)
-      saveDb(db, ocrDir)
       res.status(200).json({ deleted: true })
     } catch (err) {
       console.error('Failed to delete conversation:', err)
