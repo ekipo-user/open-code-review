@@ -17,12 +17,12 @@
  */
 
 import type { Database } from '@open-code-review/cli/db'
+// Canonical process-sentinel codes — single source of truth in the CLI.
+import {
+  CANCELLED_EXIT_CODE as CANCEL_EXIT_CODE,
+  CASCADE_CLOSE_EXIT_CODE,
+} from '@open-code-review/cli/exit-codes'
 import type { CommandOutcome } from '../../shared/types.js'
-
-/** Cancel sentinel set by finishExecution when the user clicks Cancel. */
-const CANCEL_EXIT_CODE = -2
-/** Cascade-close sentinel: a child terminated by its parent workflow close. */
-const CASCADE_CLOSE_EXIT_CODE = -4
 
 /**
  * The `completeness_state` of the linked workflow, or `null` when the command

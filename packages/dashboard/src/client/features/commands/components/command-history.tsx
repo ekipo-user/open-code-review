@@ -43,6 +43,17 @@ type SortDir = 'asc' | 'desc'
  */
 const HEARTBEAT_STALE_MS = 60_000
 
+/**
+ * Process-exit sentinels (canonical definitions live in the CLI's
+ * `exit-codes` module). The client bundle mirrors the numeric values rather
+ * than importing the Node module. A `-4` row is a child command that was
+ * stopped because its PARENT workflow closed — a non-failure distinct from a
+ * user cancel (`-2`).
+ */
+const CANCEL_EXIT_CODE = -2
+const ORPHAN_EXIT_CODE = -3
+const CASCADE_CLOSE_EXIT_CODE = -4
+
 // ── Fuzzy match helper ──
 
 /**
@@ -80,8 +91,9 @@ function getStatus(entry: CommandHistoryEntry): StatusFilter {
   if (entry.outcome === 'failed') return 'fail'
   // Legacy fallback for rows that predate the outcome field.
   if (entry.exit_code === 0) return 'success'
-  if (entry.exit_code === -2) return 'cancelled'
-  if (entry.exit_code === -3) return 'orphaned'
+  if (entry.exit_code === CANCEL_EXIT_CODE) return 'cancelled'
+  if (entry.exit_code === CASCADE_CLOSE_EXIT_CODE) return 'cancelled'
+  if (entry.exit_code === ORPHAN_EXIT_CODE) return 'orphaned'
   return 'fail'
 }
 
@@ -96,6 +108,26 @@ function statusLabel(s: StatusFilter): string {
     case 'orphaned': return 'Orphaned'
     default: return 'All'
   }
+}
+
+/**
+ * The pill label, distinguishing a cascade-close (`-4`, "Superseded") from a
+ * user cancel (`-2`, "Cancelled") — both share the amber `cancelled` filter
+ * bucket but read differently so an operator knows which happened.
+ */
+function pillLabel(entry: CommandHistoryEntry, status: StatusFilter): string {
+  if (status === 'cancelled' && entry.exit_code === CASCADE_CLOSE_EXIT_CODE) {
+    return 'Superseded'
+  }
+  return statusLabel(status)
+}
+
+/** Tooltip elaborating a non-obvious pill (e.g. why a row is "Superseded"). */
+function pillTitle(entry: CommandHistoryEntry, status: StatusFilter): string | undefined {
+  if (status === 'cancelled' && entry.exit_code === CASCADE_CLOSE_EXIT_CODE) {
+    return 'Stopped because its parent workflow was closed'
+  }
+  return undefined
 }
 
 /** Tailwind classes for the per-status pill in the row. */
@@ -300,12 +332,13 @@ function HistoryItem({
           {formatDuration(entry.duration_ms)}
         </span>
         <span
+          title={pillTitle(entry, status)}
           className={cn(
             'inline-flex shrink-0 items-center rounded-md border px-2 py-0.5 text-xs font-medium',
             statusPillClasses(status),
           )}
         >
-          {statusLabel(status)}
+          {pillLabel(entry, status)}
         </span>
         {canHandoff && (
           <button
