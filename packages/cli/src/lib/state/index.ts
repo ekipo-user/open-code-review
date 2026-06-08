@@ -15,7 +15,6 @@ import {
 } from "node:fs";
 import {
   ensureDatabase,
-  saveDatabase,
   insertSession,
   updateSession,
   getSession,
@@ -23,6 +22,8 @@ import {
   getAllSessions,
   insertEvent,
   getEventsForSession,
+  commitReasonClose,
+  cascadeTerminateExecutions,
 } from "../db/index.js";
 import { join } from "node:path";
 import type {
@@ -38,6 +39,9 @@ import type {
   MapCompleteParams,
   MapCompleteResult,
   MapMeta,
+  SessionStatus,
+  ReviewPhase,
+  MapPhase,
 } from "./types.js";
 
 export type {
@@ -78,6 +82,8 @@ export const STATE_EXIT = {
   ILLEGAL_TRANSITION: 5,
   INVARIANT_UNMET: 6,
   SCHEMA_INVALID: 7,
+  /** Database was locked past the bounded retry budget (SQLITE_BUSY). */
+  BUSY: 8,
 } as const;
 
 /** An error carrying a {@link STATE_EXIT} code for deterministic CLI mapping. */
@@ -90,6 +96,34 @@ export class StateError extends Error {
     this.name = "StateError";
   }
 }
+
+/**
+ * Re-export of the atomic reason-close primitive. It physically lives in the
+ * leaf `db/queries.ts` module (surfaced via the db barrel) to avoid an import
+ * cycle — reconcile.ts also uses it — but is re-exported here so the state
+ * layer and external consumers (the dashboard) can import it from the
+ * canonical state module as well.
+ */
+export { commitReasonClose };
+
+/**
+ * The terminal "reason" event types — non-artifact terminals that explain a
+ * session close (abort, stale auto-close, filesystem sync, legacy import).
+ * Each one independently satisfies the close-guard trigger.
+ *
+ * Single source of truth shared by {@link TERMINAL_EVENT_TYPES} (the fold)
+ * and conceptually by:
+ *   - the close-guard trigger SQL (migrations.ts `trg_sessions_close_guard`)
+ *   - the known-event-type guard (migrations.ts `trg_events_known_type`)
+ *   - reconcile.ts `hasReasonEvent`
+ * If this list changes, those SQL definitions MUST be updated in lockstep.
+ */
+export const REASON_EVENT_TYPES = [
+  "session_aborted",
+  "session_auto_closed_stale",
+  "session_synced",
+  "session_legacy_import",
+] as const;
 
 // ── Helpers ──
 
@@ -195,11 +229,14 @@ export type DerivedLifecycle = {
   current_map_run: number;
 };
 
-const TERMINAL_EVENT_TYPES = new Set([
+// `session_closed` (the artifact-backed success terminal) plus every
+// non-artifact reason terminal. `session_synced` was previously missing,
+// causing rebuildSessionProjection to leave a sync-closed session 'active'
+// (Blocker 2). Derived from REASON_EVENT_TYPES so the fold can never drift
+// from the close-guard's reason vocabulary.
+const TERMINAL_EVENT_TYPES = new Set<string>([
   "session_closed",
-  "session_aborted",
-  "session_auto_closed_stale",
-  "session_legacy_import",
+  ...REASON_EVENT_TYPES,
 ]);
 
 /**
@@ -283,7 +320,6 @@ function hasArtifacts(dir: string): boolean {
 export async function stateInit(params: InitParams): Promise<string> {
   const { sessionId, branch, workflowType, sessionDir, ocrDir } = params;
   const db = await ensureDatabase(ocrDir);
-  const dbPath = join(ocrDir, "data", "ocr.db");
 
   const existing = getSession(db, sessionId);
 
@@ -291,7 +327,8 @@ export async function stateInit(params: InitParams): Promise<string> {
     // Workflow type compatibility: re-opening with a different type would
     // corrupt phase semantics (review vs map have disjoint phase graphs).
     if (existing.workflow_type !== workflowType) {
-      throw new Error(
+      throw new StateError(
+        STATE_EXIT.USAGE,
         `Cannot re-open session ${sessionId} as workflow_type "${workflowType}": ` +
           `existing workflow_type is "${existing.workflow_type}". ` +
           `Maps and reviews have disjoint phase graphs.`,
@@ -331,7 +368,6 @@ export async function stateInit(params: InitParams): Promise<string> {
       });
     });
 
-    saveDatabase(db, dbPath);
     return sessionId;
   }
 
@@ -358,8 +394,6 @@ export async function stateInit(params: InitParams): Promise<string> {
       round: 1,
     });
   });
-
-  saveDatabase(db, dbPath);
 
   return sessionId;
 }
@@ -403,11 +437,18 @@ function graphFor(
   return workflowType === "review" ? REVIEW_PHASE_GRAPH : MAP_PHASE_GRAPH;
 }
 
+/** The first phase a workflow type legally starts (or restarts) at. */
+function initialPhaseFor(workflowType: "review" | "map"): string {
+  return workflowType === "map" ? "map-context" : "context";
+}
+
 /**
  * Validate that `target` is a legal next phase given `source` and the
- * workflow's type. Self-loops are always allowed. Round/mapRun bumps
- * are treated as a permitted reset back to the first phase regardless
- * of source (a new round legitimately starts over at `context`).
+ * workflow's type. Self-loops are always allowed. A round/mapRun bump is a
+ * permitted reset, but ONLY back to the workflow's initial phase — a new
+ * round legitimately starts over at `context` (review) / `map-context`
+ * (map), never partway through. Allowing an arbitrary target on a round
+ * boundary would let the AI skip phases under cover of a round bump.
  */
 function validatePhaseTransition(
   workflowType: "review" | "map",
@@ -427,8 +468,17 @@ function validatePhaseTransition(
   }
   // Same-phase re-entry: always allowed (retries, idempotent calls).
   if (source === target) return;
-  // Round/mapRun boundary: any phase of the same workflow is reachable.
-  if (isRoundBoundary) return;
+  // Round/mapRun boundary: a reset is permitted, but only to the initial
+  // phase. Anything else on a boundary is an illegal skip.
+  if (isRoundBoundary) {
+    const initial = initialPhaseFor(workflowType);
+    if (target === initial) return;
+    throw new StateError(
+      STATE_EXIT.ILLEGAL_TRANSITION,
+      `Illegal round-boundary transition: a new round/run must reset to ` +
+        `"${initial}", not "${target}".`,
+    );
+  }
   const allowed = graph[source];
   if (!allowed || !allowed.includes(target)) {
     throw new StateError(
@@ -444,15 +494,21 @@ function validatePhaseTransition(
 
 /**
  * Transition a session to a new phase in SQLite.
+ *
+ * Accepts an optional already-open `db` handle so callers that have already
+ * opened the database (e.g. {@link stateAdvance}) can avoid a redundant
+ * second open. When omitted, the handle is opened from `ocrDir`.
  */
-export async function stateTransition(params: TransitionParams): Promise<void> {
+export async function stateTransition(
+  params: TransitionParams,
+  db?: Database,
+): Promise<void> {
   const { sessionId, phase, phaseNumber, round, mapRun, ocrDir } = params;
-  const db = await ensureDatabase(ocrDir);
-  const dbPath = join(ocrDir, "data", "ocr.db");
+  db ??= await ensureDatabase(ocrDir);
 
   const existing = getSession(db, sessionId);
   if (!existing) {
-    throw new Error(`Session not found: ${sessionId}`);
+    throw new StateError(STATE_EXIT.NOT_FOUND, `Session not found: ${sessionId}`);
   }
 
   const previousRound = existing.current_round;
@@ -497,8 +553,6 @@ export async function stateTransition(params: TransitionParams): Promise<void> {
       });
     }
   });
-
-  saveDatabase(db, dbPath);
 }
 
 /** Sentinel exit code stamped on dependent rows cascade-closed by a
@@ -521,7 +575,6 @@ const CASCADE_CLOSE_EXIT_CODE = -4;
 export async function stateClose(params: CloseParams): Promise<void> {
   const { sessionId, ocrDir, abort } = params;
   const db = await ensureDatabase(ocrDir);
-  const dbPath = join(ocrDir, "data", "ocr.db");
 
   const existing = getSession(db, sessionId);
   if (!existing) {
@@ -584,19 +637,8 @@ export async function stateClose(params: CloseParams): Promise<void> {
     // flight. Without this, a workflow close leaves orphan rows that only
     // the heartbeat sweep can recover — and that sweep needs the dashboard
     // running. Doing it here makes close authoritative.
-    db.run(
-      `UPDATE command_executions
-         SET finished_at = datetime('now'),
-             exit_code   = ?,
-             pid         = NULL,
-             notes       = COALESCE(notes || char(10), '') || ?
-       WHERE workflow_id = ?
-         AND finished_at IS NULL`,
-      [CASCADE_CLOSE_EXIT_CODE, note, sessionId],
-    );
+    cascadeTerminateExecutions(db, sessionId, CASCADE_CLOSE_EXIT_CODE, note);
   });
-
-  saveDatabase(db, dbPath);
 }
 
 /**
@@ -690,6 +732,12 @@ export type ResolveSessionResult = {
   current_round: number;
   current_map_run: number;
   workflow_type: "review" | "map";
+  // Projection fields carried through so callers that need them (completion,
+  // status) don't have to re-`getSession` and dereference with a `!`.
+  status: SessionStatus;
+  current_phase: string;
+  phase_number: number;
+  branch: string;
   decision: ResolveDecision;
 };
 
@@ -723,6 +771,10 @@ export function resolveSession(
       current_round: s.current_round,
       current_map_run: s.current_map_run,
       workflow_type: s.workflow_type,
+      status: s.status,
+      current_phase: s.current_phase,
+      phase_number: s.phase_number,
+      branch: s.branch,
       decision: "explicit",
     };
   }
@@ -744,6 +796,10 @@ export function resolveSession(
           current_round: s.current_round,
           current_map_run: s.current_map_run,
           workflow_type: s.workflow_type,
+          status: s.status,
+          current_phase: s.current_phase,
+          phase_number: s.phase_number,
+          branch: s.branch,
           decision: "dashboard-uid",
         };
       }
@@ -754,7 +810,8 @@ export function resolveSession(
 
   // 3. Latest-active. Refuse if ambiguous.
   const activeRows = db.exec(
-    `SELECT id, session_dir, current_round, current_map_run, workflow_type
+    `SELECT id, session_dir, current_round, current_map_run, workflow_type,
+            status, current_phase, phase_number, branch
        FROM sessions
       WHERE status = 'active'
       ORDER BY started_at DESC`,
@@ -776,6 +833,10 @@ export function resolveSession(
     current_round: row[2] as number,
     current_map_run: row[3] as number,
     workflow_type: row[4] as "review" | "map",
+    status: row[5] as SessionStatus,
+    current_phase: row[6] as string,
+    phase_number: row[7] as number,
+    branch: row[8] as string,
     decision: "latest-active",
   };
 }
@@ -823,7 +884,7 @@ function readJsonFromSource(
 ): string {
   if (params.source === "file") {
     if (!existsSync(params.filePath)) {
-      throw new Error(`File not found: ${params.filePath}`);
+      throw new StateError(STATE_EXIT.NOT_FOUND, `File not found: ${params.filePath}`);
     }
     return readFileSync(params.filePath, "utf-8");
   }
@@ -837,7 +898,8 @@ function parseRawJson(raw: string, label: string): unknown {
   try {
     return JSON.parse(raw);
   } catch (err) {
-    throw new Error(
+    throw new StateError(
+      STATE_EXIT.SCHEMA_INVALID,
       `Failed to parse ${label}: ${err instanceof Error ? err.message : "invalid JSON"}`,
     );
   }
@@ -848,6 +910,30 @@ function parseRawJson(raw: string, label: string): unknown {
 
 const VALID_CATEGORIES = new Set(["blocker", "should_fix", "suggestion", "style"]);
 const VALID_SEVERITIES = new Set(["critical", "high", "medium", "low", "info"]);
+
+const DEFAULT_METADATA_MAX_LEN = 4096;
+
+/**
+ * Defang an orchestrator-supplied free-text field before it is persisted and
+ * later rendered (dashboard, stderr logs, agent prompts):
+ *
+ *   - strips C0 control chars (\x00-\x1f) except tab (\t) and newline (\n),
+ *     which neutralizes ANSI/escape injection and embedded NULs;
+ *   - strips a leading "[ocr]" prefix (case-insensitive), reserved for the
+ *     CLI's own machine-readable log lines, so a finding can't spoof one;
+ *   - caps the length to `maxLen` to bound storage + render cost.
+ */
+function sanitizeMetadataString(
+  s: string,
+  opts: { maxLen?: number } = {},
+): string {
+  const maxLen = opts.maxLen ?? DEFAULT_METADATA_MAX_LEN;
+  // eslint-disable-next-line no-control-regex
+  let out = s.replace(/[\x00-\x08\x0b-\x1f]/g, "");
+  out = out.replace(/^\s*\[ocr\]\s*/i, "");
+  if (out.length > maxLen) out = out.slice(0, maxLen);
+  return out;
+}
 
 function validateRoundMeta(meta: unknown): RoundMeta {
   if (!meta || typeof meta !== "object") {
@@ -865,6 +951,7 @@ function validateRoundMeta(meta: unknown): RoundMeta {
   if (typeof obj.verdict !== "string" || obj.verdict.trim().length === 0) {
     throw new Error("round-meta.json must contain a non-empty verdict string");
   }
+  obj.verdict = sanitizeMetadataString(obj.verdict);
 
   if (!Array.isArray(obj.reviewers)) {
     throw new Error("round-meta.json must contain a reviewers array");
@@ -892,6 +979,7 @@ function validateRoundMeta(meta: unknown): RoundMeta {
       if (typeof f.title !== "string" || f.title.trim().length === 0) {
         throw new Error("Each finding must have a non-empty title");
       }
+      f.title = sanitizeMetadataString(f.title);
       if (typeof f.category !== 'string' || !VALID_CATEGORIES.has(f.category)) {
         throw new Error(
           `Finding "${f.title}" has invalid category: "${String(f.category)}". Must be one of: ${[...VALID_CATEGORIES].join(", ")}`,
@@ -905,6 +993,7 @@ function validateRoundMeta(meta: unknown): RoundMeta {
       if (typeof f.summary !== "string") {
         throw new Error(`Finding "${f.title}" must have a summary string`);
       }
+      f.summary = sanitizeMetadataString(f.summary);
       if (f.file_path !== undefined && typeof f.file_path !== "string") {
         throw new Error(`Finding "${f.title}" has invalid file_path: expected string`);
       }
@@ -996,7 +1085,6 @@ export async function stateRoundComplete(
 ): Promise<RoundCompleteResult> {
   const { ocrDir } = params;
   const db = await ensureDatabase(ocrDir);
-  const dbPath = join(ocrDir, "data", "ocr.db");
 
   // ── 1. Read and parse JSON ──
   const rawJsonString = readJsonFromSource(params);
@@ -1046,9 +1134,7 @@ export async function stateRoundComplete(
     }
   });
 
-  saveDatabase(db, dbPath);
-
-  return { sessionId: session.id, round: roundNumber, metaPath };
+  return { sessionId: session.id, round: roundNumber, metaPath, schema_version: 1 };
 }
 
 // ── Map-meta validation helpers ──
@@ -1081,6 +1167,13 @@ function validateMapMeta(meta: unknown): MapMeta {
     if (typeof s.title !== "string" || s.title.trim().length === 0) {
       throw new Error("Each section must have a non-empty title");
     }
+    s.title = sanitizeMetadataString(s.title);
+    if (s.description !== undefined) {
+      if (typeof s.description !== "string") {
+        throw new Error(`Section "${s.title}" description must be a string if provided`);
+      }
+      s.description = sanitizeMetadataString(s.description);
+    }
     if (!Array.isArray(s.files)) {
       throw new Error(`Section "${s.title}" must have a files array`);
     }
@@ -1095,6 +1188,7 @@ function validateMapMeta(meta: unknown): MapMeta {
       if (typeof f.role !== "string") {
         throw new Error(`File "${f.file_path}" must have a role string`);
       }
+      f.role = sanitizeMetadataString(f.role);
       if (typeof f.lines_added !== "number") {
         throw new Error(`File "${f.file_path}" must have a lines_added number`);
       }
@@ -1141,7 +1235,6 @@ export async function stateMapComplete(
 ): Promise<MapCompleteResult> {
   const { ocrDir } = params;
   const db = await ensureDatabase(ocrDir);
-  const dbPath = join(ocrDir, "data", "ocr.db");
 
   // ── 1. Read and parse JSON ──
   const rawJsonString = readJsonFromSource(params);
@@ -1183,14 +1276,13 @@ export async function stateMapComplete(
     });
   });
 
-  saveDatabase(db, dbPath);
-
-  return { sessionId: session.id, mapRun: mapRunNumber, metaPath };
+  return { sessionId: session.id, mapRun: mapRunNumber, metaPath, schema_version: 1 };
 }
 
 // ── Atomic porcelain (the misuse-proof agent API) ──
 
 export type BeginResult = {
+  schema_version: number;
   session_id: string;
   round: number;
   phase: string;
@@ -1206,6 +1298,7 @@ export async function stateBegin(params: InitParams): Promise<BeginResult> {
   const db = await ensureDatabase(params.ocrDir);
   const s = getSession(db, id);
   return {
+    schema_version: 1,
     session_id: id,
     round: s?.current_round ?? 1,
     phase: s?.current_phase ?? "context",
@@ -1232,14 +1325,18 @@ export async function stateAdvance(params: AdvanceParams): Promise<void> {
     throw new StateError(STATE_EXIT.NOT_FOUND, `Session not found: ${params.sessionId}`);
   }
   const phaseNumber = phaseNumberFor(existing.workflow_type, params.phase);
-  await stateTransition({
-    sessionId: params.sessionId,
-    phase: params.phase as ReviewPhase | MapPhase,
-    phaseNumber,
-    round: params.round,
-    mapRun: params.mapRun,
-    ocrDir: params.ocrDir,
-  });
+  // Thread the already-open handle so stateTransition doesn't re-open the DB.
+  await stateTransition(
+    {
+      sessionId: params.sessionId,
+      phase: params.phase as ReviewPhase | MapPhase,
+      phaseNumber,
+      round: params.round,
+      mapRun: params.mapRun,
+      ocrDir: params.ocrDir,
+    },
+    db,
+  );
 }
 
 type CompleteRoundParams = RoundCompleteParams & { requireFinal?: boolean };
@@ -1256,7 +1353,6 @@ export async function stateCompleteRound(
 ): Promise<RoundCompleteResult> {
   const { ocrDir } = params;
   const db = await ensureDatabase(ocrDir);
-  const dbPath = join(ocrDir, "data", "ocr.db");
 
   // Validate schema (any failure → SCHEMA_INVALID).
   let meta: RoundMeta;
@@ -1274,25 +1370,32 @@ export async function stateCompleteRound(
   }
 
   const resolved = resolveSession(db, params.sessionId);
-  const session = getSession(db, resolved.id)!;
-  const roundNumber = params.round ?? session.current_round;
+  const roundNumber = params.round ?? resolved.current_round;
+  const roundMetaPath = join(
+    resolved.session_dir,
+    "rounds",
+    `round-${roundNumber}`,
+    "round-meta.json",
+  );
 
-  // Idempotent: already finalized → no-op success.
+  // Idempotent: already finalized → no-op success. Return the stable
+  // round-meta.json path so callers can't tell an idempotent retry apart
+  // from the first write by the absence of metaPath.
   const already = db.exec(
     `SELECT 1 FROM orchestration_events
        WHERE session_id = ? AND event_type = 'round_completed' AND round = ? LIMIT 1`,
-    [session.id, roundNumber],
+    [resolved.id, roundNumber],
   );
   if ((already[0]?.values.length ?? 0) > 0) {
-    return { sessionId: session.id, round: roundNumber };
+    return { sessionId: resolved.id, round: roundNumber, metaPath: roundMetaPath, schema_version: 1 };
   }
 
   // Proof of work: the workflow must have reached synthesis. Because every
   // advance is graph-validated, reaching synthesis implies the full path.
-  if (session.current_phase !== "synthesis") {
+  if (resolved.current_phase !== "synthesis") {
     throw new StateError(
       STATE_EXIT.INVARIANT_UNMET,
-      `Cannot complete round: workflow is at "${session.current_phase}", not "synthesis". ` +
+      `Cannot complete round: workflow is at "${resolved.current_phase}", not "synthesis". ` +
         `Advance through the phases first.`,
     );
   }
@@ -1312,13 +1415,13 @@ export async function stateCompleteRound(
   if (params.source === "stdin") {
     const roundDir = join(resolved.session_dir, "rounds", `round-${roundNumber}`);
     mkdirSync(roundDir, { recursive: true });
-    metaPath = join(roundDir, "round-meta.json");
+    metaPath = roundMetaPath;
     writeFileSync(metaPath, JSON.stringify(meta, null, 2));
   }
 
   db.transaction(() => {
     insertEvent(db, {
-      session_id: session.id,
+      session_id: resolved.id,
       event_type: "round_completed",
       phase: "synthesis",
       phase_number: 7,
@@ -1333,14 +1436,14 @@ export async function stateCompleteRound(
         source: "orchestrator",
       }),
     });
-    if (roundNumber >= session.current_round) {
-      updateSession(db, session.id, { current_round: roundNumber });
+    if (roundNumber >= resolved.current_round) {
+      updateSession(db, resolved.id, { current_round: roundNumber });
     }
     // Transition synthesis → complete (graph-validated).
-    validatePhaseTransition("review", session.current_phase, "complete", false);
-    updateSession(db, session.id, { current_phase: "complete", phase_number: 8 });
+    validatePhaseTransition("review", resolved.current_phase, "complete", false);
+    updateSession(db, resolved.id, { current_phase: "complete", phase_number: 8 });
     insertEvent(db, {
-      session_id: session.id,
+      session_id: resolved.id,
       event_type: "phase_transition",
       phase: "complete",
       phase_number: 8,
@@ -1348,8 +1451,7 @@ export async function stateCompleteRound(
     });
   });
 
-  saveDatabase(db, dbPath);
-  return { sessionId: session.id, round: roundNumber, metaPath };
+  return { sessionId: resolved.id, round: roundNumber, metaPath, schema_version: 1 };
 }
 
 type CompleteMapParams = MapCompleteParams;
@@ -1363,7 +1465,6 @@ export async function stateCompleteMap(
 ): Promise<MapCompleteResult> {
   const { ocrDir } = params;
   const db = await ensureDatabase(ocrDir);
-  const dbPath = join(ocrDir, "data", "ocr.db");
 
   let meta: MapMeta;
   let counts: { sectionCount: number; fileCount: number };
@@ -1380,22 +1481,30 @@ export async function stateCompleteMap(
   }
 
   const resolved = resolveSession(db, params.sessionId);
-  const session = getSession(db, resolved.id)!;
-  const mapRunNumber = params.mapRun ?? session.current_map_run;
+  const mapRunNumber = params.mapRun ?? resolved.current_map_run;
+  const mapMetaPath = join(
+    resolved.session_dir,
+    "map",
+    "runs",
+    `run-${mapRunNumber}`,
+    "map-meta.json",
+  );
 
+  // Idempotent: already finalized → no-op success. Return the stable
+  // map-meta.json path so an idempotent retry looks identical to the first.
   const already = db.exec(
     `SELECT 1 FROM orchestration_events
        WHERE session_id = ? AND event_type = 'map_completed' AND round = ? LIMIT 1`,
-    [session.id, mapRunNumber],
+    [resolved.id, mapRunNumber],
   );
   if ((already[0]?.values.length ?? 0) > 0) {
-    return { sessionId: session.id, mapRun: mapRunNumber };
+    return { sessionId: resolved.id, mapRun: mapRunNumber, metaPath: mapMetaPath, schema_version: 1 };
   }
 
-  if (session.current_phase !== "synthesis") {
+  if (resolved.current_phase !== "synthesis") {
     throw new StateError(
       STATE_EXIT.INVARIANT_UNMET,
-      `Cannot complete map: workflow is at "${session.current_phase}", not "synthesis". Advance first.`,
+      `Cannot complete map: workflow is at "${resolved.current_phase}", not "synthesis". Advance first.`,
     );
   }
 
@@ -1403,13 +1512,13 @@ export async function stateCompleteMap(
   if (params.source === "stdin") {
     const runDir = join(resolved.session_dir, "map", "runs", `run-${mapRunNumber}`);
     mkdirSync(runDir, { recursive: true });
-    metaPath = join(runDir, "map-meta.json");
+    metaPath = mapMetaPath;
     writeFileSync(metaPath, JSON.stringify(meta, null, 2));
   }
 
   db.transaction(() => {
     insertEvent(db, {
-      session_id: session.id,
+      session_id: resolved.id,
       event_type: "map_completed",
       phase: "synthesis",
       phase_number: 5,
@@ -1420,10 +1529,10 @@ export async function stateCompleteMap(
         source: "orchestrator",
       }),
     });
-    validatePhaseTransition("map", session.current_phase, "complete", false);
-    updateSession(db, session.id, { current_phase: "complete", phase_number: 6 });
+    validatePhaseTransition("map", resolved.current_phase, "complete", false);
+    updateSession(db, resolved.id, { current_phase: "complete", phase_number: 6 });
     insertEvent(db, {
-      session_id: session.id,
+      session_id: resolved.id,
       event_type: "phase_transition",
       phase: "complete",
       phase_number: 6,
@@ -1431,11 +1540,23 @@ export async function stateCompleteMap(
     });
   });
 
-  saveDatabase(db, dbPath);
-  return { sessionId: session.id, mapRun: mapRunNumber, metaPath };
+  return { sessionId: resolved.id, mapRun: mapRunNumber, metaPath, schema_version: 1 };
 }
 
+/**
+ * Machine-branchable counterpart to the prose `next_action`. Lets an
+ * orchestrating agent dispatch on the next step without parsing English.
+ */
+export type NextActionKind =
+  | "finish"
+  | "complete_round"
+  | "advance"
+  | "wait"
+  | "reopen"
+  | "none";
+
 export type StatusResult = {
+  schema_version: number;
   session_id: string;
   workflow_type: string;
   status: string;
@@ -1447,6 +1568,7 @@ export type StatusResult = {
   marked_closed: boolean;
   dependents_settled: boolean;
   next_action: string;
+  next_action_kind: NextActionKind;
 };
 
 /**
@@ -1459,7 +1581,6 @@ export async function stateStatus(
 ): Promise<StatusResult> {
   const db = await ensureDatabase(ocrDir);
   const resolved = resolveSession(db, sessionId);
-  const s = getSession(db, resolved.id)!;
   const view = db.exec(
     `SELECT completeness_state, has_terminal_artifact, marked_closed, dependents_settled
        FROM session_completeness WHERE session_id = ?`,
@@ -1467,43 +1588,53 @@ export async function stateStatus(
   );
   const row = view[0]?.values[0];
   const completenessState = (row?.[0] as string | undefined) ?? null;
+  const hasTerminalArtifact = (row?.[1] as number) === 1;
 
   let nextAction: string;
+  let nextActionKind: NextActionKind;
   switch (completenessState) {
     case "complete":
       nextAction = "none — session is complete";
+      nextActionKind = "none";
       break;
     case "closed_without_artifact":
       nextAction =
         "re-open and finalize: this session was closed without a completed round/run";
+      nextActionKind = "reopen";
       break;
     case "in_flight":
       nextAction = "wait for in-flight agent processes to finish";
+      nextActionKind = "wait";
       break;
     default:
       // Open session. If the current round/run already has its terminal
       // artifact, the next step is to finish; otherwise complete the round.
-      if ((row?.[1] as number) === 1) {
+      if (hasTerminalArtifact) {
         nextAction = "run 'ocr state finish' to close the workflow";
-      } else if (s.current_phase === "synthesis") {
+        nextActionKind = "finish";
+      } else if (resolved.current_phase === "synthesis") {
         nextAction = "pipe round metadata to 'ocr state complete-round --stdin'";
+        nextActionKind = "complete_round";
       } else {
         nextAction = "advance through the phases, then 'ocr state complete-round'";
+        nextActionKind = "advance";
       }
   }
 
   return {
-    session_id: s.id,
-    workflow_type: s.workflow_type,
-    status: s.status,
-    current_phase: s.current_phase,
-    current_round: s.current_round,
-    current_map_run: s.current_map_run,
+    schema_version: 1,
+    session_id: resolved.id,
+    workflow_type: resolved.workflow_type,
+    status: resolved.status,
+    current_phase: resolved.current_phase,
+    current_round: resolved.current_round,
+    current_map_run: resolved.current_map_run,
     completeness_state: completenessState,
-    has_terminal_artifact: (row?.[1] as number) === 1,
+    has_terminal_artifact: hasTerminalArtifact,
     marked_closed: (row?.[2] as number) === 1,
     dependents_settled: (row?.[3] as number) === 1,
     next_action: nextAction,
+    next_action_kind: nextActionKind,
   };
 }
 
@@ -1515,7 +1646,6 @@ export async function stateStatus(
  */
 export async function stateSync(ocrDir: string): Promise<number> {
   const db = await ensureDatabase(ocrDir);
-  const dbPath = join(ocrDir, "data", "ocr.db");
   const sessionsRoot = join(ocrDir, "sessions");
 
   if (!existsSync(sessionsRoot)) {
@@ -1618,22 +1748,22 @@ export async function stateSync(ocrDir: string): Promise<number> {
     });
 
     // Backfilled sessions are always marked closed — they are filesystem
-    // artifacts, not actively running workflows. The session_synced reason
-    // event is written FIRST so the close-guard trigger permits the close.
-    insertEvent(db, {
-      session_id: dirName,
-      event_type: "session_synced",
-      phase: inferredPhase,
-      phase_number: 1,
-      metadata: JSON.stringify({ source: "filesystem_backfill" }),
-    });
-    updateSession(db, dirName, { status: "closed" });
+    // artifacts, not actively running workflows. commitReasonClose writes the
+    // session_synced reason event FIRST and the status flip together in one
+    // transaction, so the close-guard trigger always sees the reason event.
+    commitReasonClose(
+      db,
+      dirName,
+      {
+        event_type: "session_synced",
+        phase: inferredPhase,
+        phase_number: 1,
+        metadata: JSON.stringify({ source: "filesystem_backfill" }),
+      },
+      { status: "closed" },
+    );
 
     synced++;
-  }
-
-  if (synced > 0) {
-    saveDatabase(db, dbPath);
   }
 
   return synced;

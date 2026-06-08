@@ -123,6 +123,8 @@ export type RoundCompleteResult = {
   sessionId: string;
   round: number;
   metaPath?: string;
+  /** Result envelope version so consumers can branch on schema changes. */
+  schema_version: number;
 };
 
 // ── Map Meta (structured map data) ──
@@ -175,6 +177,8 @@ export type MapCompleteResult = {
   sessionId: string;
   mapRun: number;
   metaPath?: string;
+  /** Result envelope version so consumers can branch on schema changes. */
+  schema_version: number;
 };
 
 // ── Reviewers Meta (structured reviewer catalog for dashboard) ──
@@ -210,7 +214,15 @@ export type AgentSessionStatus =
   | "cancelled"
   | "orphaned";
 
-export type AgentVendor = "claude" | "opencode" | "gemini" | string;
+/** The vendors OCR ships first-class support for. */
+export type KnownAgentVendor = "claude" | "opencode" | "gemini";
+
+/**
+ * A vendor identifier. Unknown vendors are accepted (the field is open), but
+ * the `string & {}` intersection keeps editor autocomplete for the known
+ * vendors instead of collapsing the union to a bare `string`.
+ */
+export type AgentVendor = KnownAgentVendor | (string & {});
 
 /**
  * One row in the `agent_sessions` table — a journal entry for an agent-CLI

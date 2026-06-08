@@ -103,6 +103,8 @@ The system SHALL enforce, at the database layer, that a session cannot be marked
 
 The system SHALL expose a `session_completeness` view that derives, per session, whether it is genuinely complete and — when not — which obligations are unmet, as the published contract consumed by the dashboard and the agent `status` command.
 
+`completeness_state` is an intentional hybrid of the mutable `status` column (marked closed) and append-only event evidence (the terminal artifact event). This is sound because the close-guard trigger makes the `status` column trustworthy — a row can only reach `status = 'closed'` with a completed round/run or an explicit reason event — so reading the column is not a regression to a mutable flag that could lie.
+
 #### Scenario: View reports completeness state
 
 - **WHEN** the `session_completeness` view is queried for a session
@@ -241,10 +243,11 @@ The system SHALL use a versioned, transactional, idempotent migration system tha
 - **WHEN** the v12 migration is about to apply
 - **THEN** the system SHALL copy `ocr.db` to `ocr.db.bak.<fromVersion>` before mutating it
 
-#### Scenario: Reconciliation runs within the upgrade
+#### Scenario: Reconciliation runs as part of the upgrade
 
 - **WHEN** the v12 migration applies
-- **THEN** legacy reconciliation SHALL run before the strict completion-invariant trigger is installed
+- **THEN** legacy reconciliation SHALL run as part of the upgrade, after the schema (including the close-guard trigger) is installed — reconciliation needs filesystem access for artifact evidence, so it runs in the application's `ensureDatabase` step, not inside the SQL migration
+- **AND** running it after the trigger is safe because (a) the close-guard trigger only fires on an active→closed status change, and (b) reconciliation writes its reason event (`session_legacy_import` / `session_auto_closed_stale`) before any status change, so every reconcile-driven close satisfies the guard
 - **AND** the upgrade SHALL complete without any manual user action
 
 #### Scenario: Crash-safe and idempotent

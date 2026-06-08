@@ -5,7 +5,6 @@ import { describe, it, expect, beforeEach, afterEach } from "vitest";
 import {
   openDatabase,
   ensureDatabase,
-  saveDatabase,
   closeAllDatabases,
   insertSession,
   updateSession,
@@ -298,20 +297,6 @@ describe("ensureDatabase", () => {
     expect(result[0]?.values[0]?.[0]).toBeGreaterThanOrEqual(1);
 
     ensuredDb.close();
-  });
-});
-
-describe("saveDatabase", () => {
-  it("persists the database to disk", () => {
-    insertSession(db, {
-      id: "persist-test",
-      branch: "feat/persist",
-      workflow_type: "review",
-      session_dir: "/tmp/ocr/sessions/persist-test",
-    });
-
-    saveDatabase(db, dbPath);
-    expect(existsSync(dbPath)).toBe(true);
   });
 });
 

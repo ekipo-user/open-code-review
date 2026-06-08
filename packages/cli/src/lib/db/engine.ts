@@ -17,6 +17,33 @@ import type { Database as BetterSqliteDatabase, Statement } from "better-sqlite3
 /** A value that can be bound to a parameter or returned from a column. */
 export type SqlValue = number | string | bigint | Buffer | Uint8Array | null;
 
+/** Bounded retry budget for write transactions that hit SQLITE_BUSY. */
+const BUSY_RETRY_ATTEMPTS = 5;
+const BUSY_RETRY_BACKOFF_MS = 50;
+
+/**
+ * True when `e` is a better-sqlite3 lock-contention error. We can't rely on
+ * `instanceof BetterSqlite3.SqliteError` alone (different module instances can
+ * defeat it), so we also probe the structural `code` field.
+ */
+export function isBusyError(e: unknown): boolean {
+  if (e instanceof BetterSqlite3.SqliteError) {
+    return e.code === "SQLITE_BUSY" || e.code === "SQLITE_BUSY_SNAPSHOT";
+  }
+  const code = (e as { code?: unknown } | null)?.code;
+  return code === "SQLITE_BUSY" || code === "SQLITE_BUSY_SNAPSHOT";
+}
+
+/**
+ * Block the current thread for `ms` milliseconds. Synchronous because
+ * `transaction()` is synchronous — we cannot `await` a timer mid-transaction.
+ * Uses `Atomics.wait` on a throwaway SharedArrayBuffer, which parks the
+ * thread without busy-spinning the CPU.
+ */
+function sleepSync(ms: number): void {
+  Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, ms);
+}
+
 /** Positional bind parameters for `exec`/`run`. */
 export type BindParams = ReadonlyArray<SqlValue>;
 
@@ -97,7 +124,28 @@ class BetterSqliteAdapter implements Database {
   transaction<T>(fn: () => T): T {
     // `immediate` acquires the write lock up front so cross-process writers
     // serialize cleanly under WAL instead of failing late on upgrade.
-    return this.raw.transaction(fn).immediate();
+    //
+    // `busy_timeout` covers most contention, but a writer can still surface
+    // SQLITE_BUSY (e.g. when another connection holds the write lock past the
+    // timeout, or on BUSY_SNAPSHOT). Bounded synchronous retry with backoff
+    // absorbs those transient cases; we re-throw on any non-busy error and on
+    // the final attempt so genuine failures still propagate.
+    const tx = this.raw.transaction(fn);
+    let lastErr: unknown;
+    for (let attempt = 0; attempt < BUSY_RETRY_ATTEMPTS; attempt++) {
+      try {
+        return tx.immediate();
+      } catch (e) {
+        if (!isBusyError(e) || attempt === BUSY_RETRY_ATTEMPTS - 1) {
+          throw e;
+        }
+        lastErr = e;
+        sleepSync(BUSY_RETRY_BACKOFF_MS);
+      }
+    }
+    // Unreachable — the loop either returns or throws — but satisfies the
+    // type checker that a value (or throw) is always produced.
+    throw lastErr;
   }
 
   pragma(source: string): unknown {

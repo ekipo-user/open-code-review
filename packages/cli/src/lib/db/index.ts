@@ -107,6 +107,7 @@ export {
   insertEvent,
   getEventsForSession,
   getLatestEventId,
+  commitReasonClose,
 } from "./queries.js";
 
 export {
@@ -123,6 +124,7 @@ export {
   updateAgentSession,
   sweepStaleAgentSessions,
   sweepStaleSessions,
+  cascadeTerminateExecutions,
 } from "./agent-sessions.js";
 
 export type { WorkflowType, SessionStatus } from "../state/types.js";
@@ -132,7 +134,7 @@ export { runMigrations, MIGRATIONS } from "./migrations.js";
 export { resultToRows, resultToRow } from "./result-mapper.js";
 
 export type { Database, ExecResult, ExecResultRow, SqlValue, BindParams } from "./engine.js";
-export { probeEngine } from "./engine.js";
+export { probeEngine, isBusyError } from "./engine.js";
 export { reconcileLegacyState } from "./reconcile.js";
 export type {
   ReconcileResult,
@@ -180,20 +182,6 @@ export async function openDatabase(dbPath: string): Promise<Database> {
   const db = openEngine(dbPath);
   connections.set(dbPath, db);
   return db;
-}
-
-/**
- * No-op persistence shim.
- *
- * Under the prior sql.js engine the entire database lived in memory and had
- * to be serialized to disk after every mutation. With better-sqlite3 + WAL,
- * writes are persisted by the engine as part of each statement/transaction,
- * so there is nothing to flush. Retained as a symbol so the ~30 existing
- * `saveDatabase(db, path)` / `saveDb(db)` call sites do not all need editing;
- * durability is now the engine's responsibility.
- */
-export function saveDatabase(_db: Database, _dbPath: string): void {
-  // Intentionally empty — better-sqlite3 + WAL persists on commit.
 }
 
 /**
@@ -254,8 +242,6 @@ export async function ensureDatabase(ocrDir: string): Promise<Database> {
     const notice = formatUpgradeNotice(bakPath, reconcile);
     if (notice) console.error(notice);
   }
-
-  saveDatabase(db, dbPath);
 
   return db;
 }

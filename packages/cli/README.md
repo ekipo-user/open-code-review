@@ -120,12 +120,16 @@ ocr reviewers sync --stdin      # Pipe JSON from AI-generated metadata
 
 ### `ocr state`
 
-Internal command used by the review workflow to manage session state. Subcommands: `init`, `transition`, `close`, `show`, `sync`, `round-complete`, `map-complete`.
+Internal command used by the review workflow to manage session state. Subcommands: `begin`, `advance`, `complete-round`, `complete-map`, `finish`, `status`, `show`, `sync`, `reconcile`.
 
 ```bash
-ocr state show                # Show current session state
-ocr state show --json         # Output as JSON
-ocr state sync                # Rebuild state from filesystem
+ocr state begin --session-id <id> --branch <branch> --workflow-type review
+ocr state advance --phase reviews   # Advance to a phase (graph-validated)
+ocr state complete-round --stdin    # Finalize a round from piped JSON
+ocr state finish                    # Close the workflow (invariant-checked)
+ocr state status --json             # Completeness + next action
+ocr state show --json               # Show current session state
+ocr state sync                      # Rebuild state from filesystem
 ```
 
 ## Supported AI Tools

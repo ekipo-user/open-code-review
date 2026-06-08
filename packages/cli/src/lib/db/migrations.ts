@@ -365,6 +365,17 @@ const MIGRATIONS: Migration[] = [
       -- close carries a reason event and passes. App-level guards in
       -- stateClose/finish are the primary check; this makes the illegal state
       -- unrepresentable even via raw SQL.
+      --
+      -- DEFENCE-IN-DEPTH NOTE (intentional, documented gap): the reason-event
+      -- branch below (event_type IN (...)) is NOT round-scoped — a reason event
+      -- recorded for an earlier round would also satisfy a later close. The
+      -- app-level guards ARE round-scoped (hasCompletionInvariant checks the
+      -- current round/run), so the precise check lives in the application; this
+      -- trigger is a coarse backstop against a *silent* premature close via raw
+      -- SQL. Tightening it to be round-scoped would require a new migration
+      -- (this v12 trigger is append-only and already shipped); the residual
+      -- risk is a non-artifact close carrying a stale reason event, which is
+      -- still an explicit, audited terminal — not the failure mode this guards.
       CREATE TRIGGER IF NOT EXISTS trg_sessions_close_guard
       BEFORE UPDATE OF status ON sessions
       WHEN NEW.status = 'closed' AND OLD.status <> 'closed'
@@ -388,6 +399,14 @@ const MIGRATIONS: Migration[] = [
       -- artifact event exists for its current round/run. The dashboard's
       -- outcome derivation and the agent 'status' command read this view, so
       -- they cannot disagree.
+      --
+      -- completeness_state is an INTENTIONAL HYBRID: it combines the mutable
+      -- status column (marked_closed) with append-only event evidence (the
+      -- terminal artifact event). This is sound precisely because the
+      -- close-guard trigger above makes the status column trustworthy — a row
+      -- can only reach status='closed' with a completed round/run or an
+      -- explicit reason event — so reading the column is not a regression to
+      -- the old "mutable flag that could lie" model.
       --
       --   completeness_state:
       --     'complete'                — closed + terminal artifact for current round/run
@@ -485,7 +504,10 @@ export function runMigrations(db: Database): void {
       continue;
     }
 
-    db.run("BEGIN TRANSACTION;");
+    // BEGIN IMMEDIATE acquires the write lock up front, so a concurrent
+    // opener queues cleanly behind us under WAL instead of starting a
+    // deferred transaction that fails late with SQLITE_BUSY mid-migration.
+    db.run("BEGIN IMMEDIATE;");
     try {
       db.run(migration.sql);
       db.run(

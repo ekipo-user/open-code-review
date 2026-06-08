@@ -30,26 +30,28 @@ function tracked<T extends TempProject>(project: T): T {
 }
 
 /**
- * Initialize a workflow `sessions` row via `ocr state init`. Returns the
- * session id printed on stdout — the canonical way for tests to obtain
- * a workflow id without importing internal modules.
+ * Initialize a workflow `sessions` row via `ocr state begin` (the v2 atomic
+ * verb that replaced `state init`). Returns the session id from the JSON
+ * result — the canonical way for tests to obtain a workflow id without
+ * importing internal modules.
  */
 async function initWorkflow(project: TempProject): Promise<string> {
   const result = await spawnCli(
     [
       "state",
-      "init",
+      "begin",
       "--session-id",
       "2026-04-29-feat-test",
       "--branch",
       "feat/test",
       "--workflow-type",
       "review",
+      "--json",
     ],
     { cwd: project.dir },
   );
   expect(result.exitCode).toBe(0);
-  return result.stdout.trim();
+  return JSON.parse(result.stdout).session_id as string;
 }
 
 describe("ocr session start-instance", () => {

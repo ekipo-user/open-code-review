@@ -24,7 +24,7 @@
 import { existsSync } from "node:fs";
 import { isAbsolute, join, dirname } from "node:path";
 import type { Database } from "./engine.js";
-import { getAllSessions, insertEvent, updateSession } from "./queries.js";
+import { getAllSessions, insertEvent, commitReasonClose } from "./queries.js";
 
 const DEFAULT_STALE_THRESHOLD_SECONDS = 7 * 24 * 60 * 60; // 7 days
 
@@ -199,15 +199,19 @@ export function reconcileLegacyState(
             : `active, last event ${Math.round(age / 86400)}d ago, no in-flight dependents`,
       });
       if (!dryRun) {
-        // Reason event FIRST so the close-guard trigger (once installed) is
-        // satisfied at the status UPDATE.
-        insertEvent(db, {
-          session_id: s.id,
-          event_type: "session_auto_closed_stale",
-          phase: "complete",
-          metadata: JSON.stringify({ source: "reconciled", threshold_seconds: threshold }),
-        });
-        updateSession(db, s.id, { status: "closed", current_phase: "complete" });
+        // Reason event FIRST (inside one transaction) so the close-guard
+        // trigger is satisfied at the status UPDATE. commitReasonClose owns
+        // that ordering + atomicity.
+        commitReasonClose(
+          db,
+          s.id,
+          {
+            event_type: "session_auto_closed_stale",
+            phase: "complete",
+            metadata: JSON.stringify({ source: "reconciled", threshold_seconds: threshold }),
+          },
+          { status: "closed", current_phase: "complete" },
+        );
       }
     }
   }

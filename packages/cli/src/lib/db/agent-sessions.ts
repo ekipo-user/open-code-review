@@ -32,6 +32,34 @@ const CANCELLED_EXIT_CODE = -2;
 const NOTE_ORPHAN_PREFIX = "orphaned by liveness sweep";
 
 /**
+ * Stamp every still-in-flight `command_executions` row for a workflow as
+ * terminal — used when the parent workflow closes so dependent child rows
+ * don't linger until the heartbeat sweep (which needs the dashboard running)
+ * reclaims them.
+ *
+ * Sets `finished_at`, the given `exitCode`, clears `pid`, and appends `note`.
+ * The caller is responsible for running this inside its own transaction so
+ * the cascade commits atomically with the parent close.
+ */
+export function cascadeTerminateExecutions(
+  db: Database,
+  workflowId: string,
+  exitCode: number,
+  note: string,
+): void {
+  db.run(
+    `UPDATE command_executions
+       SET finished_at = datetime('now'),
+           exit_code   = ?,
+           pid         = NULL,
+           notes       = COALESCE(notes || char(10), '') || ?
+     WHERE workflow_id = ?
+       AND finished_at IS NULL`,
+    [exitCode, note, workflowId],
+  );
+}
+
+/**
  * Internal row shape from `command_executions` SELECTs, mapped to the
  * AgentSessionRow surface for backward compatibility with existing
  * consumers (dashboard server, /api/agent-sessions, terminal handoff).
