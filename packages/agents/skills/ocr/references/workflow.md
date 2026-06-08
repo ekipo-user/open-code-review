@@ -2,9 +2,9 @@
 
 Complete 8-phase process for multi-agent code review.
 
-> **CRITICAL**: You MUST call `ocr state transition` **BEFORE starting work** on each phase. The `ocr progress` CLI reads session state for real-time tracking. Transition the `current_phase` and `phase_number` immediately when entering a new phase—do not wait until the phase is complete.
+> **CRITICAL**: You MUST call `ocr state advance` **BEFORE starting work** on each phase. The `ocr progress` CLI reads session state for real-time tracking. Transition the `current_phase` and `phase_number` immediately when entering a new phase—do not wait until the phase is complete.
 
-> **PREREQUISITE**: The `ocr` CLI must be installed (`npm install -g @open-code-review/cli`) or accessible via `npx`. Every phase transition calls `ocr state transition`, which requires the CLI.
+> **PREREQUISITE**: The `ocr` CLI must be installed (`npm install -g @open-code-review/cli`) or accessible via `npx`. Every phase transition calls `ocr state advance`, which requires the CLI.
 
 ---
 
@@ -81,11 +81,11 @@ else
 fi
 ```
 
-When starting a new round (CURRENT_ROUND > 1), pass the `--current-round` flag to `ocr state transition` so the CLI progress timer shows elapsed time for the current round, not the entire session.
+When starting a new round (CURRENT_ROUND > 1), pass the `--current-round` flag to `ocr state advance` so the CLI progress timer shows elapsed time for the current round, not the entire session.
 
 ### Step 4: Determine resume point
 
-- **No state in SQLite, files exist**: Use `ocr state init` to recreate the session, then `ocr state transition` to set the correct phase based on file existence
+- **No state in SQLite, files exist**: Use `ocr state begin` to recreate the session, then `ocr state advance` to set the correct phase based on file existence
 - **State exists, files match**: Resume from `current_phase` shown by `ocr state show`
 - **State and files mismatch**: Ask user which to trust
 - **No session exists**: Create session directory and start Phase 1
@@ -103,17 +103,17 @@ Action: [Starting fresh | Resuming from Phase X]
 
 ## State Tracking
 
-At **every phase transition**, call `ocr state transition`:
+At **every phase transition**, call `ocr state advance`:
 
 ```bash
-ocr state transition --phase "reviews" --phase-number 4 --current-round 1
+ocr state advance --phase "reviews" --current-round 1
 ```
 
 This updates the session in SQLite and logs an orchestration event.
 
 **Phase values**: `context`, `change-context`, `analysis`, `reviews`, `aggregation`, `discourse`, `synthesis`, `complete`
 
-**Status values**: `active` (in progress), `closed` (complete — set via `ocr state close`)
+**Status values**: `active` (in progress), `closed` (complete — set via `ocr state finish`)
 
 ## Artifact Checklist
 
@@ -123,12 +123,12 @@ Before proceeding to each phase, verify the required artifacts exist:
 
 | Phase | Required Before Starting | Artifact to Create |
 |-------|-------------------------|-------------------|
-| 1 | Session directory created | `discovered-standards.md`, `requirements.md` (if provided); call `ocr state init` |
-| 2 | `discovered-standards.md` exists | `context.md`, `rounds/round-1/reviews/` directory; call `ocr state transition` |
-| 3 | `context.md` exists | Update `context.md` with Tech Lead guidance; call `ocr state transition` |
-| 4 | `context.md` exists | `rounds/round-{n}/reviews/{type}-{n}.md` for each reviewer; call `ocr state transition` |
-| 5 | ≥2 files in `rounds/round-{n}/reviews/` | Aggregated findings (inline); call `ocr state transition` |
-| 6 | Reviews complete | `rounds/round-{n}/discourse.md`; call `ocr state transition` |
+| 1 | Session directory created | `discovered-standards.md`, `requirements.md` (if provided); call `ocr state begin` |
+| 2 | `discovered-standards.md` exists | `context.md`, `rounds/round-1/reviews/` directory; call `ocr state advance` |
+| 3 | `context.md` exists | Update `context.md` with Tech Lead guidance; call `ocr state advance` |
+| 4 | `context.md` exists | `rounds/round-{n}/reviews/{type}-{n}.md` for each reviewer; call `ocr state advance` |
+| 5 | ≥2 files in `rounds/round-{n}/reviews/` | Aggregated findings (inline); call `ocr state advance` |
+| 6 | Reviews complete | `rounds/round-{n}/discourse.md`; call `ocr state advance` |
 | 7 | `rounds/round-{n}/discourse.md` exists | `rounds/round-{n}/round-meta.json`, `rounds/round-{n}/final.md`; **after `synthesis`, finalize with `ocr state complete-round --stdin`** |
 | 8 | round finalized | Present to user; call `ocr state finish` |
 
@@ -163,18 +163,18 @@ This location is consistent regardless of how OCR is installed (CLI or plugin), 
 
 **Goal**: Build review context from config + discovered files + user requirements.
 
-**State**: Call `ocr state init` to create the session, then `ocr state transition --phase "context" --phase-number 1`:
+**State**: Call `ocr state begin` to create the session, then `ocr state advance --phase "context"`:
 
 ```bash
 # Initialize the session in SQLite
-ocr state init \
+ocr state begin \
   --session-id "$SESSION_ID" \
   --branch "$BRANCH" \
   --workflow-type review \
   --session-dir "$SESSION_DIR"
 
 # Transition to context phase
-ocr state transition --phase "context" --phase-number 1
+ocr state advance --phase "context"
 ```
 
 ### Steps
@@ -276,7 +276,7 @@ See `references/context-discovery.md` for detailed algorithm.
 
 **Goal**: Understand what changed and why.
 
-**State**: Call `ocr state transition --phase "change-context" --phase-number 2`
+**State**: Call `ocr state advance --phase "change-context"`
 
 ### Steps
 
@@ -337,7 +337,7 @@ See `references/context-discovery.md` for detailed algorithm.
 
 **Goal**: Summarize changes, analyze against requirements, identify risks, select reviewers.
 
-**State**: Call `ocr state transition --phase "analysis" --phase-number 3`
+**State**: Call `ocr state advance --phase "analysis"`
 
 ### Steps
 
@@ -454,7 +454,7 @@ See `references/context-discovery.md` for detailed algorithm.
 
 **Goal**: Run each reviewer independently with configured redundancy.
 
-**State**: Call `ocr state transition --phase "reviews" --phase-number 4 --current-round $CURRENT_ROUND`
+**State**: Call `ocr state advance --phase "reviews" --current-round $CURRENT_ROUND`
 
 > **CRITICAL**: Reviewer counts, types, and per-instance models come from `.ocr/config.yaml`
 > via `ocr team resolve --json`. Do NOT parse `default_team` yourself — the resolved
@@ -598,7 +598,7 @@ echo "OK Found $REVIEWER_COUNT reviewer files"
 
 **Goal**: Merge redundant reviewer runs and mark confidence.
 
-**State**: Call `ocr state transition --phase "aggregation" --phase-number 5 --current-round $CURRENT_ROUND`
+**State**: Call `ocr state advance --phase "aggregation" --current-round $CURRENT_ROUND`
 
 ### Steps
 
@@ -626,7 +626,7 @@ echo "OK Found $REVIEWER_COUNT reviewer files"
 
 **Goal**: Let reviewers challenge and build on each other's findings.
 
-**State**: Call `ocr state transition --phase "discourse" --phase-number 6 --current-round $CURRENT_ROUND`
+**State**: Call `ocr state advance --phase "discourse" --current-round $CURRENT_ROUND`
 
 > Skip this phase if `--quick` flag is used.
 
@@ -657,7 +657,7 @@ See `references/discourse.md` for detailed instructions.
 
 **Goal**: Produce final prioritized review and save to **`final.md`**.
 
-**State**: Call `ocr state transition --phase "synthesis" --phase-number 7 --current-round $CURRENT_ROUND`
+**State**: Call `ocr state advance --phase "synthesis" --current-round $CURRENT_ROUND`
 
 > **File**: `rounds/round-{n}/final.md`
 > **Template**: See `references/final-template.md` for format
@@ -706,7 +706,7 @@ See `references/discourse.md` for detailed instructions.
    > **CRITICAL — `synthesis_counts` must match `final.md`**: The `synthesis_counts` object contains the **deduplicated** counts of items in each section of `final.md`. Multiple reviewers often flag the same issue independently, so the per-reviewer findings array will have more entries than `final.md` lists. Count the actual numbered items under each section heading in your synthesized review (`## Blockers`, `## Should Fix`, `## Suggestions`) and set those counts here. The dashboard uses `synthesis_counts` when present, falling back to derived counts only for older reviews.
 
    ```bash
-   cat <<'JSON' | ocr state round-complete --stdin
+   cat <<'JSON' | ocr state complete-round --stdin
    {
      "schema_version": 1,
      "verdict": "REQUEST CHANGES",
@@ -815,7 +815,7 @@ fi
 
 **Goal**: Display results, optionally post to GitHub, and close the session.
 
-**State**: Call `ocr state close` after presenting results.
+**State**: Call `ocr state finish` after presenting results.
 
 ### Steps
 
@@ -839,7 +839,7 @@ fi
 
 3. **Close the session**:
    ```bash
-   ocr state close
+   ocr state finish
    ```
 
    This sets `status: "closed"` and `current_phase: "complete"` in SQLite.
@@ -861,11 +861,11 @@ fi
 
 | Phase | Command/Action | Output |
 |-------|---------------|--------|
-| 1 | `ocr state init` + search for context files | `discovered-standards.md` |
-| 2 | git diff, create session, `ocr state transition` | `context.md`, `rounds/round-1/reviews/` |
-| 3 | Analyze, select reviewers, `ocr state transition` | guidance in `context.md` |
-| 4 | Spawn reviewer tasks, `ocr state transition` | `rounds/round-{n}/reviews/*.md` |
-| 5 | Compare redundant runs, `ocr state transition` | aggregated findings |
-| 6 | Reviewer discourse, `ocr state transition` | `rounds/round-{n}/discourse.md` |
-| 7 | Synthesize, pipe data to `ocr state round-complete --stdin`, write `final.md` | `rounds/round-{n}/round-meta.json` (CLI-written), `rounds/round-{n}/final.md` |
-| 8 | Display/post, `ocr state close` | Terminal output, GitHub |
+| 1 | `ocr state begin` + search for context files | `discovered-standards.md` |
+| 2 | git diff, create session, `ocr state advance` | `context.md`, `rounds/round-1/reviews/` |
+| 3 | Analyze, select reviewers, `ocr state advance` | guidance in `context.md` |
+| 4 | Spawn reviewer tasks, `ocr state advance` | `rounds/round-{n}/reviews/*.md` |
+| 5 | Compare redundant runs, `ocr state advance` | aggregated findings |
+| 6 | Reviewer discourse, `ocr state advance` | `rounds/round-{n}/discourse.md` |
+| 7 | Synthesize, pipe data to `ocr state complete-round --stdin`, write `final.md` | `rounds/round-{n}/round-meta.json` (CLI-written), `rounds/round-{n}/final.md` |
+| 8 | Display/post, `ocr state finish` | Terminal output, GitHub |
