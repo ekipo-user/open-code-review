@@ -11,6 +11,7 @@ import { existsSync, mkdirSync, copyFileSync, statSync } from "node:fs";
 import { dirname, join } from "node:path";
 import { openEngine, type Database } from "./engine.js";
 import { runMigrations, getSchemaVersion } from "./migrations.js";
+import { reconcileLegacyState } from "./reconcile.js";
 
 /**
  * Schema version that introduces the v2.0 event-sourced lifecycle. Databases
@@ -96,6 +97,14 @@ export { resultToRows, resultToRow } from "./result-mapper.js";
 
 export type { Database, ExecResult, ExecResultRow, SqlValue, BindParams } from "./engine.js";
 export { probeEngine } from "./engine.js";
+export { reconcileLegacyState } from "./reconcile.js";
+export type {
+  ReconcileResult,
+  ReconcileAction,
+  ReconcileKind,
+  ReconcileOptions,
+} from "./reconcile.js";
+export { getSchemaVersion } from "./migrations.js";
 
 export {
   cacheDir,
@@ -172,8 +181,29 @@ export async function ensureDatabase(ocrDir: string): Promise<Database> {
 
   const dbPath = join(dataDir, "ocr.db");
   const db = await openDatabase(dbPath);
+  let before = 0;
+  try {
+    before = getSchemaVersion(db);
+  } catch {
+    before = 0;
+  }
   maybeSnapshotBeforeUpgrade(db, dbPath);
   runMigrations(db);
+
+  // On crossing into the v2 event-sourced model, heal legacy state (derive
+  // truth from events + filesystem artifacts) once, automatically. Runs after
+  // the schema is in place; safe to skip on any error so it never blocks
+  // opening the database.
+  if (before < V2_SCHEMA_VERSION) {
+    try {
+      reconcileLegacyState(db, ocrDir);
+    } catch (err) {
+      console.error(
+        `[ocr] legacy reconciliation skipped: ${err instanceof Error ? err.message : String(err)}`,
+      );
+    }
+  }
+
   saveDatabase(db, dbPath);
 
   return db;

@@ -28,6 +28,7 @@ import {
 } from "../lib/state/index.js";
 import type { WorkflowType, ReviewPhase, MapPhase, RoundCompleteResult, MapCompleteResult } from "../lib/state/types.js";
 import { replayCommandLog } from "../lib/db/command-log.js";
+import { ensureDatabase, reconcileLegacyState } from "../lib/db/index.js";
 import {
   getDb,
   saveDatabase,
@@ -576,6 +577,52 @@ const mapCompleteSubcommand = new Command("map-complete")
     },
   );
 
+// ── reconcile ──
+
+const reconcileSubcommand = new Command("reconcile")
+  .description(
+    "Heal legacy/drifted session state by deriving truth from events + artifacts",
+  )
+  .option("--dry-run", "Print the repair plan without writing anything")
+  .option("--json", "Output the result as JSON")
+  .action(async (options: { dryRun?: boolean; json?: boolean }) => {
+    const targetDir = process.cwd();
+    requireOcrSetup(targetDir);
+    const ocrDir = join(targetDir, ".ocr");
+
+    try {
+      const db = await ensureDatabase(ocrDir);
+      const result = reconcileLegacyState(db, ocrDir, { dryRun: options.dryRun });
+
+      if (options.json) {
+        console.log(JSON.stringify(result, null, 2));
+        return;
+      }
+
+      const repairs = result.actions.filter((a) => a.kind !== "ok");
+      if (repairs.length === 0) {
+        console.log(chalk.dim("Nothing to reconcile — all sessions consistent."));
+        return;
+      }
+      console.log(
+        result.dryRun
+          ? chalk.bold(`Reconciliation plan (${repairs.length} change(s), dry run):`)
+          : chalk.bold(`Reconciled ${repairs.length} session(s):`),
+      );
+      for (const a of repairs) {
+        console.log(`  ${chalk.cyan(a.kind)}  ${a.sessionId}`);
+        console.log(`    ${chalk.dim(a.detail)}`);
+      }
+    } catch (error) {
+      console.error(
+        chalk.red(
+          `Error: ${error instanceof Error ? error.message : "Failed to reconcile"}`,
+        ),
+      );
+      process.exit(1);
+    }
+  });
+
 // ── Main state command ──
 
 export const stateCommand = new Command("state")
@@ -586,4 +633,5 @@ export const stateCommand = new Command("state")
   .addCommand(showSubcommand)
   .addCommand(syncSubcommand)
   .addCommand(roundCompleteSubcommand)
-  .addCommand(mapCompleteSubcommand);
+  .addCommand(mapCompleteSubcommand)
+  .addCommand(reconcileSubcommand);
