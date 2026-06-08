@@ -13,12 +13,6 @@ import { reviewersCommand } from "./commands/reviewers";
 import { checkForUpdate, printUpdateNotification } from "./lib/update-check.js";
 import { checkLocalArtifactVersion, printLocalVersionHint } from "./lib/cli-config.js";
 import { CLI_VERSION } from "./lib/version.js";
-import { initColor } from "./lib/color.js";
-
-// Pin the terminal-color level deterministically (NO_COLOR / FORCE_COLOR /
-// TTY) so published single-file bundles color identically to dev — must run
-// before any chalk output.
-initColor();
 
 // Only check for updates on human-facing commands (not AI-invoked ones like `state`)
 const HUMAN_COMMANDS = new Set(["init", "update", "doctor", "dashboard", "progress"]);
