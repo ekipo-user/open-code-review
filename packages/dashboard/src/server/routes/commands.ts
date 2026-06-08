@@ -69,16 +69,17 @@ export function createCommandsRouter(db: Database, ocrDir: string): Router {
     try {
       const limit = parseInt(req.query['limit'] as string, 10) || 50
       const history = getCommandHistory(db, limit).map((row) => {
-        const { workflow_status, ...persisted } = row
+        const { workflow_completeness, ...persisted } = row
         return {
           ...persisted,
           duration_ms:
             row.finished_at && row.started_at
               ? new Date(row.finished_at).getTime() - new Date(row.started_at).getTime()
               : null,
-          // Derived from (exit_code, workflow_status) — single source of
-          // truth shared with the live `command:finished` socket event.
-          outcome: deriveCommandOutcome(row.exit_code, workflow_status),
+          // Derived from (exit_code, event-sourced workflow completeness) —
+          // single source of truth shared with the live `command:finished`
+          // socket event.
+          outcome: deriveCommandOutcome(row.exit_code, workflow_completeness),
         }
       })
       res.json(history)

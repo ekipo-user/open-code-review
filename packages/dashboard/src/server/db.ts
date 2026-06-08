@@ -618,25 +618,30 @@ export function deleteNote(db: Database, noteId: number): void {
 // ── Command execution queries ──
 
 /**
- * Like {@link CommandExecutionRow} but with the linked workflow's status
- * projected on as `workflow_status` (via LEFT JOIN sessions). Used by the
- * commands history route to derive the {@link CommandOutcome} per row in
- * one round-trip rather than N+1 lookups. `null` when the row has no
- * `workflow_id` or the workflow row was deleted.
+ * Like {@link CommandExecutionRow} but with the linked workflow's
+ * event-derived completeness projected on as `workflow_completeness` (via
+ * LEFT JOIN session_completeness). Used by the commands history route to
+ * derive the {@link CommandOutcome} per row in one round-trip rather than
+ * N+1 lookups. `null` when the row has no `workflow_id`.
  */
-export type CommandExecutionRowWithWorkflowStatus = CommandExecutionRow & {
-  workflow_status: 'active' | 'closed' | null
+export type CommandExecutionRowWithCompleteness = CommandExecutionRow & {
+  workflow_completeness:
+    | 'complete'
+    | 'closed_without_artifact'
+    | 'in_flight'
+    | 'open_no_artifact'
+    | null
 }
 
 export function getCommandHistory(
   db: Database,
   limit = 50,
-): CommandExecutionRowWithWorkflowStatus[] {
-  return resultToRows<CommandExecutionRowWithWorkflowStatus>(
+): CommandExecutionRowWithCompleteness[] {
+  return resultToRows<CommandExecutionRowWithCompleteness>(
     db.exec(
-      `SELECT ce.*, s.status AS workflow_status
+      `SELECT ce.*, sc.completeness_state AS workflow_completeness
          FROM command_executions ce
-         LEFT JOIN sessions s ON s.id = ce.workflow_id
+         LEFT JOIN session_completeness sc ON sc.session_id = ce.workflow_id
         ORDER BY ce.started_at DESC
         LIMIT ?`,
       [limit],

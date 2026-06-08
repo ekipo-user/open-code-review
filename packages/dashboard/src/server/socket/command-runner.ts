@@ -18,7 +18,7 @@ import type { Database } from '@open-code-review/cli/db'
 import { saveDb } from '../db.js'
 import {
   deriveCommandOutcome,
-  getWorkflowStatusForExecution,
+  getWorkflowCompletenessForExecution,
 } from '../services/command-outcome.js'
 import type { SessionCaptureService } from '../services/capture/session-capture-service.js'
 import {
@@ -1116,13 +1116,13 @@ function finishExecution(
   )
   saveDb(db, ocrDir)
 
-  // Cross-check workflow lifecycle so the UI can distinguish a cleanly
-  // finished workflow from one whose parent process exited 0 mid-flight
-  // (the macOS-sleep / network-drop case). Read AFTER the exit_code
-  // UPDATE above so the lookup sees current data; the JOIN handles the
-  // common no-workflow case (utility commands).
-  const workflowStatus = getWorkflowStatusForExecution(db, executionId)
-  const outcome = deriveCommandOutcome(code, workflowStatus)
+  // Cross-check workflow completeness (event-derived, via the
+  // session_completeness view) so the UI distinguishes a genuinely finished
+  // workflow from one that exited 0 while incomplete — including the
+  // "closed too soon" case. Under WAL the read is live (no merge needed);
+  // it runs AFTER the exit_code UPDATE above so it sees current data.
+  const completeness = getWorkflowCompletenessForExecution(db, executionId)
+  const outcome = deriveCommandOutcome(code, completeness)
 
   // Best-effort JSONL backup
   if (entry?.uid) {
