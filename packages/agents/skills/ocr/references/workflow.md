@@ -129,10 +129,22 @@ Before proceeding to each phase, verify the required artifacts exist:
 | 4 | `context.md` exists | `rounds/round-{n}/reviews/{type}-{n}.md` for each reviewer; call `ocr state transition` |
 | 5 | ≥2 files in `rounds/round-{n}/reviews/` | Aggregated findings (inline); call `ocr state transition` |
 | 6 | Reviews complete | `rounds/round-{n}/discourse.md`; call `ocr state transition` |
-| 7 | `rounds/round-{n}/discourse.md` exists | `rounds/round-{n}/round-meta.json`, `rounds/round-{n}/final.md`; call `ocr state round-complete` |
-| 8 | `rounds/round-{n}/final.md` exists | Present to user; call `ocr state close` |
+| 7 | `rounds/round-{n}/discourse.md` exists | `rounds/round-{n}/round-meta.json`, `rounds/round-{n}/final.md`; **after `synthesis`, finalize with `ocr state complete-round --stdin`** |
+| 8 | round finalized | Present to user; call `ocr state finish` |
 
-**NEVER skip directly to `final.md`** — this breaks progress tracking.
+**NEVER skip directly to `final.md`** — this breaks progress tracking, and the
+CLI enforces it: `ocr state advance` rejects illegal phase jumps, and
+`ocr state finish` **refuses** to close a workflow whose current round was
+never finalized (use `ocr state finish --abort` to abandon one deliberately).
+
+> **v2.0 atomic finalize**: write `final.md`, reach `synthesis` via
+> `ocr state advance`, then pipe the round metadata to
+> `ocr state complete-round --stdin`. That single command atomically writes
+> `round-meta.json`, records the `round_completed` event, advances the round,
+> and transitions to `complete` — replacing the old
+> `round-complete` + `transition complete` + `close` sequence that could
+> partially apply. Then `ocr state finish`. On resume, run
+> `ocr state status --json` to see exactly what's left.
 
 ## Session Storage
 

@@ -87,6 +87,37 @@ Agents MUST use these CLI commands to manage session state. **Do NOT write state
 
 > **Note**: These commands require the OCR CLI. Install globally with `npm install -g @open-code-review/cli` or prefix with `npx @open-code-review/cli`.
 
+## Atomic state API (preferred)
+
+As of v2.0 the CLI exposes a small set of **atomic, invariant-checked** verbs.
+Prefer these — they make correct state updates the default and make incorrect
+ones impossible:
+
+| Verb | Use it to | Guarantee |
+|------|-----------|-----------|
+| `ocr state begin` | start or resume a workflow | returns `{session_id, round, phase, completeness}` |
+| `ocr state advance --phase <name>` | mark you've reached a phase | graph-validated; rejects illegal jumps; phase number derived |
+| `ocr state complete-round --stdin` | finalize a review round | **one transaction**: writes meta + `round_completed` + advances + transitions to `complete`. Refuses unless you've reached `synthesis`. Idempotent. |
+| `ocr state complete-map --stdin` | finalize a map run | map analogue |
+| `ocr state finish [--abort]` | close the workflow | **refuses** unless the current round/run is complete; `--abort` records an abandoned session |
+| `ocr state status --json` | ask "is it done? what's missing?" | machine-readable completeness + `next_action` |
+
+**The CLI now enforces the lifecycle.** `ocr state finish` will *refuse*
+(exit code 6) to close a workflow whose current round/run has no
+`round_completed`/`map_completed`. This is by design — it makes the
+"completed too soon" failure impossible. If you genuinely need to abandon a
+workflow, use `ocr state finish --abort`.
+
+**Exit codes** (branch on these instead of parsing messages): `0` ok ·
+`2` usage · `3` ambiguous session · `4` not found · `5` illegal transition ·
+`6` invariant unmet · `7` schema invalid.
+
+On resume, run `ocr state status --json` first — it tells you exactly what's
+missing and the next action, instead of inspecting the filesystem by hand.
+
+The lower-level verbs below (`transition`, `round-complete`, `close`) remain
+for compatibility but the atomic verbs above are preferred.
+
 ### `ocr state init` — Create a new session
 
 ```bash
@@ -125,13 +156,22 @@ ocr state transition \
 
 Updates the session in SQLite and logs an orchestration event.
 
-### `ocr state close` — Close the session
+### `ocr state finish` — Close the session (invariant-checked)
 
 ```bash
-ocr state close
+ocr state finish
 ```
 
-Sets `status: "closed"` and `current_phase: "complete"` in SQLite.
+Closes the workflow, but **refuses** (exit code 6) unless the current
+round/run has a completed artifact. To abandon a workflow without finishing
+it, pass `--abort` (records a distinct, non-success terminal):
+
+```bash
+ocr state finish --abort
+```
+
+> The older `ocr state close` still works and is now equivalent to `finish`
+> (it enforces the same invariant and accepts `--abort`).
 
 ### `ocr state show` — Read current session state
 

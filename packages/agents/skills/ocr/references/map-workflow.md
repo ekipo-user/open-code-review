@@ -405,12 +405,16 @@ See `references/map-personas/flow-analyst.md` for persona details.
    [ "$EXPECTED" -ne "$MAPPED" ] && echo "ERROR: Missing files!"
    ```
 
-11. **Pipe structured map data to CLI**:
+11. **Atomically finalize the map run** (v2.0):
 
-    Construct a JSON object with the map's structured data and pipe it to the CLI. The CLI validates, writes `map-meta.json`, and records a `map_completed` orchestration event — all in one command.
+    After reaching `synthesis` via `ocr state advance`, pipe the structured
+    map data to `ocr state complete-map --stdin`. In one transaction the CLI
+    validates the schema, writes `map-meta.json`, records the `map_completed`
+    event, and transitions to `complete`. (The older `ocr state map-complete`
+    remains for compatibility but does not transition the phase.)
 
     ```bash
-    cat <<'JSON' | ocr state map-complete --stdin
+    cat <<'JSON' | ocr state complete-map --stdin
     {
       "schema_version": 1,
       "sections": [
