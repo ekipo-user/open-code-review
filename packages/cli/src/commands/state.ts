@@ -297,9 +297,10 @@ const transitionSubcommand = new Command("transition")
 // ── close ──
 
 const closeSubcommand = new Command("close")
-  .description("Close a session")
+  .description("Close a session (invariant-checked; alias of `finish`)")
   .option("--session-id <id>", "Session ID (auto-detects latest active if omitted; refuses on ambiguity)")
-  .action(async (options: { sessionId?: string }) => {
+  .option("--abort", "Abandon the session — records a distinct, non-success terminal")
+  .action(async (options: { sessionId?: string; abort?: boolean }) => {
     const targetDir = process.cwd();
     requireOcrSetup(targetDir);
     const ocrDir = join(targetDir, ".ocr");
@@ -313,16 +314,14 @@ const closeSubcommand = new Command("close")
       await stateClose({
         sessionId,
         ocrDir,
+        abort: options.abort,
       });
 
-      console.log(`${sessionId}: closed`);
+      console.log(`${sessionId}: ${options.abort ? "aborted" : "closed"}`);
     } catch (error) {
-      console.error(
-        chalk.red(
-          `Error: ${error instanceof Error ? error.message : "Failed to close session"}`,
-        ),
-      );
-      process.exit(1);
+      // Same typed exit-code taxonomy as `finish` — a premature close
+      // (no completed round/run) exits 6 (INVARIANT_UNMET), not a generic 1.
+      exitFromStateError(error, "Failed to close session");
     }
   });
 

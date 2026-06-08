@@ -142,6 +142,45 @@ describe("migration v12 — session_completeness view", () => {
   });
 });
 
+describe("migration v12 — close-guard trigger (DB backstop)", () => {
+  // Reproduces the production "completed too soon" mechanism from
+  // 2026-05-16-hotfix-super-admin: a workflow at 'synthesis' is closed with
+  // no round_completed event. The trigger must abort it even via raw SQL.
+  beforeEach(() => {
+    insertSession(db, {
+      id: "g",
+      branch: "feat/g",
+      workflow_type: "review",
+      session_dir: ".ocr/sessions/g",
+    });
+    insertEvent(db, { session_id: "g", event_type: "session_created", round: 1 });
+    updateSession(db, "g", { current_phase: "synthesis", phase_number: 7 });
+  });
+
+  it("aborts a raw close of a session with no completed round", () => {
+    expect(() =>
+      db.run("UPDATE sessions SET status = 'closed' WHERE id = 'g'"),
+    ).toThrow(/cannot close session without a completed round/);
+    // The session stays open — the illegal state was never written.
+    const r = db.exec("SELECT status FROM sessions WHERE id = 'g'");
+    expect(r[0]?.values[0]?.[0]).toBe("active");
+  });
+
+  it("permits the close once the round is completed (legitimate path)", () => {
+    insertEvent(db, { session_id: "g", event_type: "round_completed", round: 1 });
+    expect(() =>
+      db.run("UPDATE sessions SET status = 'closed' WHERE id = 'g'"),
+    ).not.toThrow();
+  });
+
+  it("permits the close when an explicit reason event is present (abort/sync/stale)", () => {
+    insertEvent(db, { session_id: "g", event_type: "session_aborted", round: 1 });
+    expect(() =>
+      db.run("UPDATE sessions SET status = 'closed' WHERE id = 'g'"),
+    ).not.toThrow();
+  });
+});
+
 describe("migration v12 — indexes", () => {
   it("creates the sweep indexes", () => {
     const idx = db.exec(
