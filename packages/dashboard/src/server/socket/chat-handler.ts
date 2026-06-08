@@ -9,7 +9,7 @@
 import type { ChildProcess } from 'node:child_process'
 import { dirname } from 'node:path'
 import type { Server as SocketIOServer, Socket } from 'socket.io'
-import type { Database } from 'sql.js'
+import type { Database } from '@open-code-review/cli/db'
 import {
   saveDb,
   getConversation,

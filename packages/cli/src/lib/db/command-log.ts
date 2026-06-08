@@ -16,7 +16,7 @@
 import { appendFileSync, existsSync, mkdirSync, readFileSync, renameSync, writeFileSync } from "node:fs";
 import { dirname, join } from "node:path";
 import { randomUUID } from "node:crypto";
-import type { Database } from "sql.js";
+import type { Database } from "./engine.js";
 
 // ── Types ──
 

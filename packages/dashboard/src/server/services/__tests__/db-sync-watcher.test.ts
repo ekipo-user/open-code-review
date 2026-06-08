@@ -1,163 +1,118 @@
 /**
- * DbSyncWatcher resilience regressions.
+ * DbSyncWatcher change-notifier behavior.
  *
- * Specifically guards against the WASM `memory access out of bounds`
- * crash that surfaced when `readFileSync` raced an in-flight atomic
- * rename and got back a partial / temp / zero-byte file. The watcher
- * now validates the SQLite magic header before handing the buffer to
- * sql.js and only advances `lastMtime` on a successful load.
- *
- * The header validator is a private constant; we test it through the
- * watcher's behavior — torn reads must not throw and must leave the
- * watermark untouched so the next change event retries.
+ * Under better-sqlite3 + WAL the watcher no longer merges a separate disk
+ * copy — it diffs the live shared database against cached snapshots and
+ * emits granular Socket.IO events. These tests exercise that contract:
+ * new sessions emit `session:created` + fire the auto-link hook exactly
+ * once; mutated sessions emit `session:updated`; unchanged scans are silent.
  */
 
-import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
-import { mkdtempSync, rmSync, writeFileSync } from 'node:fs'
+import { afterEach, beforeEach, describe, expect, it } from 'vitest'
+import { mkdtempSync, rmSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
-import type { Database } from 'sql.js'
+import {
+  openDatabase,
+  closeAllDatabases,
+  runMigrations,
+  insertSession,
+  updateSession,
+  type Database,
+} from '@open-code-review/cli/db'
 import type { Server as SocketIOServer } from 'socket.io'
 import { DbSyncWatcher } from '../db-sync-watcher.js'
 
-// Minimal fakes — the watcher's `init()` loads the real sql.js wasm
-// module. We only test syncFromDisk's resilience here, so we
-// monkey-construct a watcher with the SQL field manually populated to a
-// trampoline that throws if ever called. A torn read should NEVER reach
-// sql.js — the header validator should reject the buffer first.
+type Emit = { event: string; payload: unknown }
+
+function makeIo(emits: Emit[]): SocketIOServer {
+  return {
+    emit: (event: string, payload: unknown) => {
+      emits.push({ event, payload })
+    },
+    to: () => ({
+      emit: (event: string, payload: unknown) => {
+        emits.push({ event, payload })
+      },
+    }),
+  } as unknown as SocketIOServer
+}
 
 let workspace: string
 let dbPath: string
-let watcher: DbSyncWatcher
+let db: Database
+let emits: Emit[]
 
-class ThrowingDatabase {
-  constructor() {
-    throw new Error('SQL.Database should not be constructed for invalid headers')
-  }
-  close(): void {}
-}
-
-beforeEach(() => {
+beforeEach(async () => {
   workspace = mkdtempSync(join(tmpdir(), 'ocr-watcher-'))
   dbPath = join(workspace, 'ocr.db')
-
-  const fakeDb = {
-    run: () => {},
-    exec: () => [],
-    close: () => {},
-  } as unknown as Database
-
-  const fakeIo = {
-    emit: () => {},
-    to: () => ({ emit: () => {} }),
-  } as unknown as SocketIOServer
-
-  watcher = new DbSyncWatcher(fakeDb, dbPath, fakeIo)
-  ;(watcher as unknown as { SQL: unknown }).SQL = {
-    Database: ThrowingDatabase,
-  }
+  db = await openDatabase(dbPath)
+  runMigrations(db)
+  emits = []
 })
 
 afterEach(() => {
+  closeAllDatabases()
   rmSync(workspace, { recursive: true, force: true })
-  vi.restoreAllMocks()
 })
 
-describe('syncFromDisk resilience', () => {
-  it('returns silently when the file does not start with the SQLite magic header', () => {
-    // Write a plausible-looking but invalid db file: zero-padded buffer.
-    writeFileSync(dbPath, Buffer.alloc(4096), { mode: 0o644 })
-    expect(() => watcher.syncFromDisk()).not.toThrow()
-  })
+describe('DbSyncWatcher change notification', () => {
+  it('emits session:created and fires onSessionInserted once for a new session', async () => {
+    const inserted: string[] = []
+    const watcher = new DbSyncWatcher(db, dbPath, makeIo(emits), undefined, (s) =>
+      inserted.push(s.id),
+    )
+    await watcher.init() // primes snapshots — nothing seen yet
 
-  it('returns silently for a zero-byte file', () => {
-    writeFileSync(dbPath, '', { mode: 0o644 })
-    expect(() => watcher.syncFromDisk()).not.toThrow()
-  })
+    insertSession(db, {
+      id: 'sess-1',
+      branch: 'feat/x',
+      workflow_type: 'review',
+      session_dir: '.ocr/sessions/sess-1',
+    })
 
-  it('returns silently for a truncated file (header partially written)', () => {
-    // Only the first 8 bytes of the 16-byte magic — simulates the worst-case
-    // mid-rename window where we read a few bytes of the new file.
-    writeFileSync(dbPath, Buffer.from('SQLite f', 'utf-8'), { mode: 0o644 })
-    expect(() => watcher.syncFromDisk()).not.toThrow()
-  })
-
-  it('does not advance lastMtime when the load short-circuits on bad header', () => {
-    writeFileSync(dbPath, Buffer.alloc(2048), { mode: 0o644 })
-    const before = (watcher as unknown as { lastMtime: number }).lastMtime
     watcher.syncFromDisk()
-    const after = (watcher as unknown as { lastMtime: number }).lastMtime
-    expect(after).toBe(before)
+    expect(emits.filter((e) => e.event === 'session:created')).toHaveLength(1)
+    expect(inserted).toEqual(['sess-1'])
+
+    // A second scan with no changes is silent and does not re-fire the hook.
+    watcher.syncFromDisk()
+    expect(emits.filter((e) => e.event === 'session:created')).toHaveLength(1)
+    expect(inserted).toEqual(['sess-1'])
   })
-})
 
-describe('syncAgentSessions — CLI-mutable column equality check', () => {
-  // Regression for the cross-process write loss bug:
-  //
-  // The CLI's `state init` UPDATEs `command_executions.workflow_id` on
-  // disk. The dashboard's syncAgentSessions used to compare only
-  // (last_heartbeat_at, finished_at, exit_code). When the CLI changed
-  // `workflow_id` without touching those three, the sync skipped the
-  // in-memory UPDATE — the dashboard's stale in-memory copy was then
-  // written back to disk on the next saveDb, wiping the link.
-  //
-  // The fix includes `workflow_id` and `vendor_session_id` in the
-  // diff. We test by exercising the equality check through the
-  // private method directly — the test substitutes a real-shaped
-  // disk db via the fake adapter pattern.
-  it('detects workflow_id changes on disk and updates in-memory', () => {
-    // Track whether `db.run(INSERT OR REPLACE...)` was called for the
-    // synced row. The bug was that it WASN'T called.
-    let replaceCalled = false
-    const memoryDb = {
-      run: (sql: string) => {
-        if (sql.includes('INSERT OR REPLACE INTO command_executions')) {
-          replaceCalled = true
-        }
-      },
-      exec: (sql: string) => {
-        // Simulate the in-memory row: same heartbeat/finished/exit as
-        // disk, but workflow_id is NULL (the bug shape — CLI just
-        // wrote workflow_id, dashboard's memory hasn't seen it).
-        if (sql.includes('SELECT last_heartbeat_at')) {
-          return [{
-            columns: ['last_heartbeat_at', 'finished_at', 'exit_code', 'workflow_id', 'vendor_session_id'],
-            values: [['2026-05-04T14:00:00Z', null, null, null, 'vendor-abc']],
-          }]
-        }
-        return []
-      },
-      close: () => {},
-    } as unknown as Database
+  it('does not re-emit sessions that existed at prime time', async () => {
+    insertSession(db, {
+      id: 'pre-existing',
+      branch: 'feat/y',
+      workflow_type: 'review',
+      session_dir: '.ocr/sessions/pre-existing',
+    })
+    const watcher = new DbSyncWatcher(db, dbPath, makeIo(emits))
+    await watcher.init() // session already present → snapshotted
 
-    const fakeIo = {
-      emit: () => {},
-      to: () => ({ emit: () => {} }),
-    } as unknown as SocketIOServer
+    watcher.syncFromDisk()
+    expect(emits.filter((e) => e.event === 'session:created')).toHaveLength(0)
+  })
 
-    const w = new DbSyncWatcher(memoryDb, dbPath, fakeIo)
-    // Disk row: same heartbeat/finished/exit as memory, but
-    // workflow_id is now SET (CLI just wrote it).
-    const diskDb = {
-      exec: () => [{
-        columns: [
-          'id', 'uid', 'command', 'args', 'exit_code', 'started_at',
-          'finished_at', 'output', 'pid', 'is_detached', 'workflow_id',
-          'parent_id', 'vendor', 'vendor_session_id', 'persona',
-          'instance_index', 'name', 'resolved_model', 'last_heartbeat_at', 'notes',
-        ],
-        values: [[
-          1, 'uid-1', 'ocr review', '[]', null, '2026-05-04T13:00:00Z',
-          null, null, 12345, 0, 'wf-link-from-cli',
-          null, 'claude', 'vendor-abc', null,
-          null, null, null, '2026-05-04T14:00:00Z', null,
-        ]],
-      }],
-      close: () => {},
-    } as unknown as Database
+  it('emits session:updated when a session changes', async () => {
+    insertSession(db, {
+      id: 'sess-2',
+      branch: 'feat/z',
+      workflow_type: 'review',
+      session_dir: '.ocr/sessions/sess-2',
+    })
+    const watcher = new DbSyncWatcher(db, dbPath, makeIo(emits))
+    await watcher.init()
 
-    ;(w as unknown as { syncAgentSessions: (d: Database) => void }).syncAgentSessions(diskDb)
+    updateSession(db, 'sess-2', {
+      current_phase: 'reviews',
+      phase_number: 4,
+    })
 
-    expect(replaceCalled).toBe(true)
+    watcher.syncFromDisk()
+    const updates = emits.filter((e) => e.event === 'session:updated')
+    expect(updates).toHaveLength(1)
+    expect((updates[0]!.payload as { current_phase: string }).current_phase).toBe('reviews')
   })
 })

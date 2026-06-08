@@ -2,7 +2,7 @@
  * Schema migration runner for the OCR SQLite database.
  */
 
-import type { Database } from "sql.js";
+import type { Database } from "./engine.js";
 import type { Migration } from "./types.js";
 
 const MIGRATIONS: Migration[] = [

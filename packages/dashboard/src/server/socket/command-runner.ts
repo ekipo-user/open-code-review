@@ -14,7 +14,7 @@ import { spawnBinary } from '@open-code-review/platform'
 import { readFileSync, writeFileSync, unlinkSync, mkdirSync, existsSync } from 'node:fs'
 import { dirname, join } from 'node:path'
 import type { Server as SocketIOServer, Socket } from 'socket.io'
-import type { Database } from 'sql.js'
+import type { Database } from '@open-code-review/cli/db'
 import { saveDb } from '../db.js'
 import {
   deriveCommandOutcome,

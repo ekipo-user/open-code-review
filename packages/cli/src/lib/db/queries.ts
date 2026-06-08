@@ -2,7 +2,7 @@
  * Typed query functions for sessions and orchestration events.
  */
 
-import type { Database } from "sql.js";
+import type { Database } from "./engine.js";
 import type {
   EventRow,
   InsertEventParams,

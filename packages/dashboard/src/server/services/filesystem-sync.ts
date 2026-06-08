@@ -7,7 +7,7 @@
 import { readdirSync, readFileSync, statSync, existsSync } from 'node:fs'
 import { join, basename, dirname, relative } from 'node:path'
 import { watch, type FSWatcher } from 'chokidar'
-import type { Database } from 'sql.js'
+import type { Database } from '@open-code-review/cli/db'
 import type { Server as SocketIOServer } from 'socket.io'
 import { parseMapMd } from './parsers/map-parser.js'
 import { parseReviewerOutput } from './parsers/reviewer-parser.js'

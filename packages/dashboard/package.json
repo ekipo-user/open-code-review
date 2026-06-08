@@ -9,7 +9,7 @@
     "dev:server": "tsx watch src/server/index.ts",
     "build": "pnpm build:client && pnpm build:server",
     "build:client": "vite build",
-    "build:server": "esbuild src/server/index.ts --bundle --platform=node --format=esm --outfile=dist/server.js --conditions=source --external:sql.js --external:chokidar --external:socket.io --banner:js=\"import { createRequire as _cjsReq } from 'module'; const require = _cjsReq(import.meta.url);\"",
+    "build:server": "esbuild src/server/index.ts --bundle --platform=node --format=esm --outfile=dist/server.js --conditions=source --external:better-sqlite3 --external:chokidar --external:socket.io --banner:js=\"import { createRequire as _cjsReq } from 'module'; const require = _cjsReq(import.meta.url);\"",
     "preview": "node dist/server.js",
     "test": "vitest run"
   },
@@ -31,7 +31,7 @@
     "remark-gfm": "^4",
     "socket.io": "^4.8",
     "socket.io-client": "^4.8",
-    "sql.js": "^1.11",
+    "better-sqlite3": "^11.8.1",
     "tailwind-merge": "^3.5.0"
   },
   "devDependencies": {
@@ -41,7 +41,7 @@
     "@types/express": "^5.0.6",
     "@types/react": "^19.2.14",
     "@types/react-dom": "^19.2.3",
-    "@types/sql.js": "^1.4.9",
+    "@types/better-sqlite3": "^7.6.12",
     "@vitejs/plugin-react": "^5.1.4",
     "esbuild": "^0.24",
     "tailwindcss": "^4",

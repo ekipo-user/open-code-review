@@ -4,7 +4,7 @@
  * Manages session state exclusively through SQLite (.ocr/data/ocr.db).
  */
 
-import type { Database } from "sql.js";
+import type { Database } from "../db/engine.js";
 import {
   existsSync,
   mkdirSync,

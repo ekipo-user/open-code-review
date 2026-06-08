@@ -1,12 +1,12 @@
 /**
- * Generic row-mapping utilities for sql.js exec() results.
+ * Generic row-mapping utilities for engine exec() results.
  *
  * Extracted to its own module to break the circular dependency between
  * db/index.ts (which re-exports from queries.ts) and queries.ts (which
  * needs these helpers).
  */
 
-type ExecResult = ReturnType<import("sql.js").Database["exec"]>;
+import type { ExecResult } from "./engine.js";
 
 /**
  * Converts a sql.js exec() result set into an array of typed row objects.

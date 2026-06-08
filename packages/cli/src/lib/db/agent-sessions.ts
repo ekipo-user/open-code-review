@@ -17,7 +17,7 @@
  *   cancelled  →  exit_code = -2
  */
 
-import type { Database } from "sql.js";
+import type { Database } from "./engine.js";
 import type {
   AgentSessionRow,
   AgentSessionStatus,

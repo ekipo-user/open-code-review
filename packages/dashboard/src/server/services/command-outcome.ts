@@ -11,7 +11,7 @@
  * each row). Single helper means client + server can never disagree.
  */
 
-import type { Database } from 'sql.js'
+import type { Database } from '@open-code-review/cli/db'
 import type { CommandOutcome, SessionStatus } from '../../shared/types.js'
 
 /** Cancel sentinel set by finishExecution when the user clicks Cancel. */

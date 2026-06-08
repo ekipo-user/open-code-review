@@ -17,7 +17,7 @@ import {
   getLatestEventId,
 } from "../index.js";
 import { runMigrations, MIGRATIONS } from "../migrations.js";
-import type { Database } from "sql.js";
+import type { Database } from "../engine.js";
 
 let tmpDir: string;
 let db: Database;

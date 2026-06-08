@@ -32,18 +32,16 @@
  * under normal usage but is not a full MVCC solution.
  */
 
-import { existsSync, readFileSync, renameSync, writeFileSync, mkdirSync } from 'node:fs'
-import { join, dirname } from 'node:path'
-import initSqlJs, { type Database } from 'sql.js'
 import {
-  runMigrations,
-  locateWasm,
-  applyPragmas,
+  ensureDatabase,
+  closeDatabase,
   resultToRows,
   resultToRow,
+  type Database,
   type WorkflowType,
   type SessionStatus,
 } from '@open-code-review/cli/db'
+import { join } from 'node:path'
 
 // ── Types ──
 
@@ -234,94 +232,52 @@ let cachedDbPath: string | null = null
 // automatically merges CLI changes before writing (pre) and
 // marks its own write to avoid re-triggering the file watcher (post).
 
-let preSaveHook: (() => void) | null = null
-let postSaveHook: (() => void) | null = null
-
 /**
- * Register hooks that run around every saveDb() call.
+ * No-op shim retained for call-site compatibility.
  *
- * - `preSave`: merge external (CLI) changes before overwriting — prevents data loss.
- * - `postSave`: mark own write so the file watcher doesn't re-trigger.
+ * Under the prior sql.js engine, the dashboard merged CLI changes before
+ * every write (merge-before-write) and marked its own writes to avoid
+ * re-triggering the file watcher. With better-sqlite3 + WAL, the CLI and
+ * dashboard share the same on-disk database with native locking, so there
+ * is nothing to merge and no save hooks to run.
  */
 export function registerSaveHooks(
-  preSave: () => void,
-  postSave: () => void,
+  _preSave: () => void,
+  _postSave: () => void,
 ): void {
-  preSaveHook = preSave
-  postSaveHook = postSave
+  // Intentionally empty — superseded by native WAL locking.
 }
 
 /**
- * Opens the OCR database at the given `.ocr/` directory path.
- * Caches the connection for reuse.
+ * Opens the OCR database at the given `.ocr/` directory path via the shared
+ * CLI engine (better-sqlite3 + WAL), creating it and running migrations on
+ * first use. The shared module caches the connection per path.
  */
 export async function openDb(ocrDir: string): Promise<Database> {
   const dbPath = join(ocrDir, 'data', 'ocr.db')
-
-  if (cachedDb && cachedDbPath === dbPath) {
-    return cachedDb
-  }
-
-  const wasmBuffer = readFileSync(locateWasm())
-  const wasmBinary = wasmBuffer.buffer.slice(
-    wasmBuffer.byteOffset,
-    wasmBuffer.byteOffset + wasmBuffer.byteLength
-  )
-
-  const SQL = await initSqlJs({ wasmBinary })
-
-  let db: Database
-  if (existsSync(dbPath)) {
-    const fileBuffer = readFileSync(dbPath)
-    db = new SQL.Database(fileBuffer)
-  } else {
-    const dataDir = dirname(dbPath)
-    if (!existsSync(dataDir)) {
-      mkdirSync(dataDir, { recursive: true })
-    }
-    db = new SQL.Database()
-  }
-
-  applyPragmas(db)
-  runMigrations(db)
+  const db = await ensureDatabase(ocrDir)
   cachedDb = db
   cachedDbPath = dbPath
-
   return db
 }
 
 /**
- * Saves the in-memory database state to disk.
+ * No-op persistence shim.
  *
- * Automatically calls registered pre-save and post-save hooks:
- * - Pre-save: merges external (CLI) changes before overwriting (merge-before-write).
- * - Post-save: marks own write so the file watcher doesn't re-trigger.
- *
- * Hooks are registered once at startup via `registerSaveHooks()`.
- *
- * Uses atomic write (temp file + rename) to prevent partial reads
- * by concurrent processes.
+ * better-sqlite3 + WAL persists writes on commit, so there is nothing to
+ * flush. Retained as a symbol so the many existing `saveDb(db, ocrDir)`
+ * call sites do not all need editing; durability is the engine's job.
  */
-export function saveDb(db: Database, ocrDir: string): void {
-  preSaveHook?.()
-  const dbPath = join(ocrDir, 'data', 'ocr.db')
-  const data = db.export()
-  const dir = dirname(dbPath)
-  if (!existsSync(dir)) {
-    mkdirSync(dir, { recursive: true })
-  }
-  const tmpPath = `${dbPath}.${process.pid}.tmp`
-  writeFileSync(tmpPath, Buffer.from(data))
-  renameSync(tmpPath, dbPath)
-  postSaveHook?.()
+export function saveDb(_db: Database, _ocrDir: string): void {
+  // Intentionally empty — better-sqlite3 + WAL persists on commit.
 }
 
 /**
- * Closes the cached database connection.
+ * Closes the cached database connection (checkpointing the WAL first).
  */
 export function closeDb(): void {
-  if (cachedDb) {
-    cachedDb.close()
+  if (cachedDbPath) {
+    closeDatabase(cachedDbPath)
     cachedDb = null
     cachedDbPath = null
   }

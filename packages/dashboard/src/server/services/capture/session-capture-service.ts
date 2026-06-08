@@ -19,7 +19,7 @@
  * `docs/architecture/agent-lifecycle-and-resume.md`) swap the internals
  * without touching call sites.
  */
-import type { Database } from 'sql.js'
+import type { Database } from '@open-code-review/cli/db'
 import {
   getLatestAgentSessionWithVendorId,
   getSession,
