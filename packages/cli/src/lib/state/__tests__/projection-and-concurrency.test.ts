@@ -1,7 +1,13 @@
-import { mkdtempSync, rmSync, mkdirSync } from "node:fs";
+import { mkdtempSync, rmSync, mkdirSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
+import { spawn } from "node:child_process";
+import { createRequire } from "node:module";
 import { describe, it, expect, beforeEach, afterEach } from "vitest";
+
+// Absolute path to better-sqlite3 so a spawned child can `require` it
+// regardless of its cwd.
+const betterSqlitePath = createRequire(import.meta.url).resolve("better-sqlite3");
 import {
   openDatabase,
   closeAllDatabases,
@@ -81,12 +87,14 @@ describe("event-sourced projection", () => {
   });
 });
 
-describe("concurrent writers under WAL", () => {
-  it("a separate process's lifecycle close + round survive a concurrent dashboard write", async () => {
+describe("cross-connection co-existence under WAL", () => {
+  it("two connections' interleaved writes are both lossless (the sql.js clobber class)", async () => {
     // Two distinct connections to the same on-disk database (bypass the
-    // per-path connection cache) — mimicking the CLI process and the
-    // dashboard process writing concurrently. Under sql.js this was the
-    // clobber bug; under better-sqlite3 + WAL it must be lossless.
+    // per-path connection cache) — the CLI process and the dashboard process.
+    // Writes are SEQUENCED here (not contended); the point is that an
+    // interleaved write from connection B does not clobber connection A's
+    // earlier write, which is exactly the sql.js full-image-export bug.
+    // Genuine lock contention is exercised by the next test.
     const dbPath = join(ocrDir, "data", "ocr.db");
     mkdirSync(join(ocrDir, "data"), { recursive: true });
 
@@ -128,5 +136,73 @@ describe("concurrent writers under WAL", () => {
 
     expect(completeness[0]?.values[0]?.[0]).toBe("complete");
     expect(dashRow[0]?.values.length).toBe(1);
+  });
+
+  it("a contended write waits out a separate process's held write lock (true contention)", async () => {
+    // Genuine cross-PROCESS contention: a child process opens the same DB,
+    // takes the WAL writer lock (BEGIN IMMEDIATE), holds it for ~400ms, then
+    // commits. Meanwhile the parent issues its own transactional write, which
+    // must block on the lock and then succeed (via busy_timeout + the engine's
+    // SQLITE_BUSY retry) — not fail late as the pre-WAL design would.
+    const dbPath = join(ocrDir, "data", "ocr.db");
+    mkdirSync(join(ocrDir, "data"), { recursive: true });
+
+    const parent = openEngine(dbPath);
+    runMigrations(parent);
+    insertSession(parent, {
+      id: "wf",
+      branch: "feat/w",
+      workflow_type: "review",
+      session_dir: ".ocr/sessions/wf",
+    });
+
+    // Child script (CJS): hold the writer lock for ~400ms inside one txn.
+    const childPath = join(ocrDir, "data", "lock-holder.cjs");
+    writeFileSync(
+      childPath,
+      `const BetterSqlite3 = require(${JSON.stringify(betterSqlitePath)});
+       const db = new BetterSqlite3(process.argv[2]);
+       db.pragma("journal_mode = WAL");
+       db.pragma("busy_timeout = 5000");
+       const tx = db.transaction(() => {
+         db.prepare("INSERT INTO command_executions (uid, command, args, started_at, workflow_id) VALUES ('u-child','review','[]',datetime('now'),'wf')").run();
+         const until = Date.now() + 400;
+         while (Date.now() < until) { /* hold the write lock */ }
+       });
+       tx.immediate();
+       db.close();
+      `,
+    );
+
+    const childDone = new Promise<number>((resolve) => {
+      const child = spawn(process.execPath, [childPath, dbPath], {
+        stdio: "ignore",
+      });
+      child.on("exit", (code) => resolve(code ?? -1));
+    });
+
+    // Let the child acquire the writer lock first.
+    await new Promise((r) => setTimeout(r, 120));
+
+    // Parent's transactional write contends with the held lock and must win
+    // (after the child releases) rather than throwing.
+    expect(() =>
+      parent.transaction(() => {
+        updateSession(parent, "wf", { current_round: 2 });
+      }),
+    ).not.toThrow();
+
+    const childExit = await childDone;
+    parent.close();
+
+    expect(childExit).toBe(0);
+
+    // Both writers' effects are durably present — nothing was lost to contention.
+    const reader = openEngine(dbPath);
+    const round = reader.exec("SELECT current_round FROM sessions WHERE id = 'wf'");
+    const childRow = reader.exec("SELECT 1 FROM command_executions WHERE uid = 'u-child'");
+    reader.close();
+    expect(round[0]?.values[0]?.[0]).toBe(2);
+    expect(childRow[0]?.values.length).toBe(1);
   });
 });
