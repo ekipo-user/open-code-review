@@ -17,6 +17,10 @@ describe("resolveColorLevel", () => {
     expect(resolveColorLevel(tty, { COLORTERM: "truecolor" })).toBe(3);
   });
 
+  it("does not emit color on a dumb terminal even if it's a TTY", () => {
+    expect(resolveColorLevel(tty, { TERM: "dumb" })).toBe(0);
+  });
+
   it("honors NO_COLOR (any non-empty value) even on a TTY", () => {
     expect(resolveColorLevel(tty, { NO_COLOR: "1" })).toBe(0);
     expect(resolveColorLevel(tty, { NO_COLOR: "anything" })).toBe(0);

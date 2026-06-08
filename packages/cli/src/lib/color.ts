@@ -42,7 +42,7 @@ export function resolveColorLevel(
   if (/truecolor|24bit/i.test(colorterm)) return 3;
 
   const term = env["TERM"] ?? "";
-  if (term === "dumb") return 1;
+  if (term === "dumb") return 0; // a dumb terminal cannot render ANSI
   if (/256/.test(term)) return 2;
   return 1;
 }
