@@ -90,6 +90,82 @@ function deriveNextRound(
   return fallbackRound;
 }
 
+/**
+ * The lifecycle facts the `sessions` projection holds, recomputed purely
+ * from a session's `orchestration_events`. Proves the projection is a
+ * derivable fold over the event log (the system of record), not an
+ * independent source that can drift.
+ */
+export type DerivedLifecycle = {
+  status: "active" | "closed";
+  current_phase: string;
+  phase_number: number;
+  current_round: number;
+  current_map_run: number;
+};
+
+const TERMINAL_EVENT_TYPES = new Set([
+  "session_closed",
+  "session_aborted",
+  "session_auto_closed_stale",
+  "session_legacy_import",
+]);
+
+/**
+ * Fold a session's event log into its lifecycle projection, applying the
+ * same rules the state mutators use. Returns `null` if the session has no
+ * events.
+ */
+export function rebuildSessionProjection(
+  db: Database,
+  sessionId: string,
+): DerivedLifecycle | null {
+  const events = getEventsForSession(db, sessionId);
+  if (events.length === 0) return null;
+
+  const acc: DerivedLifecycle = {
+    status: "active",
+    current_phase: "context",
+    phase_number: 1,
+    current_round: 1,
+    current_map_run: 1,
+  };
+
+  for (const e of events) {
+    switch (e.event_type) {
+      case "session_created":
+      case "session_resumed":
+      case "round_started":
+        acc.status = "active";
+        if (e.phase) acc.current_phase = e.phase;
+        if (e.phase_number != null) acc.phase_number = e.phase_number;
+        if (e.round != null) acc.current_round = e.round;
+        break;
+      case "phase_transition":
+        if (e.phase) acc.current_phase = e.phase;
+        if (e.phase_number != null) acc.phase_number = e.phase_number;
+        if (e.round != null) acc.current_round = e.round;
+        break;
+      case "round_completed":
+        if (e.round != null && e.round >= acc.current_round) {
+          acc.current_round = e.round;
+        }
+        break;
+      case "map_completed":
+        if (e.round != null) acc.current_map_run = e.round;
+        break;
+      default:
+        if (TERMINAL_EVENT_TYPES.has(e.event_type)) {
+          acc.status = "closed";
+          acc.current_phase = "complete";
+          if (e.phase_number != null) acc.phase_number = e.phase_number;
+        }
+    }
+  }
+
+  return acc;
+}
+
 /** Returns true if the directory contains at least one .md or .json file (recursively). */
 function hasArtifacts(dir: string): boolean {
   try {
@@ -143,23 +219,25 @@ export async function stateInit(params: InitParams): Promise<string> {
     // wrong one here causes every subsequent transition to be rejected.
     const initialPhase = workflowType === "map" ? "map-context" : "context";
 
-    // Re-open the session for the next round
-    updateSession(db, sessionId, {
-      status: "active",
-      current_phase: initialPhase,
-      phase_number: 1,
-      current_round: nextRound,
-    });
+    // Re-open the session for the next round (projection + event atomic).
+    db.transaction(() => {
+      updateSession(db, sessionId, {
+        status: "active",
+        current_phase: initialPhase,
+        phase_number: 1,
+        current_round: nextRound,
+      });
 
-    insertEvent(db, {
-      session_id: sessionId,
-      event_type:
-        nextRound > (existing.current_round ?? 1)
-          ? "round_started"
-          : "session_resumed",
-      phase: initialPhase,
-      phase_number: 1,
-      round: nextRound,
+      insertEvent(db, {
+        session_id: sessionId,
+        event_type:
+          nextRound > (existing.current_round ?? 1)
+            ? "round_started"
+            : "session_resumed",
+        phase: initialPhase,
+        phase_number: 1,
+        round: nextRound,
+      });
     });
 
     saveDatabase(db, dbPath);
@@ -168,24 +246,26 @@ export async function stateInit(params: InitParams): Promise<string> {
 
   const initialPhase = workflowType === "map" ? "map-context" : "context";
 
-  // New session — original path
-  insertSession(db, {
-    id: sessionId,
-    branch,
-    workflow_type: workflowType,
-    current_phase: initialPhase,
-    phase_number: 1,
-    current_round: 1,
-    current_map_run: 1,
-    session_dir: sessionDir,
-  });
+  // New session — original path (projection + event atomic).
+  db.transaction(() => {
+    insertSession(db, {
+      id: sessionId,
+      branch,
+      workflow_type: workflowType,
+      current_phase: initialPhase,
+      phase_number: 1,
+      current_round: 1,
+      current_map_run: 1,
+      session_dir: sessionDir,
+    });
 
-  insertEvent(db, {
-    session_id: sessionId,
-    event_type: "session_created",
-    phase: initialPhase,
-    phase_number: 1,
-    round: 1,
+    insertEvent(db, {
+      session_id: sessionId,
+      event_type: "session_created",
+      phase: initialPhase,
+      phase_number: 1,
+      round: 1,
+    });
   });
 
   saveDatabase(db, dbPath);
@@ -295,31 +375,35 @@ export async function stateTransition(params: TransitionParams): Promise<void> {
     isRoundBoundary,
   );
 
-  updateSession(db, sessionId, {
-    current_phase: phase,
-    phase_number: phaseNumber,
-    ...(round !== undefined ? { current_round: round } : {}),
-    ...(mapRun !== undefined ? { current_map_run: mapRun } : {}),
-  });
+  // Event + projection commit together so the sessions row can never reflect
+  // a phase the event log doesn't record (and vice versa).
+  db.transaction(() => {
+    updateSession(db, sessionId, {
+      current_phase: phase,
+      phase_number: phaseNumber,
+      ...(round !== undefined ? { current_round: round } : {}),
+      ...(mapRun !== undefined ? { current_map_run: mapRun } : {}),
+    });
 
-  insertEvent(db, {
-    session_id: sessionId,
-    event_type: "phase_transition",
-    phase,
-    phase_number: phaseNumber,
-    round: round ?? existing.current_round,
-  });
-
-  // If round changed, also insert a round_started event
-  if (round !== undefined && round !== previousRound) {
     insertEvent(db, {
       session_id: sessionId,
-      event_type: "round_started",
+      event_type: "phase_transition",
       phase,
       phase_number: phaseNumber,
-      round,
+      round: round ?? existing.current_round,
     });
-  }
+
+    // If round changed, also insert a round_started event
+    if (round !== undefined && round !== previousRound) {
+      insertEvent(db, {
+        session_id: sessionId,
+        event_type: "round_started",
+        phase,
+        phase_number: phaseNumber,
+        round,
+      });
+    }
+  });
 
   saveDatabase(db, dbPath);
 }
@@ -359,34 +443,37 @@ export async function stateClose(params: CloseParams): Promise<void> {
     return;
   }
 
-  updateSession(db, sessionId, {
-    status: "closed",
-    current_phase: "complete",
-  });
-
-  insertEvent(db, {
-    session_id: sessionId,
-    event_type: "session_closed",
-    phase: "complete",
-    phase_number: existing.phase_number,
-    round: existing.current_round,
-  });
-
-  // Cascade: terminate any dependent command_executions rows still in
-  // flight. Without this, a workflow close leaves orphan rows that only
-  // the heartbeat sweep can recover — and that sweep needs the dashboard
-  // running. Doing it here makes close authoritative.
+  // Close event + projection + dependent cascade commit atomically.
   const note = "closed by parent workflow close";
-  db.run(
-    `UPDATE command_executions
-       SET finished_at = datetime('now'),
-           exit_code   = ?,
-           pid         = NULL,
-           notes       = COALESCE(notes || char(10), '') || ?
-     WHERE workflow_id = ?
-       AND finished_at IS NULL`,
-    [CASCADE_CLOSE_EXIT_CODE, note, sessionId],
-  );
+  db.transaction(() => {
+    updateSession(db, sessionId, {
+      status: "closed",
+      current_phase: "complete",
+    });
+
+    insertEvent(db, {
+      session_id: sessionId,
+      event_type: "session_closed",
+      phase: "complete",
+      phase_number: existing.phase_number,
+      round: existing.current_round,
+    });
+
+    // Cascade: terminate any dependent command_executions rows still in
+    // flight. Without this, a workflow close leaves orphan rows that only
+    // the heartbeat sweep can recover — and that sweep needs the dashboard
+    // running. Doing it here makes close authoritative.
+    db.run(
+      `UPDATE command_executions
+         SET finished_at = datetime('now'),
+             exit_code   = ?,
+             pid         = NULL,
+             notes       = COALESCE(notes || char(10), '') || ?
+       WHERE workflow_id = ?
+         AND finished_at IS NULL`,
+      [CASCADE_CLOSE_EXIT_CODE, note, sessionId],
+    );
+  });
 
   saveDatabase(db, dbPath);
 }
@@ -811,31 +898,31 @@ export async function stateRoundComplete(
     writeFileSync(metaPath, JSON.stringify(meta, null, 2));
   }
 
-  // ── 5. Write orchestration event with all data in metadata ──
-  insertEvent(db, {
-    session_id: session.id,
-    event_type: "round_completed",
-    phase: "synthesis",
-    phase_number: 7,
-    round: roundNumber,
-    metadata: JSON.stringify({
-      verdict: meta.verdict,
-      blocker_count: counts.blockerCount,
-      should_fix_count: counts.shouldFixCount,
-      suggestion_count: counts.suggestionCount,
-      reviewer_count: counts.reviewerCount,
-      total_finding_count: counts.totalFindingCount,
-      source: "orchestrator",
-    }),
-  });
+  // ── 5+6. Write the round_completed event and advance current_round
+  // atomically, so a reader never sees the event without the round bump
+  // (or vice versa).
+  db.transaction(() => {
+    insertEvent(db, {
+      session_id: session.id,
+      event_type: "round_completed",
+      phase: "synthesis",
+      phase_number: 7,
+      round: roundNumber,
+      metadata: JSON.stringify({
+        verdict: meta.verdict,
+        blocker_count: counts.blockerCount,
+        should_fix_count: counts.shouldFixCount,
+        suggestion_count: counts.suggestionCount,
+        reviewer_count: counts.reviewerCount,
+        total_finding_count: counts.totalFindingCount,
+        source: "orchestrator",
+      }),
+    });
 
-  // ── 6. Advance current_round on the session row. Without this, the
-  // sessions table lags the events log — the next stateInit re-open
-  // would have to re-derive round each time. Keeping the column in
-  // sync with the event log lets the dashboard read it directly.
-  if (roundNumber >= session.current_round) {
-    updateSession(db, session.id, { current_round: roundNumber });
-  }
+    if (roundNumber >= session.current_round) {
+      updateSession(db, session.id, { current_round: roundNumber });
+    }
+  });
 
   saveDatabase(db, dbPath);
 
@@ -959,17 +1046,19 @@ export async function stateMapComplete(
   // ── 5. Write orchestration event with all data in metadata ──
   // Note: `round` column stores the map run number for map_completed events.
   // This is an intentional schema overload to avoid a separate column.
-  insertEvent(db, {
-    session_id: session.id,
-    event_type: "map_completed",
-    phase: "synthesis",
-    phase_number: 5,
-    round: mapRunNumber,
-    metadata: JSON.stringify({
-      section_count: counts.sectionCount,
-      file_count: counts.fileCount,
-      source: "orchestrator",
-    }),
+  db.transaction(() => {
+    insertEvent(db, {
+      session_id: session.id,
+      event_type: "map_completed",
+      phase: "synthesis",
+      phase_number: 5,
+      round: mapRunNumber,
+      metadata: JSON.stringify({
+        section_count: counts.sectionCount,
+        file_count: counts.fileCount,
+        source: "orchestrator",
+      }),
+    });
   });
 
   saveDatabase(db, dbPath);
