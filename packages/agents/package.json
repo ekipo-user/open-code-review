@@ -1,6 +1,6 @@
 {
   "name": "@open-code-review/agents",
-  "version": "1.11.0",
+  "version": "2.0.0",
   "description": "AI-native skills, commands, and reviewer personas for Open Code Review",
   "type": "module",
   "files": [

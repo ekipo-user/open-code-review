@@ -1,3 +1,19 @@
+# 2.0.0 (2026-06-09)
+
+### 🚀 Features
+
+- **db:** one-time migration notice when upgrading a pre-v2 database ([cf05983](https://github.com/spencermarx/open-code-review/commit/cf05983))
+
+### 🩹 Fixes
+
+- **cli:** round-2 blockers — sweepStaleSessions transactionality + cutover doc/spec finish ([6f22021](https://github.com/spencermarx/open-code-review/commit/6f22021))
+- **cli:** address PR #31 review — atomic-API hardening + v2 cutover ([#31](https://github.com/spencermarx/open-code-review/issues/31))
+
+### ❤️ Thank You
+
+- claude-flow @agentic-org
+- Spencer Marx
+
 ## 1.11.0 (2026-05-06)
 
 This was a version bump only for agents to align it with other projects, there were no code changes.

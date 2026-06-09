@@ -1,3 +1,33 @@
+# 2.0.0 (2026-06-09)
+
+### 🚀 Features
+
+- **cli,dashboard:** cascade dead-supervisor dependents; derive process kind; retire dead parent_id ([8229a77](https://github.com/spencermarx/open-code-review/commit/8229a77))
+- **db:** one-time migration notice when upgrading a pre-v2 database ([cf05983](https://github.com/spencermarx/open-code-review/commit/cf05983))
+- **cli:** begin is a true superset of init; advance tolerates --phase-number ([1a19a20](https://github.com/spencermarx/open-code-review/commit/1a19a20))
+- **cli:** atomic agent state API + close-guard backstop ([e95873f](https://github.com/spencermarx/open-code-review/commit/e95873f))
+- **state:** atomic event+projection commits + projection rebuild ([#31](https://github.com/spencermarx/open-code-review/issues/31))
+- **db:** automatic legacy state reconciliation ([0bd8dd1](https://github.com/spencermarx/open-code-review/commit/0bd8dd1))
+- **db:** migration v12 — taxonomy guard, sweep indexes, completeness view ([3a70893](https://github.com/spencermarx/open-code-review/commit/3a70893))
+- **dashboard,cli:** sweep stale-active sessions + periodic dashboard timer ([4bf3596](https://github.com/spencermarx/open-code-review/commit/4bf3596))
+
+### 🩹 Fixes
+
+- **cli,dashboard:** round-4 blocker + supervision correctness fixes ([ba49580](https://github.com/spencermarx/open-code-review/commit/ba49580))
+- **cli,dashboard:** orphan a supervised row only on a confirmed-dead pid ([7795eb5](https://github.com/spencermarx/open-code-review/commit/7795eb5))
+- **cli:** round-2 blockers — sweepStaleSessions transactionality + cutover doc/spec finish ([6f22021](https://github.com/spencermarx/open-code-review/commit/6f22021))
+- **dashboard:** resolve cli sentinels via the db barrel, not a dist-only subpath ([952e17d](https://github.com/spencermarx/open-code-review/commit/952e17d))
+- **cli:** address PR #31 review — atomic-API hardening + v2 cutover ([#31](https://github.com/spencermarx/open-code-review/issues/31))
+- **cli:** deterministic terminal color policy for published bundles ([c43a1fa](https://github.com/spencermarx/open-code-review/commit/c43a1fa))
+- **cli:** state close uses the typed exit-code taxonomy + close-guard proof ([6a3aa28](https://github.com/spencermarx/open-code-review/commit/6a3aa28))
+- **cli:** air-tight workflow state lifecycle ([#31](https://github.com/spencermarx/open-code-review/issues/31))
+- **cli:** resolve completion session via dashboard execution UID ([b1b8204](https://github.com/spencermarx/open-code-review/commit/b1b8204))
+
+### ❤️ Thank You
+
+- claude-flow @agentic-org
+- Spencer Marx
+
 ## 1.11.0 (2026-05-06)
 
 ### 🚀 Features
