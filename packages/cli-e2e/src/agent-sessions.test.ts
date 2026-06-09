@@ -394,10 +394,13 @@ describe("ocr session liveness sweep", () => {
     const workflowId = await initWorkflow(project);
 
     const DEAD_PID = 2_000_000_000;
-    // A live sibling instance (no pid) and a doomed dead-pid instance, both
-    // present BEFORE the orphaning sweep so the cascade-safety is real.
+    // The sibling records a LIVE pid (this test process) so it is itself a
+    // sweep candidate that the liveness probe finds alive — what keeps it
+    // running is therefore the `rowKind === 'supervisor'` cascade gate (the
+    // doomed row is an instance, so it must not cascade), NOT the candidate
+    // filter excluding a null-pid row.
     const sibling = await spawnCli(
-      ["session", "start-instance", "--workflow", workflowId, "--persona", "principal", "--instance", "1", "--vendor", "claude"],
+      ["session", "start-instance", "--workflow", workflowId, "--persona", "principal", "--instance", "1", "--vendor", "claude", "--pid", String(process.pid)],
       { cwd: project.dir },
     );
     const siblingId = sibling.stdout.trim();
