@@ -280,23 +280,25 @@ export async function startServer(options: StartServerOptions = {}): Promise<voi
     }
   }
 
-  // Mark any command_executions left in a broken state as cancelled.
-  // Covers two cases:
-  //   1. finished_at IS NULL — process was running when server stopped
-  //   2. exit_code IS NULL — old bug where SIGTERM-killed processes stored null exit code
-  const staleResult = db.exec(
-    "SELECT COUNT(*) as c FROM command_executions WHERE finished_at IS NULL OR exit_code IS NULL"
+  // Backfill the exit code on legacy rows that FINISHED but never recorded one
+  // (an old SIGTERM-handling bug). In-flight rows (finished_at IS NULL) are
+  // deliberately NOT terminated here — they are reclaimed by the orphan-kill
+  // block above (signals) and the liveness sweep below, which gives a terminal
+  // verdict only on a confirmed-dead pid. Blanket-cancelling in-flight rows here
+  // would stamp a LIVE process `-2` on every dashboard restart — the exact
+  // false-terminal class the liveness sweep exists to prevent.
+  const legacyResult = db.exec(
+    "SELECT COUNT(*) as c FROM command_executions WHERE finished_at IS NOT NULL AND exit_code IS NULL"
   )
-  const staleCount = (staleResult[0]?.values[0]?.[0] as number) ?? 0
-  if (staleCount > 0) {
+  const legacyCount = (legacyResult[0]?.values[0]?.[0] as number) ?? 0
+  if (legacyCount > 0) {
     db.run(
       `UPDATE command_executions
-       SET exit_code = -2, finished_at = COALESCE(finished_at, datetime('now')),
-           output = COALESCE(output, '') || '\n[Cancelled]',
-           pid = NULL
-       WHERE finished_at IS NULL OR exit_code IS NULL`
+       SET exit_code = -2,
+           output = COALESCE(output, '') || '\n[Cancelled]'
+       WHERE finished_at IS NOT NULL AND exit_code IS NULL`
     )
-    console.log(`  Cleaned up ${staleCount} stale command(s)`)
+    console.log(`  Backfilled ${legacyCount} finished command(s) missing an exit code`)
   }
 
   // ── Agent-session liveness sweep ──
@@ -307,8 +309,10 @@ export async function startServer(options: StartServerOptions = {}): Promise<voi
   const heartbeatSeconds = getAgentHeartbeatSeconds(ocrDir)
   const sweepResult = sweepStaleAgentSessions(db, heartbeatSeconds, defaultIsAlive)
   if (sweepResult.orphanedIds.length > 0) {
+    const cascaded = sweepResult.cascadedWorkflowIds.length
     console.log(
-      `  Cleaned up ${sweepResult.orphanedIds.length} stale agent session(s) (heartbeat threshold ${heartbeatSeconds}s)`
+      `  Cleaned up ${sweepResult.orphanedIds.length} stale agent session(s) (heartbeat threshold ${heartbeatSeconds}s)` +
+      (cascaded > 0 ? `; cascade-closed dependents of ${cascaded} workflow(s)` : '')
     )
   }
 

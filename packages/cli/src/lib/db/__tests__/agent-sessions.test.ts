@@ -314,6 +314,35 @@ describe("sweepStaleAgentSessions", () => {
     expect(getAgentSession(db, "agent-25h")?.status).toBe("running");
   });
 
+  it("honors the 24h guard for ISO-format started_at (the dashboard writer's shape)", () => {
+    // The dashboard's command-runner writes started_at = Date.toISOString(),
+    // NOT SQLite's `datetime('now')`. The reuse guard parses it via sqliteUtcMs;
+    // a regression there returned NaN, so `NaN < cutoff` was always false and
+    // the guard silently failed open. Insert the ISO shape directly to pin it.
+    const isoOld = new Date(Date.now() - 25 * 60 * 60 * 1000).toISOString();
+    const isoStale = new Date(Date.now() - 300 * 1000).toISOString();
+    db.run(
+      `INSERT INTO command_executions (uid, command, args, started_at, workflow_id, pid, last_heartbeat_at)
+       VALUES ('iso-25h', 'review', '[]', ?, ?, 4242, ?)`,
+      [isoOld, WORKFLOW_ID, isoStale],
+    );
+
+    // pid "dead", but the row is >24h old (ISO) → guard must trip → NOT orphaned.
+    const past = sweepStaleAgentSessions(db, 60, DEAD);
+    expect(past.orphanedIds).not.toContain("iso-25h");
+    expect(getAgentSession(db, "iso-25h")?.status).toBe("running");
+
+    // A within-window ISO row with a dead pid IS orphaned (guard lets it through).
+    const isoRecent = new Date(Date.now() - 2 * 60 * 60 * 1000).toISOString();
+    db.run(
+      `INSERT INTO command_executions (uid, command, args, started_at, workflow_id, pid, last_heartbeat_at)
+       VALUES ('iso-2h', 'review', '[]', ?, ?, 4243, ?)`,
+      [isoRecent, WORKFLOW_ID, isoStale],
+    );
+    const recent = sweepStaleAgentSessions(db, 60, DEAD);
+    expect(recent.orphanedIds).toContain("iso-2h");
+  });
+
   it("leaves rows with fresh heartbeats untouched", () => {
     insertAgentSession(db, {
       id: "agent-fresh",

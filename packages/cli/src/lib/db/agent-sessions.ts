@@ -48,14 +48,24 @@ import {
 const NOTE_ORPHAN_PREFIX = "orphaned by liveness sweep";
 
 /**
+ * The `command` value of a reviewer-instance row (bare, or `…:<persona>-<idx>`).
+ * This single constant is the load-bearing discriminator for cascade safety —
+ * only non-instance (supervisor) rows fire the cascade — so the writer
+ * ({@link insertAgentSession}) and the reader ({@link rowKind}) MUST share it.
+ */
+const INSTANCE_COMMAND = "session-instance";
+
+/**
  * Stamp every still-in-flight `command_executions` row for a workflow as
- * terminal — used when the parent workflow closes so dependent child rows
- * don't linger until the heartbeat sweep (which needs the dashboard running)
- * reclaims them.
+ * terminal — used when the workflow's owning process goes away so dependent
+ * child rows don't linger. Two callers:
+ *   - `stateClose` (`state/index.ts`) — a clean parent-workflow close.
+ *   - `sweepStaleAgentSessions` (below) — when the liveness sweep confirms a
+ *     workflow's supervising process dead and orphans it.
  *
  * Sets `finished_at`, the given `exitCode`, clears `pid`, and appends `note`.
  * The caller is responsible for running this inside its own transaction so
- * the cascade commits atomically with the parent close.
+ * the cascade commits atomically with the parent's terminal write.
  */
 export function cascadeTerminateExecutions(
   db: Database,
@@ -168,8 +178,8 @@ export function insertAgentSession(
   } = params;
 
   const command = persona && instance_index !== null
-    ? `session-instance:${persona}-${instance_index}`
-    : "session-instance";
+    ? `${INSTANCE_COMMAND}:${persona}-${instance_index}`
+    : INSTANCE_COMMAND;
 
   db.run(
     `INSERT INTO command_executions
@@ -544,7 +554,7 @@ export function sweepStaleAgentSessions(
     ),
   );
   if (candidates.length === 0) {
-    return { orphanedIds: [] };
+    return { orphanedIds: [], cascadedWorkflowIds: [] };
   }
 
   // Phase 2 — keep only rows whose pid is recent enough to trust AND confirmed
@@ -553,10 +563,14 @@ export function sweepStaleAgentSessions(
   const dead = candidates.filter((row) => {
     if (row.pid === null) return false; // already excluded by SQL; defensive
     if (sqliteUtcMs(row.started_at) < reuseCutoffMs) return false; // pid not trustworthy
+    // A pid that reads alive within the window stays in-flight. If the OS
+    // recycled a dead supervisor's pid onto a stranger, we cannot prove the
+    // original is dead, so we lean toward NOT issuing a false terminal verdict
+    // — the row is reclaimed later at the coarse session-level sweep.
     return !isAlive(row.pid);
   });
   if (dead.length === 0) {
-    return { orphanedIds: [] };
+    return { orphanedIds: [], cascadedWorkflowIds: [] };
   }
 
   // Phase 3 — atomically: stamp orphaned on exactly the dead rows (by id, clear
@@ -567,6 +581,7 @@ export function sweepStaleAgentSessions(
   // orphaned instance can't take its live siblings down.
   const note = `${NOTE_ORPHAN_PREFIX} (threshold ${thresholdSeconds}s)`;
   const placeholders = dead.map(() => "?").join(", ");
+  const cascadedWorkflowIds: string[] = [];
   db.transaction(() => {
     db.run(
       `UPDATE command_executions
@@ -586,29 +601,40 @@ export function sweepStaleAgentSessions(
           CASCADE_CLOSE_EXIT_CODE,
           "cascade-closed: workflow process orphaned by liveness sweep",
         );
+        cascadedWorkflowIds.push(row.workflow_id);
       }
     }
   });
 
-  return { orphanedIds: dead.map((r) => r.uid ?? String(r.id)) };
+  return {
+    orphanedIds: dead.map((r) => r.uid ?? String(r.id)),
+    cascadedWorkflowIds,
+  };
 }
 
 /**
  * The role a `command_executions` row plays, derived (never stored) from the
  * two columns present on every row at every insert site — including after a
  * JSONL replay, which drops `persona`/`instance_index` but keeps `command`.
- * The `session-instance` command prefix is written ONLY by `insertAgentSession`
- * (see {@link insertAgentSession}), so it is a total, unambiguous discriminator.
+ * The {@link INSTANCE_COMMAND} value is written ONLY by `insertAgentSession`
+ * (either bare, or with a `:<persona>-<idx>` suffix), so it is a total,
+ * unambiguous discriminator.
  *
- * NB: prefix match, not equality — a persona-less instance writes the bare
- * `session-instance`. Tightening this to `session-instance:` would misclassify
- * it as a supervisor and let an orphaned instance cascade-kill its siblings.
+ * NB: an instance is the bare value OR the `…:` suffixed form — matched exactly
+ * so an unrelated future command merely *prefixed* `session-instance` (e.g.
+ * `session-instances`) is NOT misclassified as an instance, which would let an
+ * orphaned instance cascade-kill its siblings.
  */
 export function rowKind(row: {
   command: string;
   last_heartbeat_at: string | null;
 }): RowKind {
-  if (row.command.startsWith("session-instance")) return "instance";
+  if (
+    row.command === INSTANCE_COMMAND ||
+    row.command.startsWith(`${INSTANCE_COMMAND}:`)
+  ) {
+    return "instance";
+  }
   // A journaled (heartbeat-bearing) non-instance row is a workflow supervisor;
   // a row that was never journaled is a fire-and-forget utility command.
   return row.last_heartbeat_at == null ? "utility" : "supervisor";

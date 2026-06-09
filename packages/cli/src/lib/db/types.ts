@@ -112,6 +112,9 @@ export type UpdateAgentSessionParams = Partial<
 
 export type SweepResult = {
   orphanedIds: string[];
+  /** workflow_ids whose in-flight dependents were cascade-closed because the
+   *  workflow's supervising process was orphaned (for the sweep log line). */
+  cascadedWorkflowIds: string[];
 };
 
 /**
