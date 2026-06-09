@@ -81,6 +81,7 @@ The dashboard periodically reclaims `command_executions` rows whose supervised p
 - **GIVEN** a supervisor was orphaned and its dependents cascade-closed
 - **THEN** the cascade SHALL affect only `command_executions` (process supervision); it SHALL NOT itself close the workflow's `sessions` row
 - **AND** the `sessions` row remains `active` so the in-progress round stays resumable (re-running the workflow resumes it; `ocr state finish --abort` abandons it); its lifecycle is reclaimed at the coarse 7-day session-level sweep if neither happens
+- **AND** consequently the `session_completeness` view reads `in_flight` / `open_no_artifact` (NOT a terminal state) for the workflow until that reconciliation — the user-observable surface of the deliberate asymmetry
 - **AND** the dashboard's sweep log line SHALL report how many rows were cascade-closed
 
 #### Scenario: A recycled PID that reads alive leaves the row in-flight (deliberate false-negative)
