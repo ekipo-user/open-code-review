@@ -110,14 +110,15 @@ workflow, use `ocr state finish --abort`.
 
 **Exit codes** (branch on these instead of parsing messages): `0` ok ·
 `2` usage · `3` ambiguous session · `4` not found · `5` illegal transition ·
-`6` invariant unmet · `7` schema invalid.
+`6` invariant unmet · `7` schema invalid · `8` busy (the DB was locked past
+the bounded retry budget; wait ~250 ms and retry the same call).
 
 On resume, run `ocr state status --json` first — it tells you exactly what's
 missing and the next action, instead of inspecting the filesystem by hand.
 
-The legacy aliases `init` / `transition` / `round-complete` / `map-complete` /
-`close` still work (they map onto the verbs documented below), but the atomic
-verbs are preferred.
+v2.0.0 **retired** the `init` / `transition` / `round-complete` /
+`map-complete` / `close` subcommands; use the atomic verbs documented below.
+Calling a retired verb exits `2` with a pointer to its replacement.
 
 ### `ocr state begin` — Create or resume a session
 
@@ -172,8 +173,7 @@ it, pass `--abort` (records a distinct, non-success terminal):
 ocr state finish --abort
 ```
 
-> The older `ocr state close` still works and is now equivalent to `finish`
-> (it enforces the same invariant and accepts `--abort`).
+> `ocr state close` was retired in v2.0.0 — `finish` replaces it.
 
 ### `ocr state show` — Read current session state
 

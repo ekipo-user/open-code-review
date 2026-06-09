@@ -49,7 +49,7 @@ import {
 
 /**
  * Spawn-marker shape — written by the dashboard's command-runner at the
- * moment it spawns an AI workflow, read here by `state init` to bind
+ * moment it spawns an AI workflow, read here by `state begin` to bind
  * `workflow_id` on the dashboard's parent `command_executions` row.
  *
  * The marker is the durable answer to a fragile-by-construction problem:
@@ -90,7 +90,7 @@ function readDashboardSpawnMarker(ocrDir: string): DashboardSpawnMarker | null {
   // not be consumed. `process.kill(pid, 0)` throws ESRCH when the PID
   // is gone — we treat that as "no live dashboard" and ignore the
   // marker. This prevents a crashed dashboard's leftover marker from
-  // mis-linking a future CLI-only `state init` invocation.
+  // mis-linking a future CLI-only `state begin` invocation.
   try {
     process.kill(marker.pid, 0);
   } catch {
@@ -119,8 +119,7 @@ async function readStdin(): Promise<string> {
  * `OCR_DASHBOARD_EXECUTION_UID` env var → filesystem spawn marker. Non-fatal:
  * the session is created either way; only resume discoverability suffers.
  *
- * Shared by `init` and `begin` so both wire up dashboard linkage identically
- * — `begin` is a true superset of `init`.
+ * Called by `begin` (the v2 create/resume verb) after the session row exists.
  */
 async function linkDashboardInvocation(
   ocrDir: string,
@@ -569,6 +568,15 @@ const statusSubcommand = new Command("status")
 
 // ── Main state command ──
 
+/** The verbs v2.0 retired, mapped to their atomic replacements. */
+const RETIRED_STATE_VERBS: Record<string, string> = {
+  init: "begin",
+  transition: "advance",
+  "round-complete": "complete-round",
+  "map-complete": "complete-map",
+  close: "finish",
+};
+
 export const stateCommand = new Command("state")
   .description("Manage OCR session state")
   // Atomic porcelain — the only supported agent API.
@@ -581,4 +589,17 @@ export const stateCommand = new Command("state")
   // Read/maintenance verbs.
   .addCommand(showSubcommand)
   .addCommand(syncSubcommand)
-  .addCommand(reconcileSubcommand);
+  .addCommand(reconcileSubcommand)
+  // Commander's default unknown-subcommand path exits 1 with a misleading
+  // "Did you mean finish?" guess. For a CLI whose consumer is an LLM, give a
+  // deterministic typed signal instead: exit 2 (USAGE) routing a v1-pinned
+  // agent to the atomic verb it should use.
+  .showSuggestionAfterError(false)
+  .on("command:*", (operands: string[]) => {
+    const verb = operands[0] ?? "";
+    const replacement = RETIRED_STATE_VERBS[verb];
+    const msg = replacement
+      ? `'ocr state ${verb}' was retired in v2.0 — use 'ocr state ${replacement}'. See 'ocr state --help'.`
+      : `Unknown 'ocr state' subcommand: '${verb}'. See 'ocr state --help'.`;
+    exitFromStateError(new StateError(STATE_EXIT.USAGE, msg), msg);
+  });

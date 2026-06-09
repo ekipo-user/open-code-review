@@ -563,7 +563,7 @@ export type ResolveSessionResult = {
  *   1. `explicitId`         — caller passed `--session-id`
  *   2. `OCR_DASHBOARD_EXECUTION_UID` env var → `command_executions.workflow_id`.
  *      Set by the dashboard when it spawns the AI; the SessionCaptureService
- *      binds that uid to the workflow_id once the AI calls `state init`.
+ *      binds that uid to the workflow_id once the AI calls `state begin`.
  *   3. latest-active fallback — only when exactly one active session exists.
  *      With >1 active sessions and no env var, this throws an ambiguity
  *      error rather than silently picking one. Brittle auto-detect is the

@@ -116,7 +116,7 @@ close a map whose current run was never finalized.
 | `ocr state complete-map --stdin` | Finalize the map run (validate + record + transition) — only after `synthesis` |
 | `ocr state finish` | Close the session (`--abort` to abandon) |
 
-> Backward-compatible aliases `ocr state init` / `transition` / `map-complete` / `close` still work, but the atomic verbs above are preferred.
+> v2.0.0 **retired** `ocr state init` / `transition` / `round-complete` / `map-complete` / `close` — use the atomic verbs above. Calling a retired verb exits `2` with a pointer to its replacement.
 
 ### Checkpoint Rules
 

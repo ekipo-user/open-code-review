@@ -26,6 +26,7 @@ import type {
   UpdateAgentSessionParams,
 } from "./types.js";
 import { resultToRows, resultToRow } from "./result-mapper.js";
+import { commitReasonClose } from "./queries.js";
 import {
   CANCELLED_EXIT_CODE,
   ORPHAN_EXIT_CODE,
@@ -205,7 +206,7 @@ export function listAgentSessionsForWorkflow(
  * and the terminal-handoff route.
  *
  * Resolution requires an explicit `workflow_id` link. The link is
- * established at write time by the CLI's `ocr state init` reading the
+ * established at write time by the CLI's `ocr state begin` reading the
  * dashboard spawn marker file (`.ocr/data/dashboard-active-spawn.json`)
  * and binding the dashboard parent execution to the freshly-created
  * workflow id. That marker is the durable handshake — if it's present
@@ -213,7 +214,7 @@ export function listAgentSessionsForWorkflow(
  *
  * No timing derivation. No heuristic fallback. If the link is missing,
  * the workflow is genuinely unresumable (dashboard wasn't running, AI
- * ran outside the dashboard, or `state init` was never called).
+ * ran outside the dashboard, or `state begin` was never called).
  */
 export function getLatestAgentSessionWithVendorId(
   db: Database,
@@ -346,7 +347,7 @@ export function recordVendorSessionIdForExecution(
 
 /**
  * Late-links a dashboard-spawned `command_executions` row (identified by
- * its `uid`) to a workflow created later by the AI's `ocr state init`
+ * its `uid`) to a workflow created later by the AI's `ocr state begin`
  * call. Idempotent (COALESCE) — if a workflow_id is already set the
  * UPDATE is a no-op.
  *
@@ -567,26 +568,21 @@ export function sweepStaleSessions(
   }
 
   for (const row of rows) {
-    // Reason event FIRST so the close-guard trigger permits the close.
-    db.run(
-      `INSERT INTO orchestration_events
-         (session_id, event_type, phase, phase_number, round, metadata, created_at)
-       VALUES (?, 'session_auto_closed_stale', 'complete', NULL, NULL, ?, datetime('now'))`,
-      [
-        row.id,
-        JSON.stringify({
+    // One transaction per session (reason event FIRST, then the status flip)
+    // via the shared close primitive — upholds the D1 invariant. Per-session
+    // (not whole-loop) so one failing close can't roll back the others.
+    commitReasonClose(
+      db,
+      row.id,
+      {
+        event_type: "session_auto_closed_stale",
+        phase: "complete",
+        metadata: JSON.stringify({
           reason: "no events past threshold; no in-flight dependents",
           threshold_seconds: thresholdSeconds,
         }),
-      ],
-    );
-    db.run(
-      `UPDATE sessions
-         SET status = 'closed',
-             current_phase = 'complete',
-             updated_at = datetime('now')
-       WHERE id = ?`,
-      [row.id],
+      },
+      { status: "closed", current_phase: "complete" },
     );
   }
 

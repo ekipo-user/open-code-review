@@ -18,11 +18,11 @@ The dashboard SHALL allow users to execute OCR CLI commands from the browser wit
 - **AND** the `outcome` SHALL be computed from the `session_completeness` view for the linked workflow, not from `exit_code === 0` alone
 - **AND** a process that exits 0 while its workflow is not genuinely complete SHALL report `incomplete`, not `success`
 
-#### Scenario: Lifecycle mutation is delegated to the CLI
+#### Scenario: Lifecycle mutation goes through the CLI-published commit primitive
 
-- **WHEN** a dashboard action needs to change workflow lifecycle (begin, advance, complete, finish)
-- **THEN** the dashboard SHALL invoke the corresponding `ocr state` command as a child process
-- **AND** the dashboard SHALL NOT write `sessions` or `orchestration_events` directly
+- **WHEN** the dashboard's filesystem-sync reconciler needs to change workflow lifecycle (e.g. backfill-close a session it discovered on disk)
+- **THEN** it SHALL mutate lifecycle only through the CLI-published `commitReasonClose` helper (a single transactional reason-event-then-status commit) — or, equivalently, a child-process `ocr state` invocation
+- **AND** the dashboard SHALL NOT issue ad-hoc `INSERT INTO sessions`, `INSERT INTO orchestration_events`, or `UPDATE sessions SET status` outside that helper
 - **AND** the dashboard SHALL write directly only to its owned tables (process-supervision journal and UX state)
 
 #### Scenario: Available commands

@@ -410,8 +410,8 @@ See `references/map-personas/flow-analyst.md` for persona details.
     After reaching `synthesis` via `ocr state advance`, pipe the structured
     map data to `ocr state complete-map --stdin`. In one transaction the CLI
     validates the schema, writes `map-meta.json`, records the `map_completed`
-    event, and transitions to `complete`. (The older `ocr state map-complete`
-    remains for compatibility but does not transition the phase.)
+    event, and transitions to `complete`. (`ocr state map-complete` was retired
+    in v2.0.0 — `complete-map` replaces it.)
 
     ```bash
     cat <<'JSON' | ocr state complete-map --stdin

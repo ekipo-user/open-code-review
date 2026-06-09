@@ -16,6 +16,8 @@ import {
   setAgentSessionStatus,
   sweepStaleAgentSessions,
   sweepStaleSessions,
+  commitReasonClose,
+  insertEvent,
 } from "../index.js";
 import { runMigrations } from "../migrations.js";
 import type { Database } from "../engine.js";
@@ -384,6 +386,66 @@ describe("sweepStaleSessions", () => {
     expect(events[0]?.values.length).toBe(1);
     const metadata = JSON.parse(events[0]!.values[0]![0] as string);
     expect(metadata.threshold_seconds).toBe(7 * 24 * 60 * 60);
+  });
+
+  it("is idempotent — a second sweep does not re-close or duplicate the event", () => {
+    insertSession(db, {
+      id: "stale-idem",
+      branch: "feat/si",
+      workflow_type: "review",
+      session_dir: ".ocr/sessions/stale-idem",
+    });
+    db.run(
+      `INSERT INTO orchestration_events
+         (session_id, event_type, phase, phase_number, round, created_at)
+       VALUES ('stale-idem', 'session_created', 'context', 1, 1, datetime('now', '-30 days'))`,
+    );
+
+    sweepStaleSessions(db, 7 * 24 * 60 * 60);
+    const second = sweepStaleSessions(db, 7 * 24 * 60 * 60);
+
+    // Already closed → not swept again; exactly one stale event.
+    expect(second.closedSessionIds).not.toContain("stale-idem");
+    const events = db.exec(
+      `SELECT 1 FROM orchestration_events
+        WHERE session_id = 'stale-idem' AND event_type = 'session_auto_closed_stale'`,
+    );
+    expect(events[0]?.values.length).toBe(1);
+  });
+
+  it("close is atomic — if the status UPDATE fails, the reason event rolls back (D1)", () => {
+    // The transactional guarantee sweepStaleSessions/stateSync/reconcile all
+    // rely on. Force the status UPDATE to abort (a temp trigger) and assert
+    // the reason event inserted first inside the same transaction is gone.
+    insertSession(db, {
+      id: "boom",
+      branch: "feat/boom",
+      workflow_type: "review",
+      session_dir: ".ocr/sessions/boom",
+    });
+    insertEvent(db, { session_id: "boom", event_type: "session_created", round: 1 });
+    db.run(
+      `CREATE TEMP TRIGGER trg_fail_boom BEFORE UPDATE OF status ON sessions
+       WHEN NEW.id = 'boom' BEGIN SELECT RAISE(ABORT, 'boom'); END;`,
+    );
+
+    expect(() =>
+      commitReasonClose(
+        db,
+        "boom",
+        { event_type: "session_auto_closed_stale", phase: "complete" },
+        { status: "closed", current_phase: "complete" },
+      ),
+    ).toThrow();
+
+    db.run("DROP TRIGGER trg_fail_boom");
+    const orphan = db.exec(
+      `SELECT 1 FROM orchestration_events
+        WHERE session_id = 'boom' AND event_type = 'session_auto_closed_stale'`,
+    );
+    expect(orphan[0]?.values.length ?? 0).toBe(0); // rolled back — no orphan
+    const status = db.exec("SELECT status FROM sessions WHERE id = 'boom'");
+    expect(status[0]?.values[0]?.[0]).toBe("active"); // unchanged
   });
 });
 

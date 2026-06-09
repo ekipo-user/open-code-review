@@ -116,7 +116,7 @@ finalized, so "completed too soon" cannot happen.
 | `ocr state complete-round --stdin` | Phase 7: atomically finalize the round (validate + record + transition) — only after `synthesis` |
 | `ocr state finish` | Phase 8: close the session (`--abort` to abandon) |
 
-> Backward-compatible aliases `ocr state init` / `transition` / `round-complete` / `close` still work (`close` now enforces the same invariant as `finish`), but the atomic verbs above are preferred.
+> v2.0.0 **retired** `ocr state init` / `transition` / `round-complete` / `map-complete` / `close` — use the atomic verbs above. Calling a retired verb exits `2` with a pointer to its replacement.
 
 ### Checkpoint Rules
 

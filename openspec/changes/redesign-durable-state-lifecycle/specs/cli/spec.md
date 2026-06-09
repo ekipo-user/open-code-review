@@ -54,7 +54,7 @@ State lifecycle commands SHALL use a stable, documented exit-code taxonomy so th
 #### Scenario: Distinct codes per failure class
 
 - **WHEN** a state command fails
-- **THEN** it SHALL exit with `2` for usage errors, `3` for ambiguous session resolution, `4` for session-not-found, `5` for an illegal phase transition, `6` for an unmet invariant, and `7` for schema-invalid input
+- **THEN** it SHALL exit with `2` for usage errors, `3` for ambiguous session resolution, `4` for session-not-found, `5` for an illegal phase transition, `6` for an unmet invariant, `7` for schema-invalid input, and `8` for database-busy past the retry budget
 - **AND** it SHALL exit `0` only on success
 
 #### Scenario: Ambiguity is a typed refusal
@@ -63,23 +63,15 @@ State lifecycle commands SHALL use a stable, documented exit-code taxonomy so th
 - **WHEN** a state command resolves the session
 - **THEN** it SHALL exit with code `3` and name the candidate sessions
 
-## MODIFIED Requirements
+#### Scenario: Busy is the retry signal
+
+- **WHEN** a transaction surfaces `SQLITE_BUSY` past the bounded retry budget
+- **THEN** the command SHALL exit with code `8`, signalling the orchestrator to wait briefly and retry the same call
+
+## REMOVED Requirements
 
 ### Requirement: OCR State Round-Complete Command
 
-The `ocr state round-complete` command SHALL remain available as a low-level plumbing primitive that appends a `round_completed` event, but agents SHALL be directed to the atomic `ocr state complete-round` porcelain, and the plumbing command SHALL print a deprecation pointer.
+**Reason**: v2.0 is a direct cutover — the `ocr state round-complete` (and `transition` / `map-complete` / `init` / `close`) subcommands were deleted, not deprecated. The atomic `ocr state complete-round` porcelain fully replaces it with one transactional, invariant-checked commit.
 
-#### Scenario: Plumbing still appends the event
-
-- **WHEN** `ocr state round-complete --stdin` runs with valid metadata
-- **THEN** it SHALL validate the metadata, write `round-meta.json` (stdin mode), and append a `round_completed` event with derived counts and `source: "orchestrator"`
-
-#### Scenario: Deprecation pointer
-
-- **WHEN** `ocr state round-complete` runs
-- **THEN** it SHALL emit a notice directing agents to `ocr state complete-round` for atomic, invariant-checked completion
-
-#### Scenario: Counts are always derived
-
-- **WHEN** the command records completion metadata
-- **THEN** finding counts SHALL be derived from the metadata, never self-reported by the caller
+**Migration**: orchestrators call `ocr state complete-round --stdin`. Invoking a retired verb exits `2` (usage) with a notice naming its replacement; no deprecation shim remains.

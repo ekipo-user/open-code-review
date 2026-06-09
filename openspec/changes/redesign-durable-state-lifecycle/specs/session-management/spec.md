@@ -44,7 +44,7 @@ The system SHALL maintain session lifecycle in SQLite, where the `orchestration_
 #### Scenario: State stored in SQLite
 
 - **GIVEN** a new review session begins
-- **WHEN** the session is initialized via `ocr state begin` (or the deprecated `ocr state init`)
+- **WHEN** the session is initialized via `ocr state begin`
 - **THEN** the system SHALL insert a `session_created` event and the derived `sessions` projection row in one transaction
 - **AND** it SHALL NOT write `state.json`
 
