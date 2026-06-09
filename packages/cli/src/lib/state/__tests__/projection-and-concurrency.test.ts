@@ -2,12 +2,7 @@ import { mkdtempSync, rmSync, mkdirSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
 import { spawn } from "node:child_process";
-import { createRequire } from "node:module";
 import { describe, it, expect, beforeEach, afterEach } from "vitest";
-
-// Absolute path to better-sqlite3 so a spawned child can `require` it
-// regardless of its cwd.
-const betterSqlitePath = createRequire(import.meta.url).resolve("better-sqlite3");
 import {
   openDatabase,
   closeAllDatabases,
@@ -147,6 +142,13 @@ describe("cross-connection co-existence under WAL", () => {
     // commits. Meanwhile the parent issues its own transactional write, which
     // must block on the lock and then succeed (via busy_timeout + the engine's
     // SQLITE_BUSY retry) — not fail late as the pre-WAL design would.
+    // The child holds the writer lock far longer than the parent's stagger plus
+    // its own busy-retry budget (BUSY_RETRY_ATTEMPTS × BUSY_RETRY_BACKOFF_MS =
+    // 5 × 50 = 250ms), so the parent genuinely contends and must wait it out via
+    // busy_timeout — not fail fast.
+    const CHILD_HOLD_MS = 400;
+    const PARENT_STAGGER_MS = 120; // let the child take the lock first
+
     const dbPath = join(ocrDir, "data", "ocr.db");
     mkdirSync(join(ocrDir, "data"), { recursive: true });
 
@@ -160,19 +162,19 @@ describe("cross-connection co-existence under WAL", () => {
     });
 
     // Child script (CJS): hold the writer lock for ~400ms inside one txn.
+    // Uses Node's built-in node:sqlite (no native dependency to resolve).
     const childPath = join(ocrDir, "data", "lock-holder.cjs");
     writeFileSync(
       childPath,
-      `const BetterSqlite3 = require(${JSON.stringify(betterSqlitePath)});
-       const db = new BetterSqlite3(process.argv[2]);
-       db.pragma("journal_mode = WAL");
-       db.pragma("busy_timeout = 5000");
-       const tx = db.transaction(() => {
-         db.prepare("INSERT INTO command_executions (uid, command, args, started_at, workflow_id) VALUES ('u-child','review','[]',datetime('now'),'wf')").run();
-         const until = Date.now() + 400;
-         while (Date.now() < until) { /* hold the write lock */ }
-       });
-       tx.immediate();
+      `const { DatabaseSync } = require("node:sqlite");
+       const db = new DatabaseSync(process.argv[2]);
+       db.exec("PRAGMA journal_mode = WAL");
+       db.exec("PRAGMA busy_timeout = 5000");
+       db.exec("BEGIN IMMEDIATE");
+       db.prepare("INSERT INTO command_executions (uid, command, args, started_at, workflow_id) VALUES ('u-child','review','[]',datetime('now'),'wf')").run();
+       const until = Date.now() + ${CHILD_HOLD_MS};
+       while (Date.now() < until) { /* hold the write lock */ }
+       db.exec("COMMIT");
        db.close();
       `,
     );
@@ -185,7 +187,7 @@ describe("cross-connection co-existence under WAL", () => {
     });
 
     // Let the child acquire the writer lock first.
-    await new Promise((r) => setTimeout(r, 120));
+    await new Promise((r) => setTimeout(r, PARENT_STAGGER_MS));
 
     // Parent's transactional write contends with the held lock and must win
     // (after the child releases) rather than throwing.

@@ -1,7 +1,7 @@
 /**
  * DbSyncWatcher change-notifier behavior.
  *
- * Under better-sqlite3 + WAL the watcher no longer merges a separate disk
+ * Under node:sqlite + WAL the watcher no longer merges a separate disk
  * copy — it diffs the live shared database against cached snapshots and
  * emits granular Socket.IO events. These tests exercise that contract:
  * new sessions emit `session:created` + fire the auto-link hook exactly

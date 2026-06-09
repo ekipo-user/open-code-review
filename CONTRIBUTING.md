@@ -4,6 +4,9 @@ Thank you for your interest in contributing to Open Code Review! We welcome cont
 
 ## 🚀 Quick Start
 
+> **Prerequisite:** Node.js **>= 22.5** (OCR's storage engine is Node's built-in
+> `node:sqlite`). Use `nvm install 22 && nvm use 22` if needed.
+
 1. **Fork the repository** and clone your fork
 2. **Install dependencies**: `pnpm install`
 3. **Run the CLI locally**: `nx run cli:init` or `nx run cli:progress`

@@ -1,0 +1,204 @@
+# Release + install-verification gate.
+#
+# v2.1 moved the SQLite engine to Node's built-in `node:sqlite` — there is NO
+# native module, NO prebuilt binary, and NO install script. That deletes the
+# pnpm-10 install-script break that hit 2.0.0 and removes the per-platform
+# prebuild matrix entirely. What remains is the keystone the 2.0.0 release
+# skipped: install the PUBLISHED tarball (under pnpm 10 with scripts blocked,
+# and under npm) on the supported Node versions and prove `ocr doctor` + a real
+# on-disk DB command work, BEFORE promoting.
+#
+# TODOs for the maintainer before the first real run:
+#   - secrets.NPM_TOKEN (publish rights to the @open-code-review scope).
+#   - This workflow publishes whatever version is in the manifests; bump/tag to
+#     2.1.0 (e.g. `nx release version`) before triggering, or push a v2.1.0 tag.
+#   - `ocr init --tools claude` is the non-interactive form; confirm the tool id.
+
+name: Release
+
+on:
+  workflow_dispatch:
+    inputs:
+      dist-tag:
+        description: 'npm dist-tag (next = RC, latest = GA)'
+        type: choice
+        options: [next, latest]
+        default: next
+      dry-run:
+        description: 'Run verify-install only; skip publish'
+        type: boolean
+        default: false
+  push:
+    tags:
+      - 'v[0-9]+.[0-9]+.[0-9]+'
+      - 'v[0-9]+.[0-9]+.[0-9]+-rc*'
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+jobs:
+  setup:
+    name: Resolve dist-tag
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    outputs:
+      dist-tag: ${{ steps.r.outputs.dist-tag }}
+      dry-run: ${{ steps.r.outputs.dry-run }}
+    steps:
+      - id: r
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
+            echo "dist-tag=${{ inputs.dist-tag }}" >> "$GITHUB_OUTPUT"
+            echo "dry-run=${{ inputs.dry-run }}" >> "$GITHUB_OUTPUT"
+          else
+            case "${GITHUB_REF_NAME}" in
+              *-rc*) echo "dist-tag=next"   >> "$GITHUB_OUTPUT" ;;
+              *)     echo "dist-tag=latest" >> "$GITHUB_OUTPUT" ;;
+            esac
+            echo "dry-run=false" >> "$GITHUB_OUTPUT"
+          fi
+
+  # THE KEYSTONE GATE — install the to-be-published tarballs the way a real user
+  # would and prove the engine works. No native binary → the matrix is just
+  # OS × Node version. pnpm 10 runs with its DEFAULT script-blocking (we never
+  # approve a build): the condition that broke 2.0.0 is now a non-issue by
+  # construction because there is no build script.
+  verify-install:
+    name: verify ${{ matrix.os }} node${{ matrix.node }}
+    needs: [setup]
+    timeout-minutes: 20
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest, windows-latest]
+        node: [22, 24]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: ${{ matrix.node }}
+
+      # Build + pack the cli and agents (the cli runtime-requires agents). Use
+      # the repo's pinned pnpm for the build; the consumer installs below use a
+      # separate pnpm 10 / npm in a clean dir.
+      - name: Build + pack
+        id: pack
+        shell: bash
+        run: |
+          set -euo pipefail
+          corepack enable
+          corepack prepare pnpm@9.15.0 --activate
+          pnpm install --frozen-lockfile
+          pnpm nx run-many -t build --projects=cli,agents
+          out="$RUNNER_TEMP/tarballs"; mkdir -p "$out"
+          # Rewrite the cli's workspace:* dep on agents to a concrete version so
+          # a bare-tarball install resolves (npm/pnpm don't grok workspace:*).
+          VER="$(node -p "require('./packages/cli/package.json').version")-verify.${{ github.run_id }}"
+          node -e '
+            const fs=require("fs"),ver=process.argv[1];
+            for (const f of ["packages/cli/package.json","packages/agents/package.json"]) {
+              const j=JSON.parse(fs.readFileSync(f,"utf8")); j.version=ver;
+              for (const k of ["dependencies","optionalDependencies"]) if (j[k]) for (const d of Object.keys(j[k]))
+                if (d.startsWith("@open-code-review/") && String(j[k][d]).startsWith("workspace:")) j[k][d]=ver;
+              fs.writeFileSync(f, JSON.stringify(j,null,2)+"\n");
+            }' "$VER"
+          ( cd packages/agents && npm pack --pack-destination "$out" )
+          ( cd packages/cli && npm pack --pack-destination "$out" )
+          echo "ver=$VER" >> "$GITHUB_OUTPUT"
+          echo "out=$out" >> "$GITHUB_OUTPUT"
+
+      - name: Install (pnpm 10 scripts-blocked + npm) and verify the engine
+        shell: bash
+        env:
+          VER: ${{ steps.pack.outputs.ver }}
+          OUT: ${{ steps.pack.outputs.out }}
+        run: |
+          set -euo pipefail
+
+          # SINGLE SOURCE for the consumer package.json. Resolve the cli's
+          # agents@<ver> dep to the LOCAL agents tarball via an override (that
+          # version isn't on the registry yet — passing both tarballs makes the
+          # package manager fetch agents from npm and fail). The override lives
+          # under `pnpm.overrides` for pnpm, top-level `overrides` for npm.
+          write_manifest() {  # $1 = pnpm | npm
+            PM="$1" node -e '
+              const fs = require("fs"), o = process.env.OUT, v = process.env.VER, pm = process.env.PM;
+              const m = { name: "ocr-verify", version: "1.0.0", private: true,
+                dependencies: { "@open-code-review/cli": `file:${o}/open-code-review-cli-${v}.tgz` } };
+              const ov = { "@open-code-review/agents": `file:${o}/open-code-review-agents-${v}.tgz` };
+              if (pm === "pnpm") m.pnpm = { overrides: ov }; else m.overrides = ov;
+              fs.writeFileSync("package.json", JSON.stringify(m, null, 2));
+            '
+          }
+
+          # SINGLE SOURCE for verification. $1 = app dir. `doctor --probe-write`
+          # exercises an on-disk WAL transaction round-trip (the journaled write
+          # path), not just engine open. The cli's node:sqlite engine has NO
+          # build script, so pnpm 10's default script-blocking is a non-issue.
+          verify() {
+            app="$1"; bin="$app/node_modules/.bin/ocr"
+            # --engine-only: this dir is a bare install (no .ocr/, no AI CLI, no
+            # gh), so a FULL doctor would exit 1 on those expected gaps before
+            # reaching the engine — and abort the gate under `set -o pipefail`.
+            # Engine-only checks just the engine + write probe and exits on that.
+            "$bin" doctor --engine-only --probe-write 2>&1 | tee "$app/doctor.out"
+            grep -q "node:sqlite (SQLite" "$app/doctor.out"
+            grep -q "write probe (on-disk" "$app/doctor.out"
+            ! grep -q "unavailable" "$app/doctor.out"
+            proj="$app/proj"; mkdir -p "$proj"; cd "$proj"
+            git init -q .; git config user.email ci@ocr.dev; git config user.name ci
+            git commit --allow-empty -qm init
+            "$bin" init --tools claude
+            mkdir -p .ocr/sessions/ci
+            "$bin" state begin --session-id ci --branch x --workflow-type review --session-dir .ocr/sessions/ci
+            "$bin" state status --json
+          }
+
+          corepack prepare pnpm@10 --activate
+          app="$RUNNER_TEMP/consumer-pnpm"; rm -rf "$app"; mkdir -p "$app"; cd "$app"
+          write_manifest pnpm; pnpm install --ignore-workspace; verify "$app"
+
+          app="$RUNNER_TEMP/consumer-npm"; rm -rf "$app"; mkdir -p "$app"; cd "$app"
+          write_manifest npm; npm install; verify "$app"
+
+  publish:
+    name: publish (${{ needs.setup.outputs.dist-tag }})
+    needs: [setup, verify-install]
+    if: ${{ needs.setup.outputs.dry-run != 'true' }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    permissions:
+      contents: write   # Nx creates the GitHub release/changelog
+      id-token: write   # npm provenance, if enabled later
+    steps:
+      - uses: actions/checkout@v4
+        with: { fetch-depth: 0 }
+      - uses: pnpm/action-setup@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: pnpm
+          registry-url: 'https://registry.npmjs.org'
+      - run: pnpm install --frozen-lockfile
+      - run: pnpm nx run-many -t build
+      - name: nx release publish
+        env:
+          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: pnpm nx release publish --tag "${{ needs.setup.outputs.dist-tag }}"
+      - name: Registry drift guard
+        shell: bash
+        run: |
+          set -euo pipefail
+          VER="$(node -p "require('./packages/cli/package.json').version")"
+          for pkg in @open-code-review/cli @open-code-review/agents; do
+            npm view "$pkg@$VER" version >/dev/null 2>&1 && echo "  ok $pkg@$VER" \
+              || { echo "  MISSING $pkg@$VER" >&2; exit 1; }
+          done

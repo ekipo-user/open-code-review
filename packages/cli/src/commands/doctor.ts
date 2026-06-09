@@ -9,12 +9,67 @@ import {
   printDepChecks,
   printCapabilities,
 } from "../lib/deps.js";
-import { probeEngine } from "../lib/db/index.js";
+import { probeEngine, probeWrite } from "../lib/db/index.js";
+
+/**
+ * Print the Storage Engine section and return whether the engine is healthy.
+ * Shared by the full doctor run and `--engine-only` (the release install gate),
+ * so the engine verdict is computed in exactly one place.
+ */
+function printStorageEngine(probeWriteEnabled: boolean): boolean {
+  console.log();
+  console.log(chalk.bold("  Storage Engine"));
+  console.log();
+  const engine = probeEngine();
+  if (!engine.ok) {
+    console.log(`    ${chalk.red("✗")} node:sqlite unavailable`);
+    console.log(`      ${chalk.dim(engine.error)}`);
+    console.log(
+      `      ${chalk.dim(
+        "OCR requires Node >= 22.5 (node:sqlite). Upgrade Node, then re-run `ocr doctor`.",
+      )}`,
+    );
+    return false;
+  }
+  console.log(
+    `    ${chalk.green("✓")} node:sqlite (SQLite ${engine.version}, WAL)`,
+  );
+  if (probeWriteEnabled) {
+    const write = probeWrite();
+    if (!write.ok) {
+      console.log(`    ${chalk.red("✗")} write probe failed`);
+      console.log(`      ${chalk.dim(write.error)}`);
+      return false;
+    }
+    console.log(
+      `    ${chalk.green("✓")} write probe (on-disk WAL transaction round-trip)`,
+    );
+  }
+  return true;
+}
 
 export const doctorCommand = new Command("doctor")
   .description("Check OCR installation and verify all dependencies")
-  .action(() => {
+  .option(
+    "--probe-write",
+    "additionally exercise an on-disk WAL transaction round-trip (used by the release install gate)",
+  )
+  .option(
+    "--engine-only",
+    "check ONLY the storage engine and exit on its result — skips project/tool checks (used by the release install gate, which runs from a non-initialized dir with no AI tools)",
+  )
+  .action((options: { probeWrite?: boolean; engineOnly?: boolean }) => {
     printHeader();
+
+    // Engine-only mode: the install gate runs from a clean consumer install
+    // dir (no `.ocr/`, no AI CLI, no gh). A full doctor run would exit 1 on
+    // those expected gaps before reaching the engine. Here we verify only the
+    // engine and exit on THAT, so the gate's assertions are meaningful.
+    if (options.engineOnly) {
+      const ok = printStorageEngine(options.probeWrite ?? false);
+      console.log();
+      process.exit(ok ? 0 : 1);
+    }
 
     const targetDir = process.cwd();
     let hasIssues = false;
@@ -67,28 +122,10 @@ export const doctorCommand = new Command("doctor")
     }
 
     // ── Storage engine ──
-    // The SQLite engine (better-sqlite3) is a native module. Probe it so a
-    // missing/incompatible prebuilt binary surfaces as a clear diagnostic
-    // rather than an opaque crash on first DB access.
-    console.log();
-    console.log(chalk.bold("  Storage Engine"));
-    console.log();
-    const engine = probeEngine();
-    if (engine.ok) {
-      console.log(
-        `    ${chalk.green("✓")} better-sqlite3 (SQLite ${engine.version}, WAL)`,
-      );
-    } else {
+    // The SQLite engine is Node's built-in `node:sqlite` (no native module).
+    // Probe it so a too-old runtime or a disabled built-in surfaces clearly.
+    if (!printStorageEngine(options.probeWrite ?? false)) {
       hasIssues = true;
-      console.log(
-        `    ${chalk.red("✗")} better-sqlite3 failed to load`,
-      );
-      console.log(`      ${chalk.dim(engine.error)}`);
-      console.log(
-        `      ${chalk.dim(
-          "Reinstall the CLI; if it persists your platform may need build tools (python3 + a C++ toolchain) or lacks a prebuilt binary.",
-        )}`,
-      );
     }
 
     // ── Capabilities ──

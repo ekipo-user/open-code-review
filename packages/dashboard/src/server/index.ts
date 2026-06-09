@@ -167,7 +167,7 @@ export async function startServer(options: StartServerOptions = {}): Promise<voi
 
   // ── WAL hygiene (best-effort, before opening the DB) ──
   // Best-effort WAL checkpoint before opening the shared connection —
-  // reclaims any .db-wal left by another better-sqlite3 client.
+  // reclaims any .db-wal left by another node:sqlite client.
   const dbPathForCheckpoint = join(ocrDir, 'data', 'ocr.db')
   const walResult = walCheckpointTruncate(dbPathForCheckpoint)
   if (walResult === 'checkpointed') {
@@ -438,7 +438,7 @@ export async function startServer(options: StartServerOptions = {}): Promise<voi
   // ── DB sync watcher ──
   // Watches .ocr/data/ocr.db for external writes (from CLI `ocr state` commands)
   // and emits Socket.IO notifications for sessions + orchestration_events
-  // changes. The DB is shared on disk (better-sqlite3 + WAL) — the watcher
+  // changes. The DB is shared on disk (node:sqlite + WAL) — the watcher
   // diffs the live connection against cached snapshots; it does not merge.
 
   const dbFilePath = join(ocrDir, 'data', 'ocr.db')

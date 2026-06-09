@@ -1,13 +1,21 @@
 /**
  * Shared SQLite database access module for OCR.
  *
- * Uses `better-sqlite3` (native, on-disk, WAL) for durable, cross-process
+ * Uses Node's built-in `node:sqlite` (on-disk, WAL) for durable, cross-process
  * SQLite access. The database lives at `.ocr/data/ocr.db` within a project.
  * Engine specifics live in `./engine.ts`; this module owns connection
  * lifecycle, migrations, and re-exports.
  */
 
-import { existsSync, mkdirSync, copyFileSync, statSync } from "node:fs";
+import {
+  existsSync,
+  mkdirSync,
+  copyFileSync,
+  statSync,
+  mkdtempSync,
+  rmSync,
+} from "node:fs";
+import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import { openEngine, type Database } from "./engine.js";
 import { runMigrations, getSchemaVersion } from "./migrations.js";
@@ -156,6 +164,8 @@ export { runMigrations, MIGRATIONS } from "./migrations.js";
 
 export { resultToRows, resultToRow } from "./result-mapper.js";
 
+// `Database` carries no `raw` handle (see engine.ts) — the published
+// `@open-code-review/cli/db` contract cannot leak the node:sqlite type.
 export type { Database, ExecResult, ExecResultRow, SqlValue, BindParams } from "./engine.js";
 export { probeEngine, isBusyError } from "./engine.js";
 export { reconcileLegacyState } from "./reconcile.js";
@@ -187,7 +197,7 @@ export type {
 const connections = new Map<string, Database>();
 
 /**
- * Opens or creates a SQLite database at the given path via better-sqlite3.
+ * Opens or creates a SQLite database at the given path via node:sqlite.
  * Connections are cached by path for reuse within a process. The directory
  * is created on demand so callers don't have to pre-create `data/`.
  */
@@ -271,7 +281,7 @@ export async function ensureDatabase(ocrDir: string): Promise<Database> {
 
 /**
  * Checkpoint-truncate the on-disk write-ahead log through a native
- * better-sqlite3 connection, so the main `.db` file stays current and the
+ * node:sqlite connection, so the main `.db` file stays current and the
  * `.db-wal` sidecar doesn't grow without bound.
  *
  * Reuses the cached connection when one exists; otherwise opens a transient
@@ -308,9 +318,11 @@ export function walCheckpointTruncate(dbPath: string): WalCheckpointResult {
     return "failed";
   } finally {
     try {
-      transient?.raw.close();
+      // Let the adapter own its close protocol (idempotent + pre-close
+      // checkpoint) rather than reaching past it to `raw.close()`.
+      transient?.close();
     } catch {
-      // already closed / never opened
+      // best-effort hygiene — never throw from the checkpoint helper
     }
   }
 }
@@ -333,5 +345,56 @@ export function closeAllDatabases(): void {
   for (const [path, db] of connections) {
     db.close();
     connections.delete(path);
+  }
+}
+
+/**
+ * Deeper engine health check than {@link probeEngine}: exercises a real
+ * **on-disk WAL transaction round-trip** — `openEngine` + `BEGIN IMMEDIATE` +
+ * a write + a read-back — in a throwaway temp database. `probeEngine` only
+ * proves the engine *opens* (`:memory:`); this proves the journaled write path
+ * (`transaction()`) the install gate relies on actually works. Used by
+ * `ocr doctor --probe-write`.
+ */
+export function probeWrite(): { ok: true } | { ok: false; error: string } {
+  let dir: string | undefined;
+  try {
+    dir = mkdtempSync(join(tmpdir(), "ocr-probe-"));
+    const db = openEngine(join(dir, "probe.db"));
+    try {
+      db.run("CREATE TABLE _probe_write (id INTEGER PRIMARY KEY, v TEXT)");
+      db.transaction(() => {
+        db.run("INSERT INTO _probe_write (v) VALUES (?)", ["written-in-txn"]);
+      });
+      const value = db.exec("SELECT v FROM _probe_write")[0]?.values[0]?.[0];
+      if (value !== "written-in-txn") {
+        return { ok: false, error: `unexpected probe value: ${String(value)}` };
+      }
+      return { ok: true };
+    } finally {
+      db.close();
+    }
+  } catch (e) {
+    return { ok: false, error: e instanceof Error ? e.message : String(e) };
+  } finally {
+    if (dir) rmDirBestEffort(dir);
+  }
+}
+
+/**
+ * Remove a temp dir, retrying a few times with a short backoff: on Windows the
+ * OS can hold the just-closed `node:sqlite` file handle briefly, so a single
+ * `rmSync` can race. Best-effort — never throws (ephemeral CI runners tolerate
+ * a residual dir, but we try not to leak one).
+ */
+function rmDirBestEffort(dir: string): void {
+  for (let attempt = 0; attempt < 3; attempt++) {
+    try {
+      rmSync(dir, { recursive: true, force: true });
+      return;
+    } catch {
+      if (attempt === 2) return;
+      Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 10);
+    }
   }
 }
