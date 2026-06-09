@@ -260,8 +260,8 @@ export async function ensureDatabase(ocrDir: string): Promise<Database> {
 
 /**
  * Checkpoint-truncate the on-disk write-ahead log through a native
- * better-sqlite3 connection, keeping the main `.db` file current (e.g. so an
- * older sql.js build could still read it after a downgrade).
+ * better-sqlite3 connection, so the main `.db` file stays current and the
+ * `.db-wal` sidecar doesn't grow without bound.
  *
  * Reuses the cached connection when one exists; otherwise opens a transient
  * one. Never throws — callers treat this as best-effort hygiene.

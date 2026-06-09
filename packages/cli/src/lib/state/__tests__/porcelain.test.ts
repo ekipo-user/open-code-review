@@ -145,7 +145,10 @@ describe("stateStatus", () => {
     const mid = await stateStatus(ocrDir, "st");
     expect(mid.completeness_state).toBe("open_no_artifact");
     expect(mid.has_terminal_artifact).toBe(true);
-    expect(mid.next_action).toContain("finish");
+    // Branch on next_action_kind (typed), not the prose next_action — the
+    // dedicated test below pins it. Substring-matching prose is the contract
+    // SF14 eliminated.
+    expect(mid.next_action_kind).toBe("finish");
     await stateClose({ sessionId: "st", ocrDir });
     expect((await stateStatus(ocrDir, "st")).completeness_state).toBe("complete");
   });

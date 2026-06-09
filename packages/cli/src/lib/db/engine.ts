@@ -131,21 +131,15 @@ class BetterSqliteAdapter implements Database {
     // absorbs those transient cases; we re-throw on any non-busy error and on
     // the final attempt so genuine failures still propagate.
     const tx = this.raw.transaction(fn);
-    let lastErr: unknown;
-    for (let attempt = 0; attempt < BUSY_RETRY_ATTEMPTS; attempt++) {
+    for (let attempt = 0; ; attempt++) {
       try {
         return tx.immediate();
       } catch (e) {
-        if (!isBusyError(e) || attempt === BUSY_RETRY_ATTEMPTS - 1) {
-          throw e;
-        }
-        lastErr = e;
+        // Re-throw on any non-busy error, or once the retry budget is spent.
+        if (!isBusyError(e) || attempt >= BUSY_RETRY_ATTEMPTS - 1) throw e;
         sleepSync(BUSY_RETRY_BACKOFF_MS);
       }
     }
-    // Unreachable — the loop either returns or throws — but satisfies the
-    // type checker that a value (or throw) is always produced.
-    throw lastErr;
   }
 
   pragma(source: string): unknown {

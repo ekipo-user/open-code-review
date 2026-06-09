@@ -21,7 +21,7 @@ import { openEngine } from "../../db/engine.js";
 import {
   stateInit,
   stateTransition,
-  stateRoundComplete,
+  stateCompleteRound,
   stateClose,
   rebuildSessionProjection,
 } from "../index.js";
@@ -61,7 +61,10 @@ describe("event-sourced projection", () => {
     ] as const) {
       await stateTransition({ sessionId: "proj-1", phase, phaseNumber: n, ocrDir });
     }
-    await stateRoundComplete({
+    // A completed round must exist before the projection assertion. The atomic
+    // finalize requires the workflow to have reached synthesis (proof of work)
+    // — the transitions above walk it there — and then transitions to complete.
+    await stateCompleteRound({
       source: "stdin",
       ocrDir,
       sessionId: "proj-1",

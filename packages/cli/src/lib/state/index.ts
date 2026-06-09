@@ -414,6 +414,9 @@ export async function stateClose(params: CloseParams): Promise<void> {
     );
   }
 
+  // Machine-written audit note on the cascaded command_executions rows. This
+  // is intentionally distinct from the dashboard's user-facing "Superseded"
+  // tooltip (command-history.tsx) — different audience, different wording.
   const note = "closed by parent workflow close";
   db.transaction(() => {
     if (abort) {
@@ -684,138 +687,6 @@ export async function resolveActiveSession(
     sessionDir: result.session_dir,
     decision: result.decision,
   };
-}
-
-// ── Round completion ──
-
-/**
- * Import structured review round data into SQLite.
- *
- * Accepts data from either a file path (`source: "file"`) or a raw JSON
- * string (`source: "stdin"`). Validates the schema, computes derived counts,
- * and writes a `round_completed` orchestration event.
- *
- * When `source` is `"stdin"`, the CLI also writes `round-meta.json` to the
- * correct session round directory — making the CLI the sole writer of all
- * stateful artifacts.
- */
-export async function stateRoundComplete(
-  params: RoundCompleteParams,
-): Promise<RoundCompleteResult> {
-  const { ocrDir } = params;
-  const db = await ensureDatabase(ocrDir);
-
-  // ── 1. Read and parse JSON ──
-  const rawJsonString = readJsonFromSource(params);
-  const label = params.source === "file" ? params.filePath : "stdin";
-  const raw = parseRawJson(rawJsonString, label);
-
-  // ── 2. Validate and compute counts ──
-  const meta = validateRoundMeta(raw);
-  const counts = computeRoundCounts(meta);
-
-  // ── 3. Resolve session and round ──
-  const session = resolveSession(db, params.sessionId);
-  const roundNumber = params.round ?? session.current_round;
-
-  // ── 4. Write round-meta.json when source is stdin ──
-  let metaPath: string | undefined;
-  if (params.source === "stdin") {
-    const roundDir = join(session.session_dir, "rounds", `round-${roundNumber}`);
-    mkdirSync(roundDir, { recursive: true });
-    metaPath = join(roundDir, "round-meta.json");
-    writeFileSync(metaPath, JSON.stringify(meta, null, 2));
-  }
-
-  // ── 5+6. Write the round_completed event and advance current_round
-  // atomically, so a reader never sees the event without the round bump
-  // (or vice versa).
-  db.transaction(() => {
-    insertEvent(db, {
-      session_id: session.id,
-      event_type: "round_completed",
-      phase: "synthesis",
-      phase_number: 7,
-      round: roundNumber,
-      metadata: JSON.stringify({
-        verdict: meta.verdict,
-        blocker_count: counts.blockerCount,
-        should_fix_count: counts.shouldFixCount,
-        suggestion_count: counts.suggestionCount,
-        reviewer_count: counts.reviewerCount,
-        total_finding_count: counts.totalFindingCount,
-        source: "orchestrator",
-      }),
-    });
-
-    if (roundNumber >= session.current_round) {
-      updateSession(db, session.id, { current_round: roundNumber });
-    }
-  });
-
-  return { sessionId: session.id, round: roundNumber, metaPath, schema_version: 1 };
-}
-
-// ── Map completion ──
-
-/**
- * Import structured map run data into SQLite.
- *
- * Accepts data from either a file path (`source: "file"`) or a raw JSON
- * string (`source: "stdin"`). Validates the schema, computes derived counts,
- * and writes a `map_completed` orchestration event.
- *
- * When `source` is `"stdin"`, the CLI also writes `map-meta.json` to the
- * correct session map run directory — making the CLI the sole writer of all
- * stateful artifacts.
- */
-export async function stateMapComplete(
-  params: MapCompleteParams,
-): Promise<MapCompleteResult> {
-  const { ocrDir } = params;
-  const db = await ensureDatabase(ocrDir);
-
-  // ── 1. Read and parse JSON ──
-  const rawJsonString = readJsonFromSource(params);
-  const label = params.source === "file" ? params.filePath : "stdin";
-  const raw = parseRawJson(rawJsonString, label);
-
-  // ── 2. Validate and compute counts ──
-  const meta = validateMapMeta(raw);
-  const counts = computeMapCounts(meta);
-
-  // ── 3. Resolve session and map run ──
-  const session = resolveSession(db, params.sessionId);
-  const mapRunNumber = params.mapRun ?? session.current_map_run;
-
-  // ── 4. Write map-meta.json when source is stdin ──
-  let metaPath: string | undefined;
-  if (params.source === "stdin") {
-    const runDir = join(session.session_dir, "map", "runs", `run-${mapRunNumber}`);
-    mkdirSync(runDir, { recursive: true });
-    metaPath = join(runDir, "map-meta.json");
-    writeFileSync(metaPath, JSON.stringify(meta, null, 2));
-  }
-
-  // ── 5. Write orchestration event with all data in metadata ──
-  // Note: `round` column stores the map run number for map_completed events.
-  // This is an intentional schema overload to avoid a separate column.
-  db.transaction(() => {
-    insertEvent(db, {
-      session_id: session.id,
-      event_type: "map_completed",
-      phase: "synthesis",
-      phase_number: 5,
-      round: mapRunNumber,
-      metadata: JSON.stringify({
-        section_count: counts.sectionCount,
-        file_count: counts.fileCount,
-        source: "orchestrator",
-      }),
-    });
-  });
-
-  return { sessionId: session.id, mapRun: mapRunNumber, metaPath, schema_version: 1 };
 }
 
 // ── Atomic porcelain (the misuse-proof agent API) ──
@@ -1108,6 +979,11 @@ export type StatusResult = {
   has_terminal_artifact: boolean;
   marked_closed: boolean;
   dependents_settled: boolean;
+  /**
+   * Human-readable elaboration of `next_action_kind`. Wording is NOT stable
+   * across versions — orchestrators MUST branch on `next_action_kind`, never
+   * substring-match this prose.
+   */
   next_action: string;
   next_action_kind: NextActionKind;
 };

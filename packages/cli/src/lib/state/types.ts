@@ -122,6 +122,12 @@ export type RoundCompleteParams =
 export type RoundCompleteResult = {
   sessionId: string;
   round: number;
+  /**
+   * Canonical on-disk location of `round-meta.json` for this round. It is the
+   * path the CLI owns — not a guarantee the file currently exists (a caller
+   * that deletes it between an initial call and an idempotent retry will get
+   * the same canonical path back).
+   */
   metaPath?: string;
   /** Result envelope version so consumers can branch on schema changes. */
   schema_version: number;

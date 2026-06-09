@@ -854,3 +854,92 @@ describe("ocr review --resume", () => {
   });
 });
 
+describe("ocr state complete-round --stdin (async drainer, multi-KB payload)", () => {
+  it("drains a ~12 KB piped RoundMeta in full and lands round-meta.json on disk", async () => {
+    const project = tracked(createInitializedProject());
+    const sessionId = "2026-06-09-feat-big-stdin";
+
+    // Begin a review workflow and walk it all the way to synthesis — the
+    // atomic complete-round refuses to finalize before proof-of-work.
+    const begin = await spawnCli(
+      [
+        "state",
+        "begin",
+        "--session-id",
+        sessionId,
+        "--branch",
+        "feat/big-stdin",
+        "--workflow-type",
+        "review",
+        "--json",
+      ],
+      { cwd: project.dir },
+    );
+    expect(begin.exitCode).toBe(0);
+
+    for (const phase of [
+      "change-context",
+      "analysis",
+      "reviews",
+      "aggregation",
+      "discourse",
+      "synthesis",
+    ]) {
+      const adv = await spawnCli(
+        ["state", "advance", "--session-id", sessionId, "--phase", phase],
+        { cwd: project.dir },
+      );
+      expect(adv.exitCode).toBe(0);
+    }
+
+    // Build a multi-KB RoundMeta: ~50 findings of ~200 chars each (~12 KB
+    // serialized). This is the regression guard for the async stdin drainer —
+    // the old readFileSync(0) could return only the first chunk of a pipe this
+    // size, silently truncating the payload before validation.
+    const findings = Array.from({ length: 50 }, (_, i) => ({
+      title: `Finding ${i} ${"x".repeat(40)}`,
+      category: "should_fix",
+      severity: "medium",
+      file_path: `src/module-${i}.ts`,
+      line_start: i + 1,
+      line_end: i + 10,
+      // ~200-char summary so the whole document comfortably exceeds 4 KB.
+      summary: `Detailed explanation number ${i}: ${"detail ".repeat(25)}`,
+    }));
+    const roundMeta = {
+      schema_version: 1,
+      verdict: "REQUEST CHANGES",
+      reviewers: [{ type: "principal", instance: 1, findings }],
+    };
+    const payload = JSON.stringify(roundMeta);
+    // Sanity: the payload is genuinely multi-KB (well past a single read chunk).
+    expect(payload.length).toBeGreaterThan(8_000);
+
+    const complete = await spawnCli(
+      ["state", "complete-round", "--stdin", "--session-id", sessionId, "--json"],
+      { cwd: project.dir, stdin: payload },
+    );
+    expect(complete.exitCode).toBe(0);
+
+    // round-meta.json must have landed on disk with the FULL payload intact
+    // (all 50 findings) — proving nothing was truncated mid-pipe.
+    const metaPath = resolve(
+      project.dir,
+      ".ocr",
+      "sessions",
+      sessionId,
+      "rounds",
+      "round-1",
+      "round-meta.json",
+    );
+    const written = JSON.parse(readFileSync(metaPath, "utf-8")) as {
+      schema_version: number;
+      verdict: string;
+      reviewers: Array<{ findings: unknown[] }>;
+    };
+    expect(written.schema_version).toBe(1);
+    expect(written.verdict).toBe("REQUEST CHANGES");
+    expect(written.reviewers[0]?.findings).toHaveLength(50);
+  });
+});
+
