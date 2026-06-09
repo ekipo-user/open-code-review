@@ -123,11 +123,13 @@ jobs:
           set -euo pipefail
           corepack prepare pnpm@10 --activate
           app="$RUNNER_TEMP/consumer-pnpm"; rm -rf "$app"; mkdir -p "$app"; cd "$app"
-          npm init -y >/dev/null
-          # No build scripts to approve — the engine is built into Node.
-          pnpm add --ignore-workspace \
-            "$OUT/open-code-review-cli-${VER}.tgz" \
-            "$OUT/open-code-review-agents-${VER}.tgz"
+          # Install the cli tarball and resolve its `agents@<ver>` dep to the
+          # LOCAL agents tarball via a pnpm override (that version is not on the
+          # registry yet — passing both tarballs would make pnpm fetch agents
+          # from npm and fail). The cli's node:sqlite engine has NO build script,
+          # so pnpm 10's default script-blocking is a non-issue — the point.
+          node -e 'const fs=require("fs"),o=process.env.OUT,v=process.env.VER;fs.writeFileSync("package.json",JSON.stringify({name:"ocr-verify",version:"1.0.0",private:true,dependencies:{"@open-code-review/cli":`file:${o}/open-code-review-cli-${v}.tgz`},pnpm:{overrides:{"@open-code-review/agents":`file:${o}/open-code-review-agents-${v}.tgz`}}},null,2))'
+          pnpm install --ignore-workspace
           node_modules/.bin/ocr doctor 2>&1 | tee doctor.out
           grep -q "node:sqlite (SQLite" doctor.out
           ! grep -q "unavailable" doctor.out
@@ -147,8 +149,9 @@ jobs:
         run: |
           set -euo pipefail
           app="$RUNNER_TEMP/consumer-npm"; rm -rf "$app"; mkdir -p "$app"; cd "$app"
-          npm init -y >/dev/null
-          npm i "$OUT/open-code-review-cli-${VER}.tgz" "$OUT/open-code-review-agents-${VER}.tgz"
+          # Same agents-resolution override, npm's native `overrides` form.
+          node -e 'const fs=require("fs"),o=process.env.OUT,v=process.env.VER;fs.writeFileSync("package.json",JSON.stringify({name:"ocr-verify-npm",version:"1.0.0",private:true,dependencies:{"@open-code-review/cli":`file:${o}/open-code-review-cli-${v}.tgz`},overrides:{"@open-code-review/agents":`file:${o}/open-code-review-agents-${v}.tgz`}},null,2))'
+          npm install
           node_modules/.bin/ocr doctor 2>&1 | tee doctor.out
           grep -q "node:sqlite (SQLite" doctor.out
           ! grep -q "unavailable" doctor.out
