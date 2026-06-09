@@ -49,3 +49,12 @@
       S3 `walCheckpointTruncate` uses `transient.close()`.
 - [x] 8.7 SF7 test-based seam guard (node:sqlite only in engine.ts; no better-sqlite3 imports).
 - [x] 8.8 SF8a de-dup release.yml consumer-manifest/verify; S2 named timings + comment notes.
+
+## 9. Round-2 review (PR #34) — addressed
+- [x] 9.1 SF1: `doctor --engine-only` checks only the engine + exits on that, so the install gate (run from a
+      bare consumer dir with no `.ocr/`/AI CLI) no longer exits 1 before its assertions under `set -o pipefail`;
+      gate calls `doctor --engine-only --probe-write`; cli-e2e pins exit 0 from a non-OCR dir.
+- [x] 9.2 S1: `proposal.md` "Affected specs" now lists `sqlite-state` + `cli`.
+- [x] 9.3 S3: seam-guard strips comments before scanning (no false-positive on a comment that mentions an import).
+- [x] 9.4 S4: `probeWrite` temp cleanup retries (Windows can hold the just-closed handle briefly).
+- [ ] 9.5 S2 (follow-up, deferred): extract the release.yml manifest/verify into a checked-in TypeScript script.

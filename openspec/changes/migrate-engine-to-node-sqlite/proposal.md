@@ -42,8 +42,10 @@ becomes **structurally impossible**.
 
 ## Impact
 
-- **Affected specs:** `cli` (native engine distribution → built-in `node:sqlite`, Node ≥22.5, install-verified
-  under npm + pnpm 10 in CI).
+- **Affected specs:** `sqlite-state` (the engine: built-in `node:sqlite` + WAL, `BEGIN IMMEDIATE`,
+  cross-process serialization, busy-retry; retires the `sql.js`/`DbSyncWatcher` merge-before-write language) and
+  `cli` (distribution + the Node ≥22.5 runtime floor: installs with no native build under any package manager,
+  a clear too-old-Node guard, no warning leak, install-verified under npm + pnpm 10 in CI).
 - **Affected code:** `packages/cli/src/lib/db/engine.ts` (rewrite), `packages/cli/src/lib/runtime-guard.ts`
   (new) + `src/index.ts` (imports it first), `packages/cli/src/commands/doctor.ts`,
   `packages/cli/src/lib/db/index.ts`, `packages/cli/package.json` + root `package.json` (engines, deps),
