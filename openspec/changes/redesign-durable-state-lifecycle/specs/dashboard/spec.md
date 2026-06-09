@@ -75,3 +75,16 @@ The dashboard periodically reclaims `command_executions` rows whose supervised p
 - **WHEN** the sweep confirms that process dead and orphans it
 - **THEN** in the same transaction it SHALL cascade-terminate that workflow's other in-flight `command_executions` rows with exit `-4` (cascade), since the parent's confirmed death is positive evidence its in-process children are gone — so reviewer instances do not linger as `stalled` and the session-level sweep is not wedged by them
 - **AND** orphaning a `session-instance` row SHALL NOT cascade (an instance never owns a workflow's lifecycle), so a live sibling instance is never taken down
+
+#### Scenario: The cascade reclaims processes, not the session's resumability (deliberate asymmetry)
+
+- **GIVEN** a supervisor was orphaned and its dependents cascade-closed
+- **THEN** the cascade SHALL affect only `command_executions` (process supervision); it SHALL NOT itself close the workflow's `sessions` row
+- **AND** the `sessions` row remains `active` so the in-progress round stays resumable (re-running the workflow resumes it; `ocr state finish --abort` abandons it); its lifecycle is reclaimed at the coarse 7-day session-level sweep if neither happens
+- **AND** the dashboard's sweep log line SHALL report how many rows were cascade-closed
+
+#### Scenario: A recycled PID that reads alive leaves the row in-flight (deliberate false-negative)
+
+- **GIVEN** a supervisor died but the OS recycled its PID onto an unrelated live process within the 24h window
+- **WHEN** the sweep probes the PID and finds it alive
+- **THEN** the sweep SHALL decline to orphan the row (it cannot prove the original process is dead) — leaning toward leaving an alive-named row in-flight rather than risk a false terminal verdict; the row is reclaimed at the coarse session-level sweep
