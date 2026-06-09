@@ -17,7 +17,7 @@
 
 ## Quick Start
 
-**Prerequisites:** Node.js >= 20, Git, and an [AI coding assistant](#supported-ai-tools).
+**Prerequisites:** Node.js >= 22.5, Git, and an [AI coding assistant](#supported-ai-tools).
 
 ```bash
 # 1. Install the CLI globally
@@ -32,6 +32,10 @@ ocr dashboard
 ```
 
 Your browser will open the OCR dashboard — you're ready to run your first review.
+
+> **Any package manager works.** From **v2.1** OCR uses Node's built-in SQLite (`node:sqlite`) — there's
+> no native module to compile, so `npm i -g`, `pnpm add -g`, and `yarn global add` all install cleanly
+> (including under pnpm 10+, which blocks dependency build scripts). It just needs **Node >= 22.5**.
 
 `ocr init` detects your installed AI tools (Claude Code, Cursor, Windsurf, and [11 more](#supported-ai-tools)) and configures each one automatically. Then open the dashboard to run a review, browse results, and manage your workflow from the browser.
 
@@ -589,23 +593,23 @@ ocr update --inject      # AGENTS.md/CLAUDE.md only
 
 ## Requirements
 
-- **Node.js** >= 20.0.0
+- **Node.js** >= 22.5.0
 - **Git** — For diff analysis
 - **An AI coding assistant** — Claude Code, Cursor, Windsurf, or [any supported tool](#supported-ai-tools)
 - **GitHub CLI** (`gh`) — Optional, for posting reviews to PRs
 
-> **v2.0 — native SQLite engine**: OCR now stores state with `better-sqlite3`
-> (a native module) for durable, concurrent-safe writes. Prebuilt binaries
-> ship for macOS, Linux, and Windows (x64/arm64) on supported Node versions,
-> so `npm i -g` just works on common platforms. On an unusual platform without
-> a prebuilt binary, install needs a C++ toolchain + Python 3. Run
-> `ocr doctor` — it verifies the engine loaded.
+> **v2.1 — built-in SQLite engine**: OCR stores state with Node's built-in
+> SQLite (`node:sqlite`, on-disk + WAL) for durable, concurrent-safe writes —
+> **no native module, no prebuilt binary, no install script.** It installs
+> cleanly under any package manager (npm, **pnpm 10+**, yarn) on every platform.
+> This requires **Node >= 22.5** (when `node:sqlite` landed); on an older Node
+> the CLI prints a clear upgrade message. Run `ocr doctor` to verify the engine.
 >
-> **Upgrading from v1.x?** Quit any running `ocr dashboard` first, then
-> `npm i -g @open-code-review/cli@latest`. Your existing database upgrades
-> **automatically** on the next `ocr` command: a backup is written to
-> `ocr.db.bak.v<n>`, legacy sessions are reconciled, and a one-time notice
-> summarizes what happened. No manual steps.
+> **Upgrading from v1.x or v2.0?** Make sure you're on **Node >= 22.5**, quit any
+> running `ocr dashboard`, then `npm i -g @open-code-review/cli@latest` (or
+> `pnpm add -g …`). Your existing database upgrades **automatically** on the next
+> `ocr` command: a backup is written to `ocr.db.bak.v<n>`, legacy sessions are
+> reconciled, and a one-time notice summarizes what happened. No manual steps.
 
 Run `ocr doctor` to verify your setup.
 
