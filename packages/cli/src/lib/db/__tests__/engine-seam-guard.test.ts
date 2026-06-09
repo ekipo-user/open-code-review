@@ -32,6 +32,17 @@ const NODE_SQLITE_OWNER = join("cli", "src", "lib", "db", "engine.ts");
 const NODE_SQLITE = /(?:from|require\(|import\()\s*["']node:sqlite["']/;
 const BETTER_SQLITE3 = /(?:from|require\(|import\()\s*["']better-sqlite3["']/;
 
+/**
+ * Strip `//` line comments and block comments so a doc comment that *mentions*
+ * an import (e.g. `// from "node:sqlite"`) can't false-positive. The `[^:]`
+ * guard keeps `://` in URLs/strings from being treated as a line comment.
+ */
+function stripComments(src: string): string {
+  return src
+    .replace(/\/\*[\s\S]*?\*\//g, "")
+    .replace(/(^|[^:])\/\/.*$/gm, "$1");
+}
+
 function collectTsFiles(dir: string): string[] {
   const out: string[] = [];
   let entries: string[];
@@ -65,13 +76,15 @@ describe("engine seam invariant", () => {
     const offenders = files.filter((f) => {
       const rel = relative(packagesRoot, f);
       if (rel.split(sep).join(sep) === NODE_SQLITE_OWNER) return false;
-      return NODE_SQLITE.test(readFileSync(f, "utf8"));
+      return NODE_SQLITE.test(stripComments(readFileSync(f, "utf8")));
     });
     expect(offenders.map((f) => relative(packagesRoot, f))).toEqual([]);
   });
 
   it("no source references the retired better-sqlite3 engine", () => {
-    const offenders = files.filter((f) => BETTER_SQLITE3.test(readFileSync(f, "utf8")));
+    const offenders = files.filter((f) =>
+      BETTER_SQLITE3.test(stripComments(readFileSync(f, "utf8"))),
+    );
     expect(offenders.map((f) => relative(packagesRoot, f))).toEqual([]);
   });
 });
