@@ -114,47 +114,55 @@ jobs:
           echo "ver=$VER" >> "$GITHUB_OUTPUT"
           echo "out=$out" >> "$GITHUB_OUTPUT"
 
-      - name: Install via pnpm 10 (scripts blocked) and verify
+      - name: Install (pnpm 10 scripts-blocked + npm) and verify the engine
         shell: bash
         env:
           VER: ${{ steps.pack.outputs.ver }}
           OUT: ${{ steps.pack.outputs.out }}
         run: |
           set -euo pipefail
+
+          # SINGLE SOURCE for the consumer package.json. Resolve the cli's
+          # agents@<ver> dep to the LOCAL agents tarball via an override (that
+          # version isn't on the registry yet — passing both tarballs makes the
+          # package manager fetch agents from npm and fail). The override lives
+          # under `pnpm.overrides` for pnpm, top-level `overrides` for npm.
+          write_manifest() {  # $1 = pnpm | npm
+            PM="$1" node -e '
+              const fs = require("fs"), o = process.env.OUT, v = process.env.VER, pm = process.env.PM;
+              const m = { name: "ocr-verify", version: "1.0.0", private: true,
+                dependencies: { "@open-code-review/cli": `file:${o}/open-code-review-cli-${v}.tgz` } };
+              const ov = { "@open-code-review/agents": `file:${o}/open-code-review-agents-${v}.tgz` };
+              if (pm === "pnpm") m.pnpm = { overrides: ov }; else m.overrides = ov;
+              fs.writeFileSync("package.json", JSON.stringify(m, null, 2));
+            '
+          }
+
+          # SINGLE SOURCE for verification. $1 = app dir. `doctor --probe-write`
+          # exercises an on-disk WAL transaction round-trip (the journaled write
+          # path), not just engine open. The cli's node:sqlite engine has NO
+          # build script, so pnpm 10's default script-blocking is a non-issue.
+          verify() {
+            app="$1"; bin="$app/node_modules/.bin/ocr"
+            "$bin" doctor --probe-write 2>&1 | tee "$app/doctor.out"
+            grep -q "node:sqlite (SQLite" "$app/doctor.out"
+            grep -q "write probe (on-disk" "$app/doctor.out"
+            ! grep -q "unavailable" "$app/doctor.out"
+            proj="$app/proj"; mkdir -p "$proj"; cd "$proj"
+            git init -q .; git config user.email ci@ocr.dev; git config user.name ci
+            git commit --allow-empty -qm init
+            "$bin" init --tools claude
+            mkdir -p .ocr/sessions/ci
+            "$bin" state begin --session-id ci --branch x --workflow-type review --session-dir .ocr/sessions/ci
+            "$bin" state status --json
+          }
+
           corepack prepare pnpm@10 --activate
           app="$RUNNER_TEMP/consumer-pnpm"; rm -rf "$app"; mkdir -p "$app"; cd "$app"
-          # Install the cli tarball and resolve its `agents@<ver>` dep to the
-          # LOCAL agents tarball via a pnpm override (that version is not on the
-          # registry yet — passing both tarballs would make pnpm fetch agents
-          # from npm and fail). The cli's node:sqlite engine has NO build script,
-          # so pnpm 10's default script-blocking is a non-issue — the point.
-          node -e 'const fs=require("fs"),o=process.env.OUT,v=process.env.VER;fs.writeFileSync("package.json",JSON.stringify({name:"ocr-verify",version:"1.0.0",private:true,dependencies:{"@open-code-review/cli":`file:${o}/open-code-review-cli-${v}.tgz`},pnpm:{overrides:{"@open-code-review/agents":`file:${o}/open-code-review-agents-${v}.tgz`}}},null,2))'
-          pnpm install --ignore-workspace
-          node_modules/.bin/ocr doctor 2>&1 | tee doctor.out
-          grep -q "node:sqlite (SQLite" doctor.out
-          ! grep -q "unavailable" doctor.out
-          proj="$app/proj"; mkdir -p "$proj"; cd "$proj"
-          git init -q .; git config user.email ci@ocr.dev; git config user.name ci
-          git commit --allow-empty -qm init
-          "$app/node_modules/.bin/ocr" init --tools claude
-          mkdir -p .ocr/sessions/ci
-          "$app/node_modules/.bin/ocr" state begin --session-id ci --branch x --workflow-type review --session-dir .ocr/sessions/ci
-          "$app/node_modules/.bin/ocr" state status --json
+          write_manifest pnpm; pnpm install --ignore-workspace; verify "$app"
 
-      - name: Install via npm and verify
-        shell: bash
-        env:
-          VER: ${{ steps.pack.outputs.ver }}
-          OUT: ${{ steps.pack.outputs.out }}
-        run: |
-          set -euo pipefail
           app="$RUNNER_TEMP/consumer-npm"; rm -rf "$app"; mkdir -p "$app"; cd "$app"
-          # Same agents-resolution override, npm's native `overrides` form.
-          node -e 'const fs=require("fs"),o=process.env.OUT,v=process.env.VER;fs.writeFileSync("package.json",JSON.stringify({name:"ocr-verify-npm",version:"1.0.0",private:true,dependencies:{"@open-code-review/cli":`file:${o}/open-code-review-cli-${v}.tgz`},overrides:{"@open-code-review/agents":`file:${o}/open-code-review-agents-${v}.tgz`}},null,2))'
-          npm install
-          node_modules/.bin/ocr doctor 2>&1 | tee doctor.out
-          grep -q "node:sqlite (SQLite" doctor.out
-          ! grep -q "unavailable" doctor.out
+          write_manifest npm; npm install; verify "$app"
 
   publish:
     name: publish (${{ needs.setup.outputs.dist-tag }})
