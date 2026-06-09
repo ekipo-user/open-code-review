@@ -81,6 +81,18 @@ The `status` field controls session visibility:
 
 The `ocr progress` command only auto-detects sessions with `status: "active"`. Closed sessions are accessible via `/ocr-history` and `/ocr-show`.
 
+## Agent-session journal: the `kind` field
+
+Each journaled process (`ocr session list --json`, the dashboard's
+`/api/agent-sessions`) carries a typed **`kind`** — branch on it instead of
+parsing the `command` string to tell what a process is:
+
+| `kind` | Meaning |
+|--------|---------|
+| `supervisor` | A workflow-owning process (a dashboard-spawned `review`/`map`). Its death cascade-closes its dependents. |
+| `instance` | A reviewer instance journaled via `ocr session start-instance`. Never owns a workflow's lifecycle. |
+| `utility` | A fire-and-forget command with no journaled heartbeat. |
+
 ## CLI Commands for State Management
 
 Agents MUST use these CLI commands to manage session state. **Do NOT write state files directly.**

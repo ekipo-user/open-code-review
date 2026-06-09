@@ -118,6 +118,13 @@ export type AgentSessionRow = {
   resolved_model: string | null
   phase: string | null
   status: AgentSessionStatus
+  /**
+   * Derived process role — branch on this to tell what kind of process the row
+   * is, instead of parsing `command`. `supervisor` = a workflow-owning process
+   * (a dashboard-spawned review/map); `instance` = a reviewer instance journaled
+   * via `ocr session start-instance`; `utility` = a fire-and-forget command.
+   */
+  kind: 'supervisor' | 'instance' | 'utility'
   pid: number | null
   started_at: string
   last_heartbeat_at: string
