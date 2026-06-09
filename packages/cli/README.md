@@ -4,8 +4,7 @@ Command-line interface for [Open Code Review](https://github.com/spencermarx/ope
 
 ## Quick Start
 
-**Requires Node.js >= 22.5** — OCR's storage engine is Node's built-in SQLite
-(`node:sqlite`), so there's no native module to compile and it installs cleanly under any package manager (npm, **pnpm 10+**, yarn).
+**Requires Node.js >= 22.5** — OCR's storage engine is Node's built-in SQLite (`node:sqlite`), so there's no native module to compile and it installs cleanly under any package manager (npm, **pnpm 10+**, yarn).
 
 ```bash
 # 1. Install globally

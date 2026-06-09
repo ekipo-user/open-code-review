@@ -31,3 +31,22 @@ the runtime floor.)
 
 - **WHEN** a release is prepared
 - **THEN** CI SHALL install the **published cli tarball** under **both npm and pnpm 10 (default, scripts blocked)** on supported Node versions, asserting the engine loads (including an on-disk WAL transaction round-trip via `ocr doctor --probe-write`) and a real DB command succeeds, **before** promoting the release to the `latest` dist-tag
+
+## MODIFIED Requirements
+
+### Requirement: Zero Dashboard Startup Cost
+
+The dashboard code SHALL NOT be loaded unless the user runs `ocr dashboard`. Commands like `ocr init`, `ocr progress`, and `ocr state` MUST remain fast.
+
+#### Scenario: Dynamic import only on dashboard command
+
+- **GIVEN** user runs any CLI command other than `ocr dashboard`
+- **WHEN** the CLI process starts
+- **THEN** the dashboard server module (`dist/dashboard/server.js`) SHALL NOT be imported or loaded
+
+#### Scenario: Dashboard dependencies isolated
+
+- **GIVEN** the dashboard adds significant dependencies (React, Socket.IO, Mermaid)
+- **WHEN** user runs `ocr init` or `ocr progress`
+- **THEN** none of these dependencies are loaded
+- **AND** CLI startup time is unaffected
