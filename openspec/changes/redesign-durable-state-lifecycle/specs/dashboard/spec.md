@@ -36,3 +36,35 @@ The dashboard SHALL allow users to execute OCR CLI commands from the browser wit
 - **GIVEN** a command is already running
 - **WHEN** user attempts to start another command
 - **THEN** a warning is shown and the user may wait or cancel the running command
+
+## ADDED Requirements
+
+### Requirement: Process-Supervision Liveness Sweep
+
+The dashboard periodically reclaims `command_executions` rows whose supervised process is genuinely gone, stamping them `orphaned` (`exit_code = -3`). Because the supervision journal is the source of truth for a command's outcome, the sweep SHALL ground the terminal `orphaned` verdict in **actual process liveness**, never in heartbeat age alone — a terminal verdict requires positive evidence that the process is dead. `last_heartbeat_at` age is a non-terminal display hint only.
+
+#### Scenario: A live process is never orphaned
+
+- **GIVEN** an unfinished `command_executions` row whose recorded `pid` is a live process
+- **WHEN** the liveness sweep runs, even if `last_heartbeat_at` is older than the threshold
+- **THEN** the row SHALL NOT be marked `orphaned` and SHALL retain `finished_at IS NULL`
+- **AND** a stale heartbeat SHALL surface only as the non-terminal `stalled` display state
+
+#### Scenario: A dead process is reclaimed
+
+- **GIVEN** an unfinished row whose recorded `pid` is confirmed not alive (the OS reports no such process)
+- **WHEN** the liveness sweep runs and the row is within the PID-reuse safety window
+- **THEN** the row SHALL be marked `orphaned` (`exit_code = -3`, `finished_at` set, `pid` cleared, a structured note appended)
+
+#### Scenario: No positive evidence of death means no terminal verdict
+
+- **GIVEN** an unfinished row with no recorded `pid` (e.g. a self-reporting `start-instance` reviewer), OR a pid-bearing row whose `started_at` is older than the 24h PID-reuse safety window
+- **WHEN** the liveness sweep runs
+- **THEN** the row SHALL NOT be orphaned by this sweep — a self-reported stale heartbeat is a liveness hint (the non-terminal `stalled` display state), never positive evidence of death
+- **AND** such rows are reclaimed instead by their evidence-bearing owners: the agent's own `ocr session end-instance`, the parent-close cascade (`cascadeTerminateExecutions`, exit `-4`), or the coarse session-level stale sweep
+
+#### Scenario: A real completion always wins, and the sweep is idempotent
+
+- **WHEN** a command finishes normally between the sweep's read and its write
+- **THEN** the sweep's orphan stamp SHALL be a compare-and-set guarded on `finished_at IS NULL`, so the genuine exit code is never overwritten
+- **AND** a second sweep over an already-reclaimed row SHALL make no further change
