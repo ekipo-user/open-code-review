@@ -45,6 +45,31 @@ function createSessionDir(sessionId: string): string {
   return dir;
 }
 
+/**
+ * Ordered phase walks per workflow type. The state machine rejects
+ * direct jumps from `context` to (e.g.) `analysis`, so tests that want
+ * to land at a specific phase need to walk the legal edges in between.
+ */
+const REVIEW_PHASE_ORDER: ReadonlyArray<{ phase: ReviewPhase; n: number }> = [
+  { phase: "context", n: 1 },
+  { phase: "change-context", n: 2 },
+  { phase: "analysis", n: 3 },
+  { phase: "reviews", n: 4 },
+  { phase: "aggregation", n: 5 },
+  { phase: "discourse", n: 6 },
+  { phase: "synthesis", n: 7 },
+  { phase: "complete", n: 8 },
+];
+
+const MAP_PHASE_ORDER: ReadonlyArray<{ phase: MapPhase; n: number }> = [
+  { phase: "map-context", n: 1 },
+  { phase: "topology", n: 2 },
+  { phase: "flow-analysis", n: 3 },
+  { phase: "requirements-mapping", n: 4 },
+  { phase: "synthesis", n: 5 },
+  { phase: "complete", n: 6 },
+];
+
 async function initDbAndSession(
   sessionId: string,
   workflowType: "review" | "map",
@@ -60,13 +85,30 @@ async function initDbAndSession(
     ocrDir,
   });
 
-  if (phase !== "context" || phaseNumber !== 1) {
-    await stateTransition({
-      sessionId,
-      phase: phase as ReviewPhase | MapPhase,
-      phaseNumber,
-      ocrDir,
-    });
+  // Walk legal phase edges to reach the target phase. Direct jumps are
+  // rejected by stateTransition's phase-graph validation.
+  const order = workflowType === "review" ? REVIEW_PHASE_ORDER : MAP_PHASE_ORDER;
+  const targetIdx = order.findIndex((p) => p.phase === phase);
+  if (targetIdx > 0) {
+    for (let i = 1; i <= targetIdx; i++) {
+      const step = order[i]!;
+      await stateTransition({
+        sessionId,
+        phase: step.phase,
+        phaseNumber: step.n,
+        ocrDir,
+      });
+    }
+    // If the caller passed a phase_number that differs from the
+    // canonical position, do a final no-op transition to that number.
+    if (order[targetIdx]!.n !== phaseNumber) {
+      await stateTransition({
+        sessionId,
+        phase: order[targetIdx]!.phase,
+        phaseNumber,
+        ocrDir,
+      });
+    }
   }
 
   // Set up the progress DB cache
@@ -181,9 +223,11 @@ describe("Waiting state", () => {
     });
 
     const { stateClose } = await import("../../state/index.js");
+    // No completed round — abort is the legitimate close for this fixture.
     await stateClose({
       sessionId: "closed-session",
       ocrDir,
+      abort: true,
     });
 
     const dbPath = join(ocrDir, "data", "ocr.db");

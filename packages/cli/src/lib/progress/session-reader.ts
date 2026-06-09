@@ -6,7 +6,7 @@
  */
 
 import { basename } from "node:path";
-import type { Database } from "sql.js";
+import type { Database } from "../db/engine.js";
 import { resultToRow } from "../db/result-mapper.js";
 import type { SessionStateData } from "./types.js";
 

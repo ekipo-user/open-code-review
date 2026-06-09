@@ -30,26 +30,28 @@ function tracked<T extends TempProject>(project: T): T {
 }
 
 /**
- * Initialize a workflow `sessions` row via `ocr state init`. Returns the
- * session id printed on stdout — the canonical way for tests to obtain
- * a workflow id without importing internal modules.
+ * Initialize a workflow `sessions` row via `ocr state begin` (the v2 atomic
+ * verb that replaced `state init`). Returns the session id from the JSON
+ * result — the canonical way for tests to obtain a workflow id without
+ * importing internal modules.
  */
 async function initWorkflow(project: TempProject): Promise<string> {
   const result = await spawnCli(
     [
       "state",
-      "init",
+      "begin",
       "--session-id",
       "2026-04-29-feat-test",
       "--branch",
       "feat/test",
       "--workflow-type",
       "review",
+      "--json",
     ],
     { cwd: project.dir },
   );
   expect(result.exitCode).toBe(0);
-  return result.stdout.trim();
+  return JSON.parse(result.stdout).session_id as string;
 }
 
 describe("ocr session start-instance", () => {
@@ -324,81 +326,115 @@ describe("ocr session end-instance", () => {
 });
 
 describe("ocr session liveness sweep", () => {
-  it("reclassifies stale 'running' rows to 'orphaned' on next start-instance", async () => {
+  // A reviewer instance carries NO pid — its liveness is the heartbeat it
+  // self-reports via `ocr session beat`. A stale heartbeat is a hint (the
+  // non-terminal 'stalled' display), NOT positive evidence of death, so the
+  // sweep must never stamp such a row terminal-orphaned. Abandoned instances
+  // are reclaimed instead by `end-instance`, the parent-close cascade, or the
+  // coarse session-level sweep.
+  it("does NOT orphan a stale instance that has no pid", async () => {
     const project = tracked(createInitializedProject());
-    // Configure a tight 1-second heartbeat threshold so the test can
-    // observe the sweep without waiting a full minute.
-    writeConfigYaml(
-      project,
-      `runtime:\n  agent_heartbeat_seconds: 1\n`,
-    );
-
+    writeConfigYaml(project, `runtime:\n  agent_heartbeat_seconds: 1\n`);
     const workflowId = await initWorkflow(project);
 
-    // Insert the row that will go stale
     const stale = await spawnCli(
-      [
-        "session",
-        "start-instance",
-        "--workflow",
-        workflowId,
-        "--persona",
-        "principal",
-        "--instance",
-        "1",
-        "--vendor",
-        "claude",
-      ],
+      ["session", "start-instance", "--workflow", workflowId, "--persona", "principal", "--instance", "1", "--vendor", "claude"],
       { cwd: project.dir },
     );
     const staleId = stale.stdout.trim();
 
-    // Wait past the threshold (the heartbeat in the row is rounded to 1s
-    // resolution by SQLite's `datetime('now')`; sleep a bit longer to be
-    // unambiguously stale).
+    await new Promise((r) => setTimeout(r, 2_500)); // past the 1s threshold
+
+    // Next start-instance triggers the opportunistic sweep.
+    await spawnCli(
+      ["session", "start-instance", "--workflow", workflowId, "--persona", "principal", "--instance", "2", "--vendor", "claude"],
+      { cwd: project.dir },
+    );
+
+    const list = await spawnCli(["session", "list", "--workflow", workflowId, "--json"], { cwd: project.dir });
+    const staleRow = JSON.parse(list.stdout).find((r: { id: string }) => r.id === staleId);
+    expect(staleRow.status).toBe("running");
+    expect(staleRow.ended_at).toBeNull();
+  });
+
+  it("orphans a stale instance whose recorded pid is confirmed dead", async () => {
+    const project = tracked(createInitializedProject());
+    writeConfigYaml(project, `runtime:\n  agent_heartbeat_seconds: 1\n`);
+    const workflowId = await initWorkflow(project);
+
+    // A pid that cannot exist on any platform — the liveness probe reports it
+    // dead, so a stale heartbeat on this row IS backed by positive evidence.
+    const DEAD_PID = 2_000_000_000;
+    const stale = await spawnCli(
+      ["session", "start-instance", "--workflow", workflowId, "--persona", "principal", "--instance", "1", "--vendor", "claude", "--pid", String(DEAD_PID)],
+      { cwd: project.dir },
+    );
+    const staleId = stale.stdout.trim();
+
     await new Promise((r) => setTimeout(r, 2_500));
 
-    // A fresh start-instance call triggers the sweep — stale row gets
-    // reclassified to 'orphaned' before the new row is inserted.
-    const fresh = await spawnCli(
-      [
-        "session",
-        "start-instance",
-        "--workflow",
-        workflowId,
-        "--persona",
-        "principal",
-        "--instance",
-        "2",
-        "--vendor",
-        "claude",
-      ],
+    await spawnCli(
+      ["session", "start-instance", "--workflow", workflowId, "--persona", "principal", "--instance", "2", "--vendor", "claude"],
       { cwd: project.dir },
     );
-    const freshId = fresh.stdout.trim();
 
-    const list = await spawnCli(
-      ["session", "list", "--workflow", workflowId, "--json"],
-      { cwd: project.dir },
-    );
-    const rows = JSON.parse(list.stdout);
-
-    const staleRow = rows.find((r: { id: string }) => r.id === staleId);
-    const freshRow = rows.find((r: { id: string }) => r.id === freshId);
-
+    const list = await spawnCli(["session", "list", "--workflow", workflowId, "--json"], { cwd: project.dir });
+    const staleRow = JSON.parse(list.stdout).find((r: { id: string }) => r.id === staleId);
     expect(staleRow.status).toBe("orphaned");
     expect(staleRow.ended_at).toBeTruthy();
     expect(staleRow.notes).toContain("orphaned by liveness sweep");
-    expect(freshRow.status).toBe("running");
   });
 
-  it("leaves a row whose heartbeat was just bumped untouched", async () => {
+  it("orphaning a dead-pid instance does NOT cascade-terminate a live sibling", async () => {
+    // The dangerous regression: a reviewer instance does not own its workflow's
+    // lifecycle, so orphaning one must never take its siblings down. (Only a
+    // dead supervising process cascades its dependents.)
     const project = tracked(createInitializedProject());
-    // 5s threshold (vs the 1s used in the orphan-path test) buys headroom
-    // for the beat → next start-instance window on slow CI runners. With
-    // 1s, two sequential CLI invocations (~700-800ms each on hosted
-    // macOS/Ubuntu) push the sweep past the threshold and the row gets
-    // wrongly reclassified.
+    writeConfigYaml(project, `runtime:\n  agent_heartbeat_seconds: 1\n`);
+    const workflowId = await initWorkflow(project);
+
+    const DEAD_PID = 2_000_000_000;
+    // The sibling records a LIVE pid (this test process) so it is itself a
+    // sweep candidate that the liveness probe finds alive — what keeps it
+    // running is therefore the `rowKind === 'supervisor'` cascade gate (the
+    // doomed row is an instance, so it must not cascade), NOT the candidate
+    // filter excluding a null-pid row.
+    const sibling = await spawnCli(
+      ["session", "start-instance", "--workflow", workflowId, "--persona", "principal", "--instance", "1", "--vendor", "claude", "--pid", String(process.pid)],
+      { cwd: project.dir },
+    );
+    const siblingId = sibling.stdout.trim();
+    const doomed = await spawnCli(
+      ["session", "start-instance", "--workflow", workflowId, "--persona", "quality", "--instance", "1", "--vendor", "claude", "--pid", String(DEAD_PID)],
+      { cwd: project.dir },
+    );
+    const doomedId = doomed.stdout.trim();
+
+    await new Promise((r) => setTimeout(r, 2_500)); // both rows go stale
+
+    // Trigger the sweep: the dead-pid instance is orphaned; the sweep must NOT
+    // cascade (it's an instance), so the live sibling is untouched.
+    await spawnCli(
+      ["session", "start-instance", "--workflow", workflowId, "--persona", "architect", "--instance", "1", "--vendor", "claude"],
+      { cwd: project.dir },
+    );
+
+    const list = await spawnCli(["session", "list", "--workflow", workflowId, "--json"], { cwd: project.dir });
+    const rows = JSON.parse(list.stdout) as Array<{ id: string; status: string; ended_at: string | null }>;
+    const doomedRow = rows.find((r) => r.id === doomedId);
+    const siblingRow = rows.find((r) => r.id === siblingId);
+
+    expect(doomedRow?.status).toBe("orphaned");
+    // The sibling survives its peer's orphaning — never cascade-terminated.
+    expect(siblingRow?.status).toBe("running");
+    expect(siblingRow?.ended_at).toBeNull();
+  });
+
+  it("session beat refreshes a row's heartbeat and the sweep leaves it running", async () => {
+    const project = tracked(createInitializedProject());
+    // Smoke-tests the real `ocr session beat` command end-to-end. (A null-pid
+    // instance is never swept regardless under the liveness model; this also
+    // confirms beat + the opportunistic sweep coexist without error.)
     writeConfigYaml(
       project,
       `runtime:\n  agent_heartbeat_seconds: 5\n`,
@@ -849,6 +885,95 @@ describe("ocr review --resume", () => {
     });
     expect(result.exitCode).not.toBe(0);
     expect(result.stderr).toMatch(/no vendor session id/i);
+  });
+});
+
+describe("ocr state complete-round --stdin (async drainer, multi-KB payload)", () => {
+  it("drains a ~12 KB piped RoundMeta in full and lands round-meta.json on disk", async () => {
+    const project = tracked(createInitializedProject());
+    const sessionId = "2026-06-09-feat-big-stdin";
+
+    // Begin a review workflow and walk it all the way to synthesis — the
+    // atomic complete-round refuses to finalize before proof-of-work.
+    const begin = await spawnCli(
+      [
+        "state",
+        "begin",
+        "--session-id",
+        sessionId,
+        "--branch",
+        "feat/big-stdin",
+        "--workflow-type",
+        "review",
+        "--json",
+      ],
+      { cwd: project.dir },
+    );
+    expect(begin.exitCode).toBe(0);
+
+    for (const phase of [
+      "change-context",
+      "analysis",
+      "reviews",
+      "aggregation",
+      "discourse",
+      "synthesis",
+    ]) {
+      const adv = await spawnCli(
+        ["state", "advance", "--session-id", sessionId, "--phase", phase],
+        { cwd: project.dir },
+      );
+      expect(adv.exitCode).toBe(0);
+    }
+
+    // Build a multi-KB RoundMeta: ~50 findings of ~200 chars each (~12 KB
+    // serialized). This is the regression guard for the async stdin drainer —
+    // the old readFileSync(0) could return only the first chunk of a pipe this
+    // size, silently truncating the payload before validation.
+    const findings = Array.from({ length: 50 }, (_, i) => ({
+      title: `Finding ${i} ${"x".repeat(40)}`,
+      category: "should_fix",
+      severity: "medium",
+      file_path: `src/module-${i}.ts`,
+      line_start: i + 1,
+      line_end: i + 10,
+      // ~200-char summary so the whole document comfortably exceeds 4 KB.
+      summary: `Detailed explanation number ${i}: ${"detail ".repeat(25)}`,
+    }));
+    const roundMeta = {
+      schema_version: 1,
+      verdict: "REQUEST CHANGES",
+      reviewers: [{ type: "principal", instance: 1, findings }],
+    };
+    const payload = JSON.stringify(roundMeta);
+    // Sanity: the payload is genuinely multi-KB (well past a single read chunk).
+    expect(payload.length).toBeGreaterThan(8_000);
+
+    const complete = await spawnCli(
+      ["state", "complete-round", "--stdin", "--session-id", sessionId, "--json"],
+      { cwd: project.dir, stdin: payload },
+    );
+    expect(complete.exitCode).toBe(0);
+
+    // round-meta.json must have landed on disk with the FULL payload intact
+    // (all 50 findings) — proving nothing was truncated mid-pipe.
+    const metaPath = resolve(
+      project.dir,
+      ".ocr",
+      "sessions",
+      sessionId,
+      "rounds",
+      "round-1",
+      "round-meta.json",
+    );
+    const written = JSON.parse(readFileSync(metaPath, "utf-8")) as {
+      schema_version: number;
+      verdict: string;
+      reviewers: Array<{ findings: unknown[] }>;
+    };
+    expect(written.schema_version).toBe(1);
+    expect(written.verdict).toBe("REQUEST CHANGES");
+    expect(written.reviewers[0]?.findings).toHaveLength(50);
   });
 });
 

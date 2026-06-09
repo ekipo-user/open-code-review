@@ -3,10 +3,14 @@
  */
 
 import { Router } from 'express'
-import type { Database } from 'sql.js'
+import type { Database } from '@open-code-review/cli/db'
 import { getCommandHistory } from '../db.js'
 import { getActiveCommands } from '../socket/command-runner.js'
 import { readEventJournal } from '../services/event-journal.js'
+import {
+  deriveCommandOutcome,
+  deriveCancellationReason,
+} from '../services/command-outcome.js'
 
 type CommandDefinition = {
   name: string
@@ -67,13 +71,24 @@ export function createCommandsRouter(db: Database, ocrDir: string): Router {
   router.get('/history', (req, res) => {
     try {
       const limit = parseInt(req.query['limit'] as string, 10) || 50
-      const history = getCommandHistory(db, limit).map((row) => ({
-        ...row,
-        duration_ms:
-          row.finished_at && row.started_at
-            ? new Date(row.finished_at).getTime() - new Date(row.started_at).getTime()
-            : null,
-      }))
+      const history = getCommandHistory(db, limit).map((row) => {
+        const { workflow_completeness, ...persisted } = row
+        return {
+          ...persisted,
+          duration_ms:
+            row.finished_at && row.started_at
+              ? new Date(row.finished_at).getTime() - new Date(row.started_at).getTime()
+              : null,
+          // Derived from (exit_code, event-sourced workflow completeness) —
+          // single source of truth shared with the live `command:finished`
+          // socket event.
+          outcome: deriveCommandOutcome(row.exit_code, workflow_completeness),
+          // Orthogonal discriminator within the 'cancelled' bucket so the
+          // client distinguishes a user cancel from a cascade close without
+          // reaching past `outcome` to match a magic exit-code number.
+          cancellation_reason: deriveCancellationReason(row.exit_code),
+        }
+      })
       res.json(history)
     } catch (err) {
       console.error('Failed to fetch command history:', err)

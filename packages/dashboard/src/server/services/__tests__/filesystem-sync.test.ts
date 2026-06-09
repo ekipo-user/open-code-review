@@ -3,18 +3,20 @@ import { mkdirSync, writeFileSync, rmSync } from 'node:fs'
 import { join } from 'node:path'
 import { tmpdir } from 'node:os'
 import { randomUUID } from 'node:crypto'
-import initSqlJs, { type Database } from 'sql.js'
+import {
+  openDatabase,
+  closeAllDatabases,
+  runMigrations,
+  type Database,
+} from '@open-code-review/cli/db'
 import { FilesystemSync } from '../filesystem-sync.js'
-import { runMigrations, applyPragmas } from '@open-code-review/cli/db'
 
 let db: Database
 let tmpDir: string
 let sessionsDir: string
 
-async function createDb(): Promise<Database> {
-  const SQL = await initSqlJs()
-  const database = new SQL.Database()
-  applyPragmas(database)
+async function createDb(dir: string): Promise<Database> {
+  const database = await openDatabase(join(dir, 'test.db'))
   runMigrations(database)
   return database
 }
@@ -38,14 +40,14 @@ function queryOne(database: Database, sql: string, params: (string | number | nu
 }
 
 beforeEach(async () => {
-  db = await createDb()
   tmpDir = join(tmpdir(), `ocr-test-${randomUUID()}`)
   sessionsDir = join(tmpDir, 'sessions')
   mkdirSync(sessionsDir, { recursive: true })
+  db = await createDb(tmpDir)
 })
 
 afterEach(() => {
-  db.close()
+  closeAllDatabases()
   rmSync(tmpDir, { recursive: true, force: true })
 })
 

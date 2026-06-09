@@ -24,7 +24,15 @@ import { EventStreamRenderer } from './event-stream/event-stream-renderer'
 
 // ── Types ──
 
-type StatusFilter = 'all' | 'success' | 'fail' | 'cancelled' | 'running' | 'stalled' | 'orphaned'
+type StatusFilter =
+  | 'all'
+  | 'success'
+  | 'fail'
+  | 'cancelled'
+  | 'incomplete'
+  | 'running'
+  | 'stalled'
+  | 'orphaned'
 type SortField = 'date' | 'command' | 'duration' | 'status'
 type SortDir = 'asc' | 'desc'
 
@@ -34,6 +42,18 @@ type SortDir = 'asc' | 'desc'
  * doesn't currently surface the configured value to the client.
  */
 const HEARTBEAT_STALE_MS = 60_000
+
+/**
+ * Process-exit sentinels (canonical definitions live in the CLI's
+ * `exit-codes` module). The client bundle mirrors the numeric values rather
+ * than importing the Node module. These are retained only for the legacy
+ * fallback in `getStatus` (rows that predate the server-derived `outcome` /
+ * `cancellation_reason` fields). The cascade-vs-user-cancel distinction is
+ * now read from the typed `entry.cancellation_reason` field instead of
+ * matching a magic exit-code number.
+ */
+const CANCEL_EXIT_CODE = -2
+const ORPHAN_EXIT_CODE = -3
 
 // ── Fuzzy match helper ──
 
@@ -64,9 +84,17 @@ function getStatus(entry: CommandHistoryEntry): StatusFilter {
     }
     return 'running'
   }
+  // Prefer the server-derived outcome when present — it accounts for
+  // the workflow's actual lifecycle, not just process exit code.
+  if (entry.outcome === 'success') return 'success'
+  if (entry.outcome === 'incomplete') return 'incomplete'
+  if (entry.outcome === 'cancelled') return 'cancelled'
+  if (entry.outcome === 'failed') return 'fail'
+  // Legacy fallback for rows that predate the outcome field.
   if (entry.exit_code === 0) return 'success'
-  if (entry.exit_code === -2) return 'cancelled'
-  if (entry.exit_code === -3) return 'orphaned'
+  if (entry.exit_code === CANCEL_EXIT_CODE) return 'cancelled'
+  if (entry.cancellation_reason === 'cascade') return 'cancelled'
+  if (entry.exit_code === ORPHAN_EXIT_CODE) return 'orphaned'
   return 'fail'
 }
 
@@ -75,11 +103,32 @@ function statusLabel(s: StatusFilter): string {
     case 'success': return 'Success'
     case 'fail': return 'Fail'
     case 'cancelled': return 'Cancelled'
+    case 'incomplete': return 'Incomplete'
     case 'running': return 'Running'
     case 'stalled': return 'Stalled'
     case 'orphaned': return 'Orphaned'
     default: return 'All'
   }
+}
+
+/**
+ * The pill label, distinguishing a cascade-close (`-4`, "Superseded") from a
+ * user cancel (`-2`, "Cancelled") — both share the amber `cancelled` filter
+ * bucket but read differently so an operator knows which happened.
+ */
+function pillLabel(entry: CommandHistoryEntry, status: StatusFilter): string {
+  if (status === 'cancelled' && entry.cancellation_reason === 'cascade') {
+    return 'Superseded'
+  }
+  return statusLabel(status)
+}
+
+/** Tooltip elaborating a non-obvious pill (e.g. why a row is "Superseded"). */
+function pillTitle(entry: CommandHistoryEntry, status: StatusFilter): string | undefined {
+  if (status === 'cancelled' && entry.cancellation_reason === 'cascade') {
+    return 'Stopped because its parent workflow was closed'
+  }
+  return undefined
 }
 
 /** Tailwind classes for the per-status pill in the row. */
@@ -88,6 +137,10 @@ function statusPillClasses(status: StatusFilter): string {
     case 'success':
       return 'border-emerald-500/25 bg-emerald-500/15 text-emerald-700 dark:text-emerald-400'
     case 'cancelled':
+      return 'border-amber-500/25 bg-amber-500/15 text-amber-700 dark:text-amber-400'
+    case 'incomplete':
+      // Same amber family as cancelled/stalled — both are "needs attention,
+      // not a hard failure". Resume-in-terminal is the natural follow-up.
       return 'border-amber-500/25 bg-amber-500/15 text-amber-700 dark:text-amber-400'
     case 'stalled':
       return 'border-amber-500/30 bg-amber-500/10 text-amber-700 dark:text-amber-400'
@@ -120,10 +173,11 @@ function compareEntries(a: CommandHistoryEntry, b: CommandHistoryEntry, field: S
       const order: Record<StatusFilter, number> = {
         running: 0,
         stalled: 1,
-        orphaned: 2,
-        success: 3,
-        cancelled: 4,
-        fail: 5,
+        incomplete: 2,
+        orphaned: 3,
+        success: 4,
+        cancelled: 5,
+        fail: 6,
         all: -1,
       }
       cmp = (order[getStatus(a)] ?? 0) - (order[getStatus(b)] ?? 0)
@@ -141,6 +195,7 @@ const STATUS_OPTIONS: { value: StatusFilter; label: string }[] = [
   { value: 'stalled', label: 'Stalled' },
   { value: 'orphaned', label: 'Orphaned' },
   { value: 'success', label: 'Success' },
+  { value: 'incomplete', label: 'Incomplete' },
   { value: 'fail', label: 'Fail' },
   { value: 'cancelled', label: 'Cancelled' },
 ]
@@ -278,12 +333,13 @@ function HistoryItem({
           {formatDuration(entry.duration_ms)}
         </span>
         <span
+          title={pillTitle(entry, status)}
           className={cn(
             'inline-flex shrink-0 items-center rounded-md border px-2 py-0.5 text-xs font-medium',
             statusPillClasses(status),
           )}
         >
-          {statusLabel(status)}
+          {pillLabel(entry, status)}
         </span>
         {canHandoff && (
           <button
@@ -468,6 +524,7 @@ export function CommandHistory({ isRunning, onRerun }: CommandHistoryProps) {
       success: 0,
       fail: 0,
       cancelled: 0,
+      incomplete: 0,
       running: 0,
       stalled: 0,
       orphaned: 0,

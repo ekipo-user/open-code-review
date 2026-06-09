@@ -13,6 +13,41 @@ import { EventStreamRenderer } from './event-stream/event-stream-renderer'
  * previously dumped into the header — the raw command is always one
  * click away via the "Raw" toggle.
  */
+/**
+ * Map status (preferred) and exit code (fallback) to the badge label.
+ * Status comes from the server-derived CommandOutcome via the provider;
+ * exit code is the legacy fallback for unhydrated rows.
+ */
+function statusBadgeLabel(
+  status: 'running' | 'complete' | 'incomplete' | 'cancelled' | 'failed' | undefined,
+  exitCode: number,
+): string {
+  if (status === 'complete') return 'Complete'
+  if (status === 'incomplete') return 'Incomplete'
+  if (status === 'cancelled') return 'Cancelled'
+  if (status === 'failed') return `Exit: ${exitCode}`
+  // Fallback (no status from server) — exit code only.
+  if (exitCode === 0) return 'Complete'
+  if (exitCode === -2) return 'Cancelled'
+  return `Exit: ${exitCode}`
+}
+
+/** Tailwind color classes for each end-state. Amber for incomplete keeps */
+/** it visually distinct from green (success) and red (failed). */
+function statusBadgeClasses(
+  status: 'running' | 'complete' | 'incomplete' | 'cancelled' | 'failed' | undefined,
+  exitCode: number,
+): string {
+  const effective = status ?? (exitCode === 0 ? 'complete' : exitCode === -2 ? 'cancelled' : 'failed')
+  if (effective === 'complete')
+    return 'border-emerald-500/25 bg-emerald-500/15 text-emerald-700 dark:text-emerald-400'
+  if (effective === 'incomplete')
+    return 'border-amber-500/25 bg-amber-500/15 text-amber-700 dark:text-amber-400'
+  if (effective === 'cancelled')
+    return 'border-amber-500/25 bg-amber-500/15 text-amber-700 dark:text-amber-400'
+  return 'border-red-500/25 bg-red-500/15 text-red-700 dark:text-red-400'
+}
+
 function parseCommandSummary(command: string | null): {
   verb: string
   reviewerCount: number | null
@@ -49,6 +84,12 @@ type WorkflowOutputProps = {
   events?: StreamEvent[]
   isRunning: boolean
   exitCode: number | null
+  /**
+   * Canonical end-state from the parent provider, derived server-side
+   * from (exit_code, linked workflow.status). Falls back to exit-code
+   * mapping if absent (older sockets / unhydrated state).
+   */
+  status?: 'running' | 'complete' | 'incomplete' | 'cancelled' | 'failed'
   commandName: string | null
   onCancel: () => void
   bare?: boolean
@@ -66,6 +107,7 @@ export function WorkflowOutput({
   events,
   isRunning,
   exitCode,
+  status,
   commandName,
   onCancel,
   bare,
@@ -145,14 +187,15 @@ export function WorkflowOutput({
             <span
               className={cn(
                 'inline-flex items-center rounded-md border px-2 py-0.5 text-xs font-medium',
-                exitCode === 0
-                  ? 'border-emerald-500/25 bg-emerald-500/15 text-emerald-700 dark:text-emerald-400'
-                  : exitCode === -2
-                    ? 'border-amber-500/25 bg-amber-500/15 text-amber-700 dark:text-amber-400'
-                    : 'border-red-500/25 bg-red-500/15 text-red-700 dark:text-red-400',
+                statusBadgeClasses(status, exitCode),
               )}
+              title={
+                status === 'incomplete'
+                  ? "Process exited 0 but the workflow never reached its terminal phase. Likely cause: the parent process was interrupted (e.g. macOS sleep dropped the streaming connection). Use 'Resume in terminal' to pick up where it left off."
+                  : undefined
+              }
             >
-              {exitCode === 0 ? 'Complete' : exitCode === -2 ? 'Cancelled' : `Exit: ${exitCode}`}
+              {statusBadgeLabel(status, exitCode)}
             </span>
           )}
           {hasTimeline && (

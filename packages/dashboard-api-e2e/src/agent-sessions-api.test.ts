@@ -91,9 +91,12 @@ async function runCli(
 }
 
 async function seedWorkflow(id: string, branch: string): Promise<string> {
-  return runCli([
+  // `state begin` prints a human status line ("<id>: round 1, phase …"),
+  // not a bare id, so return the known session id directly for use as the
+  // `--workflow` argument downstream.
+  await runCli([
     "state",
-    "init",
+    "begin",
     "--session-id",
     id,
     "--branch",
@@ -101,6 +104,7 @@ async function seedWorkflow(id: string, branch: string): Promise<string> {
     "--workflow-type",
     "review",
   ]);
+  return id;
 }
 
 async function seedAgentSession(
@@ -233,6 +237,7 @@ describe("GET /api/agent-sessions", () => {
       persona: string | null;
       resolved_model: string | null;
       status: string;
+      kind: string;
       last_heartbeat_at: string;
     }>;
     expect(rows).toHaveLength(1);
@@ -241,6 +246,9 @@ describe("GET /api/agent-sessions", () => {
       persona: "principal",
       resolved_model: "claude-opus-4-7",
       status: "running",
+      // A start-instance reviewer is surfaced as a derived `kind`, so a
+      // consumer can tell the process role without parsing the command string.
+      kind: "instance",
     });
     expect(rows[0]?.last_heartbeat_at).toBeTruthy();
   });
@@ -388,7 +396,7 @@ describe("GET /api/sessions/:id/handoff", () => {
   });
 });
 
-describe("ocr state init — late workflow_id linking via OCR_DASHBOARD_EXECUTION_UID", () => {
+describe("ocr state begin — late workflow_id linking via OCR_DASHBOARD_EXECUTION_UID", () => {
   it("links the dashboard's parent command_execution row to the new session, making handoff resolve a vendor_command", async () => {
     // Simulate the dashboard's full happy path:
     //
@@ -396,8 +404,8 @@ describe("ocr state init — late workflow_id linking via OCR_DASHBOARD_EXECUTIO
     //      heartbeat but no workflow_id (command-runner does this).
     //   2. Claude emits a session_id, command-runner binds it directly to
     //      that row's vendor_session_id (fix #1 in this plan).
-    //   3. AI (running inside the spawned Claude) calls `ocr state init`
-    //      with OCR_DASHBOARD_EXECUTION_UID set — `state init` populates
+    //   3. AI (running inside the spawned Claude) calls `ocr state begin`
+    //      with OCR_DASHBOARD_EXECUTION_UID set — `state begin` populates
     //      workflow_id on the parent row (fix #2 in this plan).
     //   4. Handoff route's `getLatestAgentSessionWithVendorId(workflowId)`
     //      finds the parent row with both fields set and returns a
@@ -411,11 +419,11 @@ describe("ocr state init — late workflow_id linking via OCR_DASHBOARD_EXECUTIO
     // We use ocr session start-instance + bind-vendor-id then strip
     // workflow_id manually via a test-only path… simpler: insert via
     // raw SQL through ocr's exec helper. The CLI doesn't expose raw SQL
-    // so we'll seed using a `state init` AND rely on the AGENT row that
+    // so we'll seed using a `state begin` AND rely on the AGENT row that
     // gets created. Actually — the cleanest synthetic path is:
     //
     //   a. Seed a base session for the test (gives us valid session id)
-    //   b. Run state init WITH the env var → linkage triggers
+    //   b. Run state begin WITH the env var → linkage triggers
     //
     // To prove the env-var BEHAVIOR (not just that handoff works in
     // happy path), we seed an unlinked dashboard parent row by running
@@ -423,7 +431,7 @@ describe("ocr state init — late workflow_id linking via OCR_DASHBOARD_EXECUTIO
     // then mutating it. That's contrived. Better: trust the unit-level
     // behavior of state.ts and observe the user-visible outcome.
     //
-    // Pragmatic: run state init twice. The second one with the env var
+    // Pragmatic: run state begin twice. The second one with the env var
     // pointing at a known previous row.
     //
     // Even simpler still: we can directly test the handoff payload by
@@ -432,11 +440,13 @@ describe("ocr state init — late workflow_id linking via OCR_DASHBOARD_EXECUTIO
     // Seed a fully-bound workflow the same way an AI workflow would:
     // this creates the parent row via `ocr session start-instance`
     // (with workflow_id) and binds a vendor session id.
-    const workflowId = await runCli([
+    const workflowId = `2026-04-30-late-link-${Date.now()}`;
+    // `state begin` prints a status line, not a bare id — use the known id.
+    await runCli([
       "state",
-      "init",
+      "begin",
       "--session-id",
-      `2026-04-30-late-link-${Date.now()}`,
+      workflowId,
       "--branch",
       "feat/late-link-test",
       "--workflow-type",
@@ -461,14 +471,14 @@ describe("ocr state init — late workflow_id linking via OCR_DASHBOARD_EXECUTIO
       "vendor-session-late-link-test",
     ]);
 
-    // Now exercise the env-var path: a *fresh* `state init` invocation
+    // Now exercise the env-var path: a *fresh* `state begin` invocation
     // with OCR_DASHBOARD_EXECUTION_UID pointing at the agent we just
     // created. This is a no-op for handoff (we already had vendor_session
     // bound) but exercises the linkage code path without crashing.
     await runCli(
       [
         "state",
-        "init",
+        "begin",
         "--session-id",
         `2026-04-30-second-${Date.now()}`,
         "--branch",
@@ -522,7 +532,7 @@ describe("ocr state init — late workflow_id linking via OCR_DASHBOARD_EXECUTIO
     await runCli(
       [
         "state",
-        "init",
+        "begin",
         "--session-id",
         `2026-04-30-stale-uid-${Date.now()}`,
         "--branch",

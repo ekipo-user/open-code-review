@@ -12,9 +12,9 @@ import { tmpdir } from 'node:os'
 import { join, dirname, isAbsolute } from 'node:path'
 import { randomUUID } from 'node:crypto'
 import type { Server as SocketIOServer, Socket } from 'socket.io'
-import type { Database } from 'sql.js'
+import type { Database } from '@open-code-review/cli/db'
 import { execBinaryAsync } from '@open-code-review/platform'
-import { getSession, saveDb } from '../db.js'
+import { getSession } from '../db.js'
 import { cleanEnv } from './env.js'
 import { resolveLocalCli } from './cli-resolver.js'
 import { AiCliService, formatToolDetail, type NormalizedEvent } from '../services/ai-cli/index.js'
@@ -242,8 +242,8 @@ export function registerPostHandlers(
           '',
           'Examples:',
           `- Instead of \`ocr state show\`, run: \`node ${localCli} state show\``,
-          `- Instead of \`ocr state init ...\`, run: \`node ${localCli} state init ...\``,
-          `- Instead of \`ocr state transition ...\`, run: \`node ${localCli} state transition ...\``,
+          `- Instead of \`ocr state begin ...\`, run: \`node ${localCli} state begin ...\``,
+          `- Instead of \`ocr state advance ...\`, run: \`node ${localCli} state advance ...\``,
           '',
           'This applies to every `ocr` invocation. Do NOT use bare `ocr` commands.',
         )
@@ -463,8 +463,6 @@ export function registerPostHandlers(
 
         const filePath = join(roundDir, 'final-human.md')
         writeFileSync(filePath, content, { mode: 0o644 })
-
-        saveDb(db, ocrDir)
 
         socket.emit('post:save-result', { success: true })
       } catch (err) {

@@ -22,7 +22,7 @@
  * Scope: read-only on disk + DB. The caller (`SessionCaptureService`)
  * is responsible for performing the backfill via `recordSessionId`.
  */
-import type { Database } from 'sql.js'
+import type { Database } from '@open-code-review/cli/db'
 import { readEventJournal } from '../event-journal.js'
 
 export type RecoveredCapture = {

@@ -73,6 +73,7 @@ export type {
   AgentSession,
   AgentSessionStatus,
   AgentVendor,
+  RowKind,
 } from "../state/types.js";
 
 /**
@@ -111,15 +112,46 @@ export type UpdateAgentSessionParams = Partial<
 
 export type SweepResult = {
   orphanedIds: string[];
+  /** workflow_ids whose in-flight dependents were cascade-closed because the
+   *  workflow's supervising process was orphaned (for the sweep log line). */
+  cascadedWorkflowIds: string[];
+};
+
+/**
+ * Result of sweepStaleSessions — the workflow_ids that were
+ * auto-closed because they'd been idle past the threshold AND had no
+ * running dependent rows.
+ */
+export type StaleSessionSweepResult = {
+  closedSessionIds: string[];
 };
 
 // ── Migration types ──
 
+type MigrationStep = {
+  /** Declarative DDL. */
+  sql?: string;
+  /**
+   * Imperative step for migrations that need conditional logic SQLite can't
+   * express declaratively (e.g. an idempotent `DROP COLUMN` guarded on column
+   * existence). Runs after `sql` (if both are present), inside the same
+   * migration transaction. Must be safe to re-run.
+   */
+  run?: (db: import("./engine.js").Database) => void;
+};
+
+/**
+ * A schema migration. The union requires AT LEAST ONE of `sql` / `run` — an
+ * empty `{ version, description }` that bumps the schema version without doing
+ * anything is unrepresentable. (Both may be present: `sql` runs, then `run`.)
+ */
 export type Migration = {
   version: number;
   description: string;
-  sql: string;
-};
+} & (
+  | (MigrationStep & { sql: string })
+  | (MigrationStep & { run: (db: import("./engine.js").Database) => void })
+);
 
 export type SchemaVersionRow = {
   version: number;

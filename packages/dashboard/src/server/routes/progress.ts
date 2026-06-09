@@ -3,7 +3,7 @@
  */
 
 import { Router } from 'express'
-import type { Database } from 'sql.js'
+import type { Database } from '@open-code-review/cli/db'
 import {
   getMapFile,
   getFinding,
@@ -17,7 +17,6 @@ import {
   getRoundProgress,
   upsertRoundProgress,
   deleteRoundProgress,
-  saveDb,
   type FindingProgressRow,
   type RoundProgressRow,
 } from '../db.js'
@@ -38,43 +37,7 @@ const VALID_ROUND_STATUSES = new Set<RoundProgressRow['status']>([
   'dismissed',
 ])
 
-// ── Debounced save ──
-
-let saveTimer: ReturnType<typeof setTimeout> | null = null
-let pendingDb: Database | null = null
-let pendingOcrDir: string | null = null
-
-function debouncedSave(db: Database, ocrDir: string): void {
-  pendingDb = db
-  pendingOcrDir = ocrDir
-  if (saveTimer) clearTimeout(saveTimer)
-  saveTimer = setTimeout(() => {
-    if (pendingDb && pendingOcrDir) {
-      saveDb(pendingDb, pendingOcrDir)
-    }
-    saveTimer = null
-    pendingDb = null
-    pendingOcrDir = null
-  }, 500)
-}
-
-/**
- * Flush any pending debounced save immediately.
- * Call this on server shutdown to ensure no writes are lost.
- */
-export function flushSave(): void {
-  if (saveTimer) {
-    clearTimeout(saveTimer)
-    saveTimer = null
-  }
-  if (pendingDb && pendingOcrDir) {
-    saveDb(pendingDb, pendingOcrDir)
-    pendingDb = null
-    pendingOcrDir = null
-  }
-}
-
-export function createProgressRouter(db: Database, ocrDir: string): Router {
+export function createProgressRouter(db: Database): Router {
   const router = Router()
 
   // PATCH /api/map-files/:id/progress — Toggle file review status
@@ -99,7 +62,6 @@ export function createProgressRouter(db: Database, ocrDir: string): Router {
       }
 
       upsertFileProgress(db, fileId, isReviewed)
-      debouncedSave(db, ocrDir)
 
       const progress = getFileProgress(db, fileId)
       res.json(progress)
@@ -119,7 +81,6 @@ export function createProgressRouter(db: Database, ocrDir: string): Router {
       }
 
       deleteFileProgress(db, fileId)
-      debouncedSave(db, ocrDir)
       res.status(200).json({ deleted: true })
     } catch (err) {
       console.error('Failed to clear file progress:', err)
@@ -152,7 +113,6 @@ export function createProgressRouter(db: Database, ocrDir: string): Router {
       }
 
       upsertFindingProgress(db, findingId, status as FindingProgressRow['status'])
-      debouncedSave(db, ocrDir)
 
       const progress = getFindingProgress(db, findingId)
       res.json(progress)
@@ -172,7 +132,6 @@ export function createProgressRouter(db: Database, ocrDir: string): Router {
       }
 
       deleteFindingProgress(db, findingId)
-      debouncedSave(db, ocrDir)
       res.status(200).json({ deleted: true })
     } catch (err) {
       console.error('Failed to clear finding progress:', err)
@@ -205,7 +164,6 @@ export function createProgressRouter(db: Database, ocrDir: string): Router {
       }
 
       upsertRoundProgress(db, roundId, status as RoundProgressRow['status'])
-      debouncedSave(db, ocrDir)
 
       const progress = getRoundProgress(db, roundId)
       res.json(progress)
@@ -225,7 +183,6 @@ export function createProgressRouter(db: Database, ocrDir: string): Router {
       }
 
       deleteRoundProgress(db, roundId)
-      debouncedSave(db, ocrDir)
       res.status(200).json({ deleted: true })
     } catch (err) {
       console.error('Failed to clear round progress:', err)

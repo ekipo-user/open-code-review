@@ -13,7 +13,7 @@ import { fetchApi, parseUtcDate } from '../../lib/utils'
 import { formatDate } from '../../lib/date-utils'
 import type { OrchestrationEvent } from '../../lib/api-types'
 
-// Phase names must match the CLI's `ocr state transition --phase` values exactly.
+// Phase names must match the CLI's `ocr state advance --phase` values exactly.
 // Display labels are derived by replacing hyphens with spaces and capitalizing.
 const REVIEW_PHASES = [
   'context',

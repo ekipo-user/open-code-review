@@ -1,10 +1,23 @@
 /**
- * OCR State Management Module
+ * OCR State Management Module — barrel + porcelain.
  *
  * Manages session state exclusively through SQLite (.ocr/data/ocr.db).
+ *
+ * This module is the canonical public surface of the state layer. The
+ * cohesive concerns have been extracted into sibling modules; this file keeps
+ * the porcelain mutators (the misuse-proof agent API) and re-exports the full
+ * public surface as a BARREL so every existing importer keeps working
+ * unchanged:
+ *
+ *   - exit-codes.ts  — {@link STATE_EXIT}, {@link StateError}, process sentinels
+ *   - phase-graph.ts — phase numbers, transition graphs, validatePhaseTransition
+ *   - round-meta.ts  — validateRoundMeta, computeRoundCounts
+ *   - map-meta.ts    — validateMapMeta, computeMapCounts
+ *   - projection.ts  — event-fold + completeness helpers
+ *   - meta-util.ts   — shared sanitizeMetadataString
  */
 
-import type { Database } from "sql.js";
+import type { Database } from "../db/engine.js";
 import {
   existsSync,
   mkdirSync,
@@ -15,7 +28,6 @@ import {
 } from "node:fs";
 import {
   ensureDatabase,
-  saveDatabase,
   insertSession,
   updateSession,
   getSession,
@@ -23,6 +35,8 @@ import {
   getAllSessions,
   insertEvent,
   getEventsForSession,
+  commitReasonClose,
+  cascadeTerminateExecutions,
 } from "../db/index.js";
 import { join } from "node:path";
 import type {
@@ -33,12 +47,32 @@ import type {
   RoundCompleteParams,
   RoundCompleteResult,
   RoundMeta,
-  RoundMetaFinding,
   SynthesisCounts,
   MapCompleteParams,
   MapCompleteResult,
   MapMeta,
+  SessionStatus,
+  ReviewPhase,
+  MapPhase,
 } from "./types.js";
+
+import { STATE_EXIT, StateError, CASCADE_CLOSE_EXIT_CODE } from "./exit-codes.js";
+import {
+  phaseNumberFor,
+  validatePhaseTransition,
+} from "./phase-graph.js";
+import { validateRoundMeta, computeRoundCounts } from "./round-meta.js";
+import { validateMapMeta, computeMapCounts } from "./map-meta.js";
+import {
+  hasCompletionInvariant,
+  getCompletenessState,
+} from "./projection.js";
+
+// ── Public re-export barrel ──
+//
+// Surfaces everything the rest of the codebase imports from this module so
+// existing import paths (`../state/index.js`, `../index.js` in tests) keep
+// working unchanged after the module split.
 
 export type {
   InitParams,
@@ -64,7 +98,79 @@ export type {
   MapMetaDependency,
 } from "./types.js";
 
-// ── Helpers ──
+// Exit-code taxonomy, error class, and the negative process sentinels live in
+// the leaf `exit-codes.ts`. Re-exported here (and from the db barrel) so both
+// the state layer's consumers and the dashboard can import them canonically.
+export {
+  STATE_EXIT,
+  StateError,
+  CANCELLED_EXIT_CODE,
+  ORPHAN_EXIT_CODE,
+  CASCADE_CLOSE_EXIT_CODE,
+} from "./exit-codes.js";
+
+// Phase-graph state machine.
+export {
+  REVIEW_PHASE_NUMBERS,
+  MAP_PHASE_NUMBERS,
+  phaseNumberFor,
+  graphFor,
+  initialPhaseFor,
+  validatePhaseTransition,
+} from "./phase-graph.js";
+export type { WorkflowKind } from "./phase-graph.js";
+
+// Round-meta / map-meta validation + count helpers.
+export { validateRoundMeta, computeRoundCounts } from "./round-meta.js";
+export { validateMapMeta, computeMapCounts } from "./map-meta.js";
+
+// Shared metadata sanitizer.
+export { sanitizeMetadataString } from "./meta-util.js";
+
+// Event-fold / completeness helpers.
+export {
+  REASON_EVENT_TYPES,
+  TERMINAL_EVENT_TYPES,
+  rebuildSessionProjection,
+  hasCompletionInvariant,
+  getCompletenessState,
+} from "./projection.js";
+export type { DerivedLifecycle } from "./projection.js";
+
+/**
+ * Re-export of the atomic reason-close primitive. It physically lives in the
+ * leaf `db/queries.ts` module (surfaced via the db barrel) to avoid an import
+ * cycle — reconcile.ts also uses it — but is re-exported here so the state
+ * layer and external consumers (the dashboard) can import it from the
+ * canonical state module as well.
+ */
+export { commitReasonClose };
+
+// ── Private helpers ──
+
+/**
+ * Derive the next round number from `round_completed` events.
+ *
+ * Events are authoritative — they record what actually happened. The
+ * filesystem is observational and may drift. If the highest completed
+ * round is N, the next round is N+1. If no rounds have completed yet,
+ * the next round is the session's current_round (i.e. still on the
+ * current round — caller is resuming, not advancing).
+ */
+function deriveNextRound(
+  db: Database,
+  sessionId: string,
+  fallbackRound: number,
+): number {
+  const result = db.exec(
+    `SELECT MAX(round) FROM orchestration_events
+       WHERE session_id = ? AND event_type = 'round_completed'`,
+    [sessionId],
+  );
+  const max = result[0]?.values[0]?.[0];
+  if (typeof max === "number") return max + 1;
+  return fallbackRound;
+}
 
 /** Returns true if the directory contains at least one .md or .json file (recursively). */
 function hasArtifacts(dir: string): boolean {
@@ -83,6 +189,37 @@ function hasArtifacts(dir: string): boolean {
 }
 
 /**
+ * Read raw JSON string from either a file path or a raw data string.
+ */
+function readJsonFromSource(
+  params: { source: "file"; filePath: string } | { source: "stdin"; data: string },
+): string {
+  if (params.source === "file") {
+    if (!existsSync(params.filePath)) {
+      throw new StateError(STATE_EXIT.NOT_FOUND, `File not found: ${params.filePath}`);
+    }
+    return readFileSync(params.filePath, "utf-8");
+  }
+  return params.data;
+}
+
+/**
+ * Parse a raw JSON string, throwing a descriptive error on failure.
+ */
+function parseRawJson(raw: string, label: string): unknown {
+  try {
+    return JSON.parse(raw);
+  } catch (err) {
+    throw new StateError(
+      STATE_EXIT.SCHEMA_INVALID,
+      `Failed to parse ${label}: ${err instanceof Error ? err.message : "invalid JSON"}`,
+    );
+  }
+}
+
+// ── Lifecycle mutators ──
+
+/**
  * Initialize a session in SQLite.
  *
  * If the session already exists (e.g. round-1 completed and closed),
@@ -92,149 +229,229 @@ function hasArtifacts(dir: string): boolean {
 export async function stateInit(params: InitParams): Promise<string> {
   const { sessionId, branch, workflowType, sessionDir, ocrDir } = params;
   const db = await ensureDatabase(ocrDir);
-  const dbPath = join(ocrDir, "data", "ocr.db");
 
   const existing = getSession(db, sessionId);
 
   if (existing) {
-    // Session exists — determine the correct round from filesystem
-    const roundsDir = join(sessionDir, "rounds");
-    let nextRound = 1;
-
-    if (existsSync(roundsDir)) {
-      const roundDirs = readdirSync(roundsDir)
-        .filter((d) => /^round-\d+$/.test(d))
-        .map((d) => parseInt(d.replace("round-", ""), 10))
-        .sort((a, b) => a - b);
-
-      if (roundDirs.length > 0) {
-        const highest = roundDirs[roundDirs.length - 1]!;
-        const hasFinal = existsSync(
-          join(roundsDir, `round-${highest}`, "final.md"),
-        );
-        nextRound = hasFinal ? highest + 1 : highest;
-      }
+    // Workflow type compatibility: re-opening with a different type would
+    // corrupt phase semantics (review vs map have disjoint phase graphs).
+    if (existing.workflow_type !== workflowType) {
+      throw new StateError(
+        STATE_EXIT.USAGE,
+        `Cannot re-open session ${sessionId} as workflow_type "${workflowType}": ` +
+          `existing workflow_type is "${existing.workflow_type}". ` +
+          `Maps and reviews have disjoint phase graphs.`,
+      );
     }
 
-    // Re-open the session for the next round
-    updateSession(db, sessionId, {
-      status: "active",
-      current_phase: "context",
+    // Session exists — derive next round from DB events (authoritative)
+    // rather than filesystem (observational). Previously this read
+    // rounds/round-N/final.md presence on disk, which broke if the disk
+    // state was missing or out-of-sync with the DB. Events are the
+    // system of record; filesystem is a side-effect.
+    const nextRound = deriveNextRound(db, sessionId, existing.current_round);
+
+    // Each workflow type starts at its own initial phase. The phase
+    // graph treats review and map vocabularies as disjoint — using the
+    // wrong one here causes every subsequent transition to be rejected.
+    const initialPhase = workflowType === "map" ? "map-context" : "context";
+
+    // Re-open the session for the next round (projection + event atomic).
+    db.transaction(() => {
+      updateSession(db, sessionId, {
+        status: "active",
+        current_phase: initialPhase,
+        phase_number: 1,
+        current_round: nextRound,
+      });
+
+      insertEvent(db, {
+        session_id: sessionId,
+        event_type:
+          nextRound > (existing.current_round ?? 1)
+            ? "round_started"
+            : "session_resumed",
+        phase: initialPhase,
+        phase_number: 1,
+        round: nextRound,
+      });
+    });
+
+    return sessionId;
+  }
+
+  const initialPhase = workflowType === "map" ? "map-context" : "context";
+
+  // New session — original path (projection + event atomic).
+  db.transaction(() => {
+    insertSession(db, {
+      id: sessionId,
+      branch,
+      workflow_type: workflowType,
+      current_phase: initialPhase,
       phase_number: 1,
-      current_round: nextRound,
+      current_round: 1,
+      current_map_run: 1,
+      session_dir: sessionDir,
     });
 
     insertEvent(db, {
       session_id: sessionId,
-      event_type:
-        nextRound > (existing.current_round ?? 1)
-          ? "round_started"
-          : "session_resumed",
-      phase: "context",
+      event_type: "session_created",
+      phase: initialPhase,
       phase_number: 1,
-      round: nextRound,
+      round: 1,
     });
-
-    saveDatabase(db, dbPath);
-    return sessionId;
-  }
-
-  // New session — original path
-  insertSession(db, {
-    id: sessionId,
-    branch,
-    workflow_type: workflowType,
-    current_phase: "context",
-    phase_number: 1,
-    current_round: 1,
-    current_map_run: 1,
-    session_dir: sessionDir,
   });
-
-  insertEvent(db, {
-    session_id: sessionId,
-    event_type: "session_created",
-    phase: "context",
-    phase_number: 1,
-    round: 1,
-  });
-
-  saveDatabase(db, dbPath);
 
   return sessionId;
 }
 
 /**
  * Transition a session to a new phase in SQLite.
+ *
+ * Accepts an optional already-open `db` handle so callers that have already
+ * opened the database (e.g. {@link stateAdvance}) can avoid a redundant
+ * second open. When omitted, the handle is opened from `ocrDir`.
  */
-export async function stateTransition(params: TransitionParams): Promise<void> {
+export async function stateTransition(
+  params: TransitionParams,
+  db?: Database,
+): Promise<void> {
   const { sessionId, phase, phaseNumber, round, mapRun, ocrDir } = params;
-  const db = await ensureDatabase(ocrDir);
-  const dbPath = join(ocrDir, "data", "ocr.db");
+  db ??= await ensureDatabase(ocrDir);
 
   const existing = getSession(db, sessionId);
   if (!existing) {
-    throw new Error(`Session not found: ${sessionId}`);
+    throw new StateError(STATE_EXIT.NOT_FOUND, `Session not found: ${sessionId}`);
   }
 
   const previousRound = existing.current_round;
+  const previousMapRun = existing.current_map_run;
+  const isRoundBoundary =
+    (round !== undefined && round !== previousRound) ||
+    (mapRun !== undefined && mapRun !== previousMapRun);
 
-  updateSession(db, sessionId, {
-    current_phase: phase,
-    phase_number: phaseNumber,
-    ...(round !== undefined ? { current_round: round } : {}),
-    ...(mapRun !== undefined ? { current_map_run: mapRun } : {}),
-  });
-
-  insertEvent(db, {
-    session_id: sessionId,
-    event_type: "phase_transition",
+  validatePhaseTransition(
+    existing.workflow_type,
+    existing.current_phase,
     phase,
-    phase_number: phaseNumber,
-    round: round ?? existing.current_round,
-  });
+    isRoundBoundary,
+  );
 
-  // If round changed, also insert a round_started event
-  if (round !== undefined && round !== previousRound) {
+  // Event + projection commit together so the sessions row can never reflect
+  // a phase the event log doesn't record (and vice versa).
+  db.transaction(() => {
+    updateSession(db, sessionId, {
+      current_phase: phase,
+      phase_number: phaseNumber,
+      ...(round !== undefined ? { current_round: round } : {}),
+      ...(mapRun !== undefined ? { current_map_run: mapRun } : {}),
+    });
+
     insertEvent(db, {
       session_id: sessionId,
-      event_type: "round_started",
+      event_type: "phase_transition",
       phase,
       phase_number: phaseNumber,
-      round,
+      round: round ?? existing.current_round,
     });
-  }
 
-  saveDatabase(db, dbPath);
+    // If round changed, also insert a round_started event
+    if (round !== undefined && round !== previousRound) {
+      insertEvent(db, {
+        session_id: sessionId,
+        event_type: "round_started",
+        phase,
+        phase_number: phaseNumber,
+        round,
+      });
+    }
+  });
 }
 
 /**
  * Close a session in SQLite.
+ *
+ * Idempotent: if the session is already `closed`, returns without writing
+ * a second `session_closed` event.
+ *
+ * Cascades to dependent `command_executions` rows: any still in flight
+ * (finished_at IS NULL) for this workflow are stamped terminal with
+ * exit_code = -4 and a structured note. Without this, closing a workflow
+ * left stranded child rows whose only cleanup path was the heartbeat
+ * liveness sweep — and that sweep depends on the dashboard running.
  */
 export async function stateClose(params: CloseParams): Promise<void> {
-  const { sessionId, ocrDir } = params;
+  const { sessionId, ocrDir, abort } = params;
   const db = await ensureDatabase(ocrDir);
-  const dbPath = join(ocrDir, "data", "ocr.db");
 
   const existing = getSession(db, sessionId);
   if (!existing) {
-    throw new Error(`Session not found: ${sessionId}`);
+    throw new StateError(STATE_EXIT.NOT_FOUND, `Session not found: ${sessionId}`);
   }
 
-  updateSession(db, sessionId, {
-    status: "closed",
-    current_phase: "complete",
-  });
+  if (existing.status === "closed") {
+    // Idempotent no-op. Caller still gets a clean exit; the stderr
+    // notice tells them their action had no effect — useful when the AI
+    // accidentally retries close after a successful first attempt.
+    console.error(`[ocr] Session already closed: ${sessionId}`);
+    return;
+  }
 
-  insertEvent(db, {
-    session_id: sessionId,
-    event_type: "session_closed",
-    phase: "complete",
-    phase_number: existing.phase_number,
-    round: existing.current_round,
-  });
+  // Completion invariant (app-level guard; the DB close-guard trigger is the
+  // backstop). A normal close requires the current round/run to be complete.
+  // `--abort` records a distinct, non-success terminal instead.
+  if (!abort && !hasCompletionInvariant(db, existing)) {
+    const what =
+      existing.workflow_type === "map"
+        ? `map run ${existing.current_map_run} has no map_completed event`
+        : `round ${existing.current_round} has no round_completed event`;
+    throw new StateError(
+      STATE_EXIT.INVARIANT_UNMET,
+      `Cannot close session ${sessionId}: ${what}. ` +
+        `Run 'ocr state complete-round' to finalize it, or pass --abort to record an abandoned session.`,
+    );
+  }
 
-  saveDatabase(db, dbPath);
+  // Machine-written audit note on the cascaded command_executions rows. This
+  // is intentionally distinct from the dashboard's user-facing "Superseded"
+  // tooltip (command-history.tsx) — different audience, different wording.
+  const note = "closed by parent workflow close";
+  db.transaction(() => {
+    if (abort) {
+      // Reason event FIRST so the close-guard trigger is satisfied at the
+      // status UPDATE; abort is a recorded, non-success terminal.
+      insertEvent(db, {
+        session_id: sessionId,
+        event_type: "session_aborted",
+        phase: existing.current_phase,
+        phase_number: existing.phase_number,
+        round: existing.current_round,
+      });
+    }
+
+    updateSession(db, sessionId, {
+      status: "closed",
+      current_phase: "complete",
+    });
+
+    if (!abort) {
+      insertEvent(db, {
+        session_id: sessionId,
+        event_type: "session_closed",
+        phase: "complete",
+        phase_number: existing.phase_number,
+        round: existing.current_round,
+      });
+    }
+
+    // Cascade: terminate any dependent command_executions rows still in
+    // flight. Without this, a workflow close leaves orphan rows that only
+    // the heartbeat sweep can recover — and that sweep needs the dashboard
+    // running. Doing it here makes close authoritative.
+    cascadeTerminateExecutions(db, sessionId, CASCADE_CLOSE_EXIT_CODE, note);
+  });
 }
 
 /**
@@ -314,415 +531,531 @@ export async function stateList(
   }));
 }
 
+// ── Session resolution ──
+
 /**
- * Resolves the active session ID from SQLite.
- * Throws if no active session is found.
+ * How the resolver arrived at the chosen session. Surfaced on the
+ * result so callers (and tests) can verify the decision path. Also
+ * printed to stderr by {@link announceResolveDecision} so users see
+ * which session a command will affect when they omit `--session-id`.
+ */
+export type ResolveDecision = "explicit" | "dashboard-uid" | "latest-active";
+
+export type ResolveSessionResult = {
+  id: string;
+  session_dir: string;
+  current_round: number;
+  current_map_run: number;
+  workflow_type: "review" | "map";
+  // Projection fields carried through so callers that need them (completion,
+  // status) don't have to re-`getSession` and dereference with a `!`.
+  status: SessionStatus;
+  current_phase: string;
+  phase_number: number;
+  branch: string;
+  decision: ResolveDecision;
+};
+
+/**
+ * Single source of truth for "which session does this CLI invocation
+ * apply to?". Replaces the two parallel helpers that previously diverged
+ * (resolveActiveSession + resolveSessionForCompletion). Used by every
+ * `state` and `session` subcommand that accepts an optional `--session-id`.
+ *
+ * Resolution order, most-specific to least:
+ *   1. `explicitId`         — caller passed `--session-id`
+ *   2. `OCR_DASHBOARD_EXECUTION_UID` env var → `command_executions.workflow_id`.
+ *      Set by the dashboard when it spawns the AI; the SessionCaptureService
+ *      binds that uid to the workflow_id once the AI calls `state begin`.
+ *   3. latest-active fallback — only when exactly one active session exists.
+ *      With >1 active sessions and no env var, this throws an ambiguity
+ *      error rather than silently picking one. Brittle auto-detect is the
+ *      root cause of the "wrong session got closed" failure mode.
+ */
+export function resolveSession(
+  db: Database,
+  explicitId?: string,
+): ResolveSessionResult {
+  // 1. Explicit
+  if (explicitId) {
+    const s = getSession(db, explicitId);
+    if (!s) throw new StateError(STATE_EXIT.NOT_FOUND, `Session not found: ${explicitId}`);
+    return {
+      id: s.id,
+      session_dir: s.session_dir,
+      current_round: s.current_round,
+      current_map_run: s.current_map_run,
+      workflow_type: s.workflow_type,
+      status: s.status,
+      current_phase: s.current_phase,
+      phase_number: s.phase_number,
+      branch: s.branch,
+      decision: "explicit",
+    };
+  }
+
+  // 2. Dashboard execution UID
+  const uid = process.env["OCR_DASHBOARD_EXECUTION_UID"];
+  if (uid) {
+    const result = db.exec(
+      "SELECT workflow_id FROM command_executions WHERE uid = ?",
+      [uid],
+    );
+    const workflowId = result[0]?.values[0]?.[0] as string | null | undefined;
+    if (workflowId) {
+      const s = getSession(db, workflowId);
+      if (s) {
+        return {
+          id: s.id,
+          session_dir: s.session_dir,
+          current_round: s.current_round,
+          current_map_run: s.current_map_run,
+          workflow_type: s.workflow_type,
+          status: s.status,
+          current_phase: s.current_phase,
+          phase_number: s.phase_number,
+          branch: s.branch,
+          decision: "dashboard-uid",
+        };
+      }
+    }
+    // env var present but no linkage yet (race window before the
+    // capture service binds workflow_id). Fall through to latest-active.
+  }
+
+  // 3. Latest-active. Refuse if ambiguous.
+  const activeRows = db.exec(
+    `SELECT id, session_dir, current_round, current_map_run, workflow_type,
+            status, current_phase, phase_number, branch
+       FROM sessions
+      WHERE status = 'active'
+      ORDER BY started_at DESC`,
+  );
+  const rows = activeRows[0]?.values ?? [];
+  if (rows.length === 0) throw new StateError(STATE_EXIT.NOT_FOUND, "No active session found");
+  if (rows.length > 1) {
+    const ids = rows.map((r) => r[0] as string);
+    throw new StateError(
+      STATE_EXIT.AMBIGUOUS,
+      `Ambiguous auto-detect: ${rows.length} active sessions exist. ` +
+        `Pass --session-id explicitly. Candidates: ${ids.join(", ")}`,
+    );
+  }
+  const row = rows[0]!;
+  return {
+    id: row[0] as string,
+    session_dir: row[1] as string,
+    current_round: row[2] as number,
+    current_map_run: row[3] as number,
+    workflow_type: row[4] as "review" | "map",
+    status: row[5] as SessionStatus,
+    current_phase: row[6] as string,
+    phase_number: row[7] as number,
+    branch: row[8] as string,
+    decision: "latest-active",
+  };
+}
+
+/**
+ * Print the auto-detect decision to stderr so a user running a CLI
+ * subcommand without `--session-id` sees which session they're acting on.
+ * No-op when the caller passed an explicit id — they already know.
+ */
+export function announceResolveDecision(r: ResolveSessionResult): void {
+  if (r.decision === "explicit") return;
+  const path =
+    r.decision === "dashboard-uid"
+      ? "via OCR_DASHBOARD_EXECUTION_UID"
+      : "via latest-active";
+  console.error(`[ocr] Auto-detected session: ${r.id} (${path})`);
+}
+
+/**
+ * Backward-compat shim for callers that still take `ocrDir` instead of
+ * a Database handle (CLI subcommands in state.ts / session.ts). New code
+ * should prefer {@link resolveSession} directly.
  */
 export async function resolveActiveSession(
   ocrDir: string,
-): Promise<{ id: string; sessionDir: string }> {
-  const db = await ensureDatabase(ocrDir);
-  const session = getLatestActiveSession(db);
-  if (!session) {
-    throw new Error("No active session found");
-  }
-  return {
-    id: session.id,
-    sessionDir: session.session_dir,
-  };
-}
-
-// ── Shared completion helpers ──
-
-/**
- * Read raw JSON string from either a file path or a raw data string.
- */
-function readJsonFromSource(
-  params: { source: "file"; filePath: string } | { source: "stdin"; data: string },
-): string {
-  if (params.source === "file") {
-    if (!existsSync(params.filePath)) {
-      throw new Error(`File not found: ${params.filePath}`);
-    }
-    return readFileSync(params.filePath, "utf-8");
-  }
-  return params.data;
-}
-
-/**
- * Parse a raw JSON string, throwing a descriptive error on failure.
- */
-function parseRawJson(raw: string, label: string): unknown {
-  try {
-    return JSON.parse(raw);
-  } catch (err) {
-    throw new Error(
-      `Failed to parse ${label}: ${err instanceof Error ? err.message : "invalid JSON"}`,
-    );
-  }
-}
-
-/**
- * Resolve the active session for a completion command.
- * Uses explicit ID if provided, otherwise falls back to the latest active session.
- */
-function resolveSessionForCompletion(
-  db: Database,
   explicitId?: string,
-): { id: string; session_dir: string; current_round: number; current_map_run: number } {
-  if (explicitId) {
-    const existing = getSession(db, explicitId);
-    if (!existing) throw new Error(`Session not found: ${explicitId}`);
-    return {
-      id: existing.id,
-      session_dir: existing.session_dir,
-      current_round: existing.current_round,
-      current_map_run: existing.current_map_run,
-    };
-  }
-  const active = getLatestActiveSession(db);
-  if (!active) throw new Error("No active session found");
+): Promise<{ id: string; sessionDir: string; decision: ResolveDecision }> {
+  const db = await ensureDatabase(ocrDir);
+  const result = resolveSession(db, explicitId);
+  announceResolveDecision(result);
   return {
-    id: active.id,
-    session_dir: active.session_dir,
-    current_round: active.current_round,
-    current_map_run: active.current_map_run,
+    id: result.id,
+    sessionDir: result.session_dir,
+    decision: result.decision,
   };
 }
 
-// ── Round-meta validation helpers ──
+// ── Atomic porcelain (the misuse-proof agent API) ──
 
-const VALID_CATEGORIES = new Set(["blocker", "should_fix", "suggestion", "style"]);
-const VALID_SEVERITIES = new Set(["critical", "high", "medium", "low", "info"]);
-
-function validateRoundMeta(meta: unknown): RoundMeta {
-  if (!meta || typeof meta !== "object") {
-    throw new Error("round-meta.json must be a JSON object");
-  }
-
-  const obj = meta as Record<string, unknown>;
-
-  if (obj.schema_version !== 1) {
-    throw new Error(
-      `Unsupported schema_version: ${String(obj.schema_version)}. Expected 1.`,
-    );
-  }
-
-  if (typeof obj.verdict !== "string" || obj.verdict.trim().length === 0) {
-    throw new Error("round-meta.json must contain a non-empty verdict string");
-  }
-
-  if (!Array.isArray(obj.reviewers)) {
-    throw new Error("round-meta.json must contain a reviewers array");
-  }
-
-  for (const reviewer of obj.reviewers) {
-    if (!reviewer || typeof reviewer !== "object") {
-      throw new Error("Each reviewer must be an object");
-    }
-    const r = reviewer as Record<string, unknown>;
-    if (typeof r.type !== "string") {
-      throw new Error("Each reviewer must have a type string");
-    }
-    if (typeof r.instance !== "number") {
-      throw new Error("Each reviewer must have an instance number");
-    }
-    if (!Array.isArray(r.findings)) {
-      throw new Error(`Reviewer ${r.type}-${r.instance} must have a findings array`);
-    }
-    for (const finding of r.findings) {
-      if (!finding || typeof finding !== "object") {
-        throw new Error("Each finding must be an object");
-      }
-      const f = finding as Record<string, unknown>;
-      if (typeof f.title !== "string" || f.title.trim().length === 0) {
-        throw new Error("Each finding must have a non-empty title");
-      }
-      if (typeof f.category !== 'string' || !VALID_CATEGORIES.has(f.category)) {
-        throw new Error(
-          `Finding "${f.title}" has invalid category: "${String(f.category)}". Must be one of: ${[...VALID_CATEGORIES].join(", ")}`,
-        );
-      }
-      if (typeof f.severity !== 'string' || !VALID_SEVERITIES.has(f.severity)) {
-        throw new Error(
-          `Finding "${f.title}" has invalid severity: "${String(f.severity)}". Must be one of: ${[...VALID_SEVERITIES].join(", ")}`,
-        );
-      }
-      if (typeof f.summary !== "string") {
-        throw new Error(`Finding "${f.title}" must have a summary string`);
-      }
-      if (f.file_path !== undefined && typeof f.file_path !== "string") {
-        throw new Error(`Finding "${f.title}" has invalid file_path: expected string`);
-      }
-      if (f.line_start !== undefined && typeof f.line_start !== "number") {
-        throw new Error(`Finding "${f.title}" has invalid line_start: expected number`);
-      }
-      if (f.line_end !== undefined && typeof f.line_end !== "number") {
-        throw new Error(`Finding "${f.title}" has invalid line_end: expected number`);
-      }
-      if (f.flagged_by !== undefined && !Array.isArray(f.flagged_by)) {
-        throw new Error(`Finding "${f.title}" has invalid flagged_by: expected array`);
-      }
-    }
-  }
-
-  // Validate optional synthesis_counts
-  if (obj.synthesis_counts !== undefined) {
-    if (!obj.synthesis_counts || typeof obj.synthesis_counts !== "object") {
-      throw new Error("synthesis_counts must be an object");
-    }
-    const sc = obj.synthesis_counts as Record<string, unknown>;
-    if (typeof sc.blockers !== "number" || sc.blockers < 0) {
-      throw new Error("synthesis_counts.blockers must be a non-negative number");
-    }
-    if (typeof sc.should_fix !== "number" || sc.should_fix < 0) {
-      throw new Error("synthesis_counts.should_fix must be a non-negative number");
-    }
-    if (typeof sc.suggestions !== "number" || sc.suggestions < 0) {
-      throw new Error("synthesis_counts.suggestions must be a non-negative number");
-    }
-  }
-
-  return meta as RoundMeta;
-}
+export type BeginResult = {
+  schema_version: number;
+  session_id: string;
+  round: number;
+  phase: string;
+  completeness: string | null;
+};
 
 /**
- * Compute counts for a RoundMeta.
- *
- * When `synthesis_counts` is present, those values are preferred because they
- * reflect the **deduplicated, post-synthesis** totals matching `final.md`.
- * The per-reviewer findings array can contain duplicates (the same issue
- * flagged by multiple reviewers), so derived counts may exceed the actual
- * number of unique items in the synthesis.
- *
- * `reviewerCount` and `totalFindingCount` are always derived from the data
- * (they aren't affected by deduplication).
- *
- * Note: `style` findings are intentionally included only in `totalFindingCount`
- * and do not have a separate named counter. The dashboard displays them as part
- * of the total but does not break them out in summary cards.
+ * Start or resume a workflow and report where it stands. Thin wrapper over
+ * `stateInit` that returns a machine-readable status.
  */
-export function computeRoundCounts(meta: RoundMeta): {
-  blockerCount: number;
-  shouldFixCount: number;
-  suggestionCount: number;
-  reviewerCount: number;
-  totalFindingCount: number;
-} {
-  const allFindings: RoundMetaFinding[] = [];
-  for (const reviewer of meta.reviewers) {
-    allFindings.push(...reviewer.findings);
-  }
-
-  // Prefer explicit synthesis counts (deduplicated) over derived counts
-  const sc = meta.synthesis_counts;
-
+export async function stateBegin(params: InitParams): Promise<BeginResult> {
+  const id = await stateInit(params);
+  const db = await ensureDatabase(params.ocrDir);
+  const s = getSession(db, id);
   return {
-    blockerCount: sc ? sc.blockers : allFindings.filter((f) => f.category === "blocker").length,
-    shouldFixCount: sc ? sc.should_fix : allFindings.filter((f) => f.category === "should_fix").length,
-    suggestionCount: sc ? sc.suggestions : allFindings.filter((f) => f.category === "suggestion").length,
-    reviewerCount: meta.reviewers.length,
-    totalFindingCount: allFindings.length,
+    schema_version: 1,
+    session_id: id,
+    round: s?.current_round ?? 1,
+    phase: s?.current_phase ?? "context",
+    completeness: getCompletenessState(db, id),
   };
 }
 
+export type AdvanceParams = {
+  sessionId: string;
+  phase: string;
+  ocrDir: string;
+  round?: number;
+  mapRun?: number;
+};
+
 /**
- * Import structured review round data into SQLite.
- *
- * Accepts data from either a file path (`source: "file"`) or a raw JSON
- * string (`source: "stdin"`). Validates the schema, computes derived counts,
- * and writes a `round_completed` orchestration event.
- *
- * When `source` is `"stdin"`, the CLI also writes `round-meta.json` to the
- * correct session round directory — making the CLI the sole writer of all
- * stateful artifacts.
+ * Advance to a phase. Derives `phase_number` from the phase (no second
+ * field to desync) and delegates to the graph-validated `stateTransition`.
  */
-export async function stateRoundComplete(
-  params: RoundCompleteParams,
+export async function stateAdvance(params: AdvanceParams): Promise<void> {
+  const db = await ensureDatabase(params.ocrDir);
+  const existing = getSession(db, params.sessionId);
+  if (!existing) {
+    throw new StateError(STATE_EXIT.NOT_FOUND, `Session not found: ${params.sessionId}`);
+  }
+  const phaseNumber = phaseNumberFor(existing.workflow_type, params.phase);
+  // Thread the already-open handle so stateTransition doesn't re-open the DB.
+  await stateTransition(
+    {
+      sessionId: params.sessionId,
+      phase: params.phase as ReviewPhase | MapPhase,
+      phaseNumber,
+      round: params.round,
+      mapRun: params.mapRun,
+      ocrDir: params.ocrDir,
+    },
+    db,
+  );
+}
+
+type CompleteRoundParams = RoundCompleteParams & { requireFinal?: boolean };
+
+/**
+ * Atomically finalize a review round: validate the metadata, assert the
+ * workflow actually reached `synthesis` (proof the phases were walked),
+ * write `round-meta.json`, append the `round_completed` event, advance the
+ * round, and transition to `complete` — all-or-nothing. Idempotent: a
+ * second call for an already-completed round is a no-op.
+ */
+export async function stateCompleteRound(
+  params: CompleteRoundParams,
 ): Promise<RoundCompleteResult> {
   const { ocrDir } = params;
   const db = await ensureDatabase(ocrDir);
-  const dbPath = join(ocrDir, "data", "ocr.db");
 
-  // ── 1. Read and parse JSON ──
-  const rawJsonString = readJsonFromSource(params);
-  const label = params.source === "file" ? params.filePath : "stdin";
-  const raw = parseRawJson(rawJsonString, label);
-
-  // ── 2. Validate and compute counts ──
-  const meta = validateRoundMeta(raw);
-  const counts = computeRoundCounts(meta);
-
-  // ── 3. Resolve session and round ──
-  const session = resolveSessionForCompletion(db, params.sessionId);
-  const roundNumber = params.round ?? session.current_round;
-
-  // ── 4. Write round-meta.json when source is stdin ──
-  let metaPath: string | undefined;
-  if (params.source === "stdin") {
-    const roundDir = join(session.session_dir, "rounds", `round-${roundNumber}`);
-    mkdirSync(roundDir, { recursive: true });
-    metaPath = join(roundDir, "round-meta.json");
-    writeFileSync(metaPath, JSON.stringify(meta, null, 2));
-  }
-
-  // ── 5. Write orchestration event with all data in metadata ──
-  insertEvent(db, {
-    session_id: session.id,
-    event_type: "round_completed",
-    phase: "synthesis",
-    phase_number: 7,
-    round: roundNumber,
-    metadata: JSON.stringify({
-      verdict: meta.verdict,
-      blocker_count: counts.blockerCount,
-      should_fix_count: counts.shouldFixCount,
-      suggestion_count: counts.suggestionCount,
-      reviewer_count: counts.reviewerCount,
-      total_finding_count: counts.totalFindingCount,
-      source: "orchestrator",
-    }),
-  });
-
-  saveDatabase(db, dbPath);
-
-  return { sessionId: session.id, round: roundNumber, metaPath };
-}
-
-// ── Map-meta validation helpers ──
-
-function validateMapMeta(meta: unknown): MapMeta {
-  if (!meta || typeof meta !== "object") {
-    throw new Error("map-meta.json must be a JSON object");
-  }
-
-  const obj = meta as Record<string, unknown>;
-
-  if (obj.schema_version !== 1) {
-    throw new Error(
-      `Unsupported schema_version: ${String(obj.schema_version)}. Expected 1.`,
+  // Validate schema (any failure → SCHEMA_INVALID).
+  let meta: RoundMeta;
+  let counts: SynthesisCounts;
+  try {
+    const rawJsonString = readJsonFromSource(params);
+    const label = params.source === "file" ? params.filePath : "stdin";
+    meta = validateRoundMeta(parseRawJson(rawJsonString, label));
+    counts = computeRoundCounts(meta);
+  } catch (e) {
+    throw new StateError(
+      STATE_EXIT.SCHEMA_INVALID,
+      e instanceof Error ? e.message : "invalid round metadata",
     );
   }
 
-  if (!Array.isArray(obj.sections)) {
-    throw new Error("map-meta.json must contain a sections array");
+  const resolved = resolveSession(db, params.sessionId);
+  const roundNumber = params.round ?? resolved.current_round;
+  const roundMetaPath = join(
+    resolved.session_dir,
+    "rounds",
+    `round-${roundNumber}`,
+    "round-meta.json",
+  );
+
+  // Idempotent: already finalized → no-op success. Return the stable
+  // round-meta.json path so callers can't tell an idempotent retry apart
+  // from the first write by the absence of metaPath.
+  const already = db.exec(
+    `SELECT 1 FROM orchestration_events
+       WHERE session_id = ? AND event_type = 'round_completed' AND round = ? LIMIT 1`,
+    [resolved.id, roundNumber],
+  );
+  if ((already[0]?.values.length ?? 0) > 0) {
+    return { sessionId: resolved.id, round: roundNumber, metaPath: roundMetaPath, schema_version: 1 };
   }
 
-  for (const section of obj.sections) {
-    if (!section || typeof section !== "object") {
-      throw new Error("Each section must be an object");
-    }
-    const s = section as Record<string, unknown>;
-    if (typeof s.section_number !== "number") {
-      throw new Error("Each section must have a section_number");
-    }
-    if (typeof s.title !== "string" || s.title.trim().length === 0) {
-      throw new Error("Each section must have a non-empty title");
-    }
-    if (!Array.isArray(s.files)) {
-      throw new Error(`Section "${s.title}" must have a files array`);
-    }
-    for (const file of s.files) {
-      if (!file || typeof file !== "object") {
-        throw new Error("Each file must be an object");
-      }
-      const f = file as Record<string, unknown>;
-      if (typeof f.file_path !== "string" || f.file_path.trim().length === 0) {
-        throw new Error("Each file must have a non-empty file_path");
-      }
-      if (typeof f.role !== "string") {
-        throw new Error(`File "${f.file_path}" must have a role string`);
-      }
-      if (typeof f.lines_added !== "number") {
-        throw new Error(`File "${f.file_path}" must have a lines_added number`);
-      }
-      if (typeof f.lines_deleted !== "number") {
-        throw new Error(`File "${f.file_path}" must have a lines_deleted number`);
-      }
+  // Proof of work: the workflow must have reached synthesis. Because every
+  // advance is graph-validated, reaching synthesis implies the full path.
+  if (resolved.current_phase !== "synthesis") {
+    throw new StateError(
+      STATE_EXIT.INVARIANT_UNMET,
+      `Cannot complete round: workflow is at "${resolved.current_phase}", not "synthesis". ` +
+        `Advance through the phases first.`,
+    );
+  }
+
+  if (params.requireFinal) {
+    const finalPath = join(resolved.session_dir, "rounds", `round-${roundNumber}`, "final.md");
+    if (!existsSync(finalPath)) {
+      throw new StateError(
+        STATE_EXIT.INVARIANT_UNMET,
+        `Cannot complete round: --require-final set but ${finalPath} is missing.`,
+      );
     }
   }
 
-  if (obj.dependencies !== undefined && !Array.isArray(obj.dependencies)) {
-    throw new Error("map-meta.json dependencies must be an array if provided");
-  }
-
-  return meta as MapMeta;
-}
-
-/**
- * Compute derived counts from the sections array in a MapMeta.
- * Counts are NEVER self-reported — always derived from the data.
- */
-export function computeMapCounts(meta: MapMeta): {
-  sectionCount: number;
-  fileCount: number;
-} {
-  return {
-    sectionCount: meta.sections.length,
-    fileCount: meta.sections.reduce((sum, s) => sum + s.files.length, 0),
-  };
-}
-
-/**
- * Import structured map run data into SQLite.
- *
- * Accepts data from either a file path (`source: "file"`) or a raw JSON
- * string (`source: "stdin"`). Validates the schema, computes derived counts,
- * and writes a `map_completed` orchestration event.
- *
- * When `source` is `"stdin"`, the CLI also writes `map-meta.json` to the
- * correct session map run directory — making the CLI the sole writer of all
- * stateful artifacts.
- */
-export async function stateMapComplete(
-  params: MapCompleteParams,
-): Promise<MapCompleteResult> {
-  const { ocrDir } = params;
-  const db = await ensureDatabase(ocrDir);
-  const dbPath = join(ocrDir, "data", "ocr.db");
-
-  // ── 1. Read and parse JSON ──
-  const rawJsonString = readJsonFromSource(params);
-  const label = params.source === "file" ? params.filePath : "stdin";
-  const raw = parseRawJson(rawJsonString, label);
-
-  // ── 2. Validate and compute counts ──
-  const meta = validateMapMeta(raw);
-  const counts = computeMapCounts(meta);
-
-  // ── 3. Resolve session and map run ──
-  const session = resolveSessionForCompletion(db, params.sessionId);
-  const mapRunNumber = params.mapRun ?? session.current_map_run;
-
-  // ── 4. Write map-meta.json when source is stdin ──
+  // Write round-meta.json (stdin mode) before the DB transaction.
   let metaPath: string | undefined;
   if (params.source === "stdin") {
-    const runDir = join(session.session_dir, "map", "runs", `run-${mapRunNumber}`);
-    mkdirSync(runDir, { recursive: true });
-    metaPath = join(runDir, "map-meta.json");
+    const roundDir = join(resolved.session_dir, "rounds", `round-${roundNumber}`);
+    mkdirSync(roundDir, { recursive: true });
+    metaPath = roundMetaPath;
     writeFileSync(metaPath, JSON.stringify(meta, null, 2));
   }
 
-  // ── 5. Write orchestration event with all data in metadata ──
-  // Note: `round` column stores the map run number for map_completed events.
-  // This is an intentional schema overload to avoid a separate column.
-  insertEvent(db, {
-    session_id: session.id,
-    event_type: "map_completed",
-    phase: "synthesis",
-    phase_number: 5,
-    round: mapRunNumber,
-    metadata: JSON.stringify({
-      section_count: counts.sectionCount,
-      file_count: counts.fileCount,
-      source: "orchestrator",
-    }),
+  db.transaction(() => {
+    insertEvent(db, {
+      session_id: resolved.id,
+      event_type: "round_completed",
+      phase: "synthesis",
+      phase_number: 7,
+      round: roundNumber,
+      metadata: JSON.stringify({
+        verdict: meta.verdict,
+        blocker_count: counts.blockerCount,
+        should_fix_count: counts.shouldFixCount,
+        suggestion_count: counts.suggestionCount,
+        reviewer_count: counts.reviewerCount,
+        total_finding_count: counts.totalFindingCount,
+        source: "orchestrator",
+      }),
+    });
+    if (roundNumber >= resolved.current_round) {
+      updateSession(db, resolved.id, { current_round: roundNumber });
+    }
+    // Transition synthesis → complete (graph-validated).
+    validatePhaseTransition("review", resolved.current_phase, "complete", false);
+    updateSession(db, resolved.id, { current_phase: "complete", phase_number: 8 });
+    insertEvent(db, {
+      session_id: resolved.id,
+      event_type: "phase_transition",
+      phase: "complete",
+      phase_number: 8,
+      round: roundNumber,
+    });
   });
 
-  saveDatabase(db, dbPath);
-
-  return { sessionId: session.id, mapRun: mapRunNumber, metaPath };
+  return { sessionId: resolved.id, round: roundNumber, metaPath, schema_version: 1 };
 }
+
+type CompleteMapParams = MapCompleteParams;
+
+/**
+ * Atomically finalize a map run: validate metadata, append the
+ * `map_completed` event, and transition to `complete`. Idempotent.
+ */
+export async function stateCompleteMap(
+  params: CompleteMapParams,
+): Promise<MapCompleteResult> {
+  const { ocrDir } = params;
+  const db = await ensureDatabase(ocrDir);
+
+  let meta: MapMeta;
+  let counts: { sectionCount: number; fileCount: number };
+  try {
+    const rawJsonString = readJsonFromSource(params);
+    const label = params.source === "file" ? params.filePath : "stdin";
+    meta = validateMapMeta(parseRawJson(rawJsonString, label));
+    counts = computeMapCounts(meta);
+  } catch (e) {
+    throw new StateError(
+      STATE_EXIT.SCHEMA_INVALID,
+      e instanceof Error ? e.message : "invalid map metadata",
+    );
+  }
+
+  const resolved = resolveSession(db, params.sessionId);
+  const mapRunNumber = params.mapRun ?? resolved.current_map_run;
+  const mapMetaPath = join(
+    resolved.session_dir,
+    "map",
+    "runs",
+    `run-${mapRunNumber}`,
+    "map-meta.json",
+  );
+
+  // Idempotent: already finalized → no-op success. Return the stable
+  // map-meta.json path so an idempotent retry looks identical to the first.
+  const already = db.exec(
+    `SELECT 1 FROM orchestration_events
+       WHERE session_id = ? AND event_type = 'map_completed' AND round = ? LIMIT 1`,
+    [resolved.id, mapRunNumber],
+  );
+  if ((already[0]?.values.length ?? 0) > 0) {
+    return { sessionId: resolved.id, mapRun: mapRunNumber, metaPath: mapMetaPath, schema_version: 1 };
+  }
+
+  if (resolved.current_phase !== "synthesis") {
+    throw new StateError(
+      STATE_EXIT.INVARIANT_UNMET,
+      `Cannot complete map: workflow is at "${resolved.current_phase}", not "synthesis". Advance first.`,
+    );
+  }
+
+  let metaPath: string | undefined;
+  if (params.source === "stdin") {
+    const runDir = join(resolved.session_dir, "map", "runs", `run-${mapRunNumber}`);
+    mkdirSync(runDir, { recursive: true });
+    metaPath = mapMetaPath;
+    writeFileSync(metaPath, JSON.stringify(meta, null, 2));
+  }
+
+  db.transaction(() => {
+    insertEvent(db, {
+      session_id: resolved.id,
+      event_type: "map_completed",
+      phase: "synthesis",
+      phase_number: 5,
+      round: mapRunNumber,
+      metadata: JSON.stringify({
+        section_count: counts.sectionCount,
+        file_count: counts.fileCount,
+        source: "orchestrator",
+      }),
+    });
+    validatePhaseTransition("map", resolved.current_phase, "complete", false);
+    updateSession(db, resolved.id, { current_phase: "complete", phase_number: 6 });
+    insertEvent(db, {
+      session_id: resolved.id,
+      event_type: "phase_transition",
+      phase: "complete",
+      phase_number: 6,
+      round: mapRunNumber,
+    });
+  });
+
+  return { sessionId: resolved.id, mapRun: mapRunNumber, metaPath, schema_version: 1 };
+}
+
+// ── Status ──
+
+/**
+ * Machine-branchable counterpart to the prose `next_action`. Lets an
+ * orchestrating agent dispatch on the next step without parsing English.
+ */
+export type NextActionKind =
+  | "finish"
+  | "complete_round"
+  | "advance"
+  | "wait"
+  | "reopen"
+  | "none";
+
+export type StatusResult = {
+  schema_version: number;
+  session_id: string;
+  workflow_type: string;
+  status: string;
+  current_phase: string;
+  current_round: number;
+  current_map_run: number;
+  completeness_state: string | null;
+  has_terminal_artifact: boolean;
+  marked_closed: boolean;
+  dependents_settled: boolean;
+  /**
+   * Human-readable elaboration of `next_action_kind`. Wording is NOT stable
+   * across versions — orchestrators MUST branch on `next_action_kind`, never
+   * substring-match this prose.
+   */
+  next_action: string;
+  next_action_kind: NextActionKind;
+};
+
+/**
+ * Report whether a session is complete and, if not, the next action — the
+ * resume-time "what's missing" query backed by the session_completeness view.
+ */
+export async function stateStatus(
+  ocrDir: string,
+  sessionId?: string,
+): Promise<StatusResult> {
+  const db = await ensureDatabase(ocrDir);
+  const resolved = resolveSession(db, sessionId);
+  const view = db.exec(
+    `SELECT completeness_state, has_terminal_artifact, marked_closed, dependents_settled
+       FROM session_completeness WHERE session_id = ?`,
+    [resolved.id],
+  );
+  const row = view[0]?.values[0];
+  const completenessState = (row?.[0] as string | undefined) ?? null;
+  const hasTerminalArtifact = (row?.[1] as number) === 1;
+
+  let nextAction: string;
+  let nextActionKind: NextActionKind;
+  switch (completenessState) {
+    case "complete":
+      nextAction = "none — session is complete";
+      nextActionKind = "none";
+      break;
+    case "closed_without_artifact":
+      nextAction =
+        "re-open and finalize: this session was closed without a completed round/run";
+      nextActionKind = "reopen";
+      break;
+    case "in_flight":
+      nextAction = "wait for in-flight agent processes to finish";
+      nextActionKind = "wait";
+      break;
+    default:
+      // Open session. If the current round/run already has its terminal
+      // artifact, the next step is to finish; otherwise complete the round.
+      if (hasTerminalArtifact) {
+        nextAction = "run 'ocr state finish' to close the workflow";
+        nextActionKind = "finish";
+      } else if (resolved.current_phase === "synthesis") {
+        nextAction = "pipe round metadata to 'ocr state complete-round --stdin'";
+        nextActionKind = "complete_round";
+      } else {
+        nextAction = "advance through the phases, then 'ocr state complete-round'";
+        nextActionKind = "advance";
+      }
+  }
+
+  return {
+    schema_version: 1,
+    session_id: resolved.id,
+    workflow_type: resolved.workflow_type,
+    status: resolved.status,
+    current_phase: resolved.current_phase,
+    current_round: resolved.current_round,
+    current_map_run: resolved.current_map_run,
+    completeness_state: completenessState,
+    has_terminal_artifact: hasTerminalArtifact,
+    marked_closed: (row?.[2] as number) === 1,
+    dependents_settled: (row?.[3] as number) === 1,
+    next_action: nextAction,
+    next_action_kind: nextActionKind,
+  };
+}
+
+// ── Filesystem sync ──
 
 /**
  * Sync filesystem sessions into SQLite.
@@ -732,7 +1065,6 @@ export async function stateMapComplete(
  */
 export async function stateSync(ocrDir: string): Promise<number> {
   const db = await ensureDatabase(ocrDir);
-  const dbPath = join(ocrDir, "data", "ocr.db");
   const sessionsRoot = join(ocrDir, "sessions");
 
   if (!existsSync(sessionsRoot)) {
@@ -771,20 +1103,35 @@ export async function stateSync(ocrDir: string): Promise<number> {
     const branchMatch = dirName.match(/^\d{4}-\d{2}-\d{2}-(.+)$/);
     const branch = branchMatch?.[1] ?? dirName;
 
-    // Determine completion phase from filesystem artifacts.
-    // Sessions with a final.md (review) or map.md (map) in their latest
-    // round/run are complete.
+    // Reconstruct the most-likely terminal state from artifacts.
+    // Sessions with a final.md (review) / map.md (map) in their latest
+    // round/run are complete; phase_number tracks the workflow's terminal
+    // phase index so the dashboard renders the same progress as a session
+    // that closed cleanly.
     let inferredPhase = "context";
+    let inferredPhaseNumber = 1;
+    let inferredRound = 1;
+    let inferredMapRun = 1;
 
     if (workflowType === "review") {
       const roundsDir = join(dirPath, "rounds");
       if (existsSync(roundsDir)) {
         const roundDirs = readdirSync(roundsDir)
           .filter((d) => /^round-\d+$/.test(d))
-          .sort((a, b) => parseInt(a.replace(/^\D+-/, ""), 10) - parseInt(b.replace(/^\D+-/, ""), 10));
-        const latestRound = roundDirs[roundDirs.length - 1];
-        if (latestRound && existsSync(join(roundsDir, latestRound, "final.md"))) {
-          inferredPhase = "complete";
+          .map((d) => parseInt(d.replace("round-", ""), 10))
+          .filter((n) => Number.isFinite(n))
+          .sort((a, b) => a - b);
+        const latestRoundNum = roundDirs[roundDirs.length - 1];
+        if (latestRoundNum !== undefined) {
+          inferredRound = latestRoundNum;
+          if (
+            existsSync(
+              join(roundsDir, `round-${latestRoundNum}`, "final.md"),
+            )
+          ) {
+            inferredPhase = "complete";
+            inferredPhaseNumber = 8;
+          }
         }
       }
     } else if (workflowType === "map") {
@@ -792,10 +1139,18 @@ export async function stateSync(ocrDir: string): Promise<number> {
       if (existsSync(runsDir)) {
         const runDirs = readdirSync(runsDir)
           .filter((d) => /^run-\d+$/.test(d))
-          .sort((a, b) => parseInt(a.replace(/^\D+-/, ""), 10) - parseInt(b.replace(/^\D+-/, ""), 10));
-        const latestRun = runDirs[runDirs.length - 1];
-        if (latestRun && existsSync(join(runsDir, latestRun, "map.md"))) {
-          inferredPhase = "complete";
+          .map((d) => parseInt(d.replace("run-", ""), 10))
+          .filter((n) => Number.isFinite(n))
+          .sort((a, b) => a - b);
+        const latestRunNum = runDirs[runDirs.length - 1];
+        if (latestRunNum !== undefined) {
+          inferredMapRun = latestRunNum;
+          if (
+            existsSync(join(runsDir, `run-${latestRunNum}`, "map.md"))
+          ) {
+            inferredPhase = "complete";
+            inferredPhaseNumber = 6;
+          }
         }
       }
     }
@@ -805,30 +1160,29 @@ export async function stateSync(ocrDir: string): Promise<number> {
       branch,
       workflow_type: workflowType,
       current_phase: inferredPhase,
-      phase_number: 1,
-      current_round: 1,
-      current_map_run: 1,
+      phase_number: inferredPhaseNumber,
+      current_round: inferredRound,
+      current_map_run: inferredMapRun,
       session_dir: dirPath,
     });
 
     // Backfilled sessions are always marked closed — they are filesystem
-    // artifacts, not actively running workflows. Active sessions are
-    // created by stateInit, not by filesystem backfill.
-    updateSession(db, dirName, { status: "closed" });
-
-    insertEvent(db, {
-      session_id: dirName,
-      event_type: "session_synced",
-      phase: inferredPhase,
-      phase_number: 1,
-      metadata: JSON.stringify({ source: "filesystem_backfill" }),
-    });
+    // artifacts, not actively running workflows. commitReasonClose writes the
+    // session_synced reason event FIRST and the status flip together in one
+    // transaction, so the close-guard trigger always sees the reason event.
+    commitReasonClose(
+      db,
+      dirName,
+      {
+        event_type: "session_synced",
+        phase: inferredPhase,
+        phase_number: 1,
+        metadata: JSON.stringify({ source: "filesystem_backfill" }),
+      },
+      { status: "closed" },
+    );
 
     synced++;
-  }
-
-  if (synced > 0) {
-    saveDatabase(db, dbPath);
   }
 
   return synced;

@@ -2,7 +2,7 @@
  * Schema migration runner for the OCR SQLite database.
  */
 
-import type { Database } from "sql.js";
+import type { Database } from "./engine.js";
 import type { Migration } from "./types.js";
 
 const MIGRATIONS: Migration[] = [
@@ -328,7 +328,160 @@ const MIGRATIONS: Migration[] = [
       DROP TABLE IF EXISTS agent_sessions;
     `,
   },
+  {
+    version: 12,
+    description:
+      "Event-sourced lifecycle hardening: event_type taxonomy guard, sweep indexes, session_completeness view",
+    sql: `
+      -- ── Indexes for the now-periodic stale-session sweep + round derivation ──
+      -- The sweep filters sessions by status and rolls up MAX(created_at) per
+      -- session over the event log; deriveNextRound does MAX(round). Index both.
+      CREATE INDEX IF NOT EXISTS idx_sessions_status ON sessions(status);
+      CREATE INDEX IF NOT EXISTS idx_events_session_created
+        ON orchestration_events(session_id, created_at);
+
+      -- ── Event-type taxonomy guard ──
+      -- orchestration_events.event_type is the spine of all lifecycle
+      -- derivation. A typo (e.g. 'round_complete' vs 'round_completed') would
+      -- silently break deriveNextRound and the completeness view. SQLite cannot
+      -- add a CHECK to an existing column without a table rebuild, so enforce
+      -- the closed vocabulary with a BEFORE INSERT trigger instead.
+      CREATE TRIGGER IF NOT EXISTS trg_events_known_type
+      BEFORE INSERT ON orchestration_events
+      WHEN NEW.event_type NOT IN (
+        'session_created', 'session_resumed', 'round_started', 'phase_transition',
+        'round_completed', 'map_completed', 'session_closed', 'session_aborted',
+        'session_auto_closed_stale', 'session_synced', 'session_legacy_import'
+      )
+      BEGIN
+        SELECT RAISE(ABORT, 'unknown orchestration_events.event_type');
+      END;
+
+      -- ── Close-guard (DB backstop for the completion invariant) ──
+      -- A session cannot transition active → closed unless its current
+      -- round/run has a terminal artifact event, OR an explicit reason event
+      -- (abort / auto-close-stale / sync / legacy-import) is present. Only a
+      -- *silent* premature close is banned — every legitimate non-artifact
+      -- close carries a reason event and passes. App-level guards in
+      -- stateClose/finish are the primary check; this makes the illegal state
+      -- unrepresentable even via raw SQL.
+      --
+      -- DEFENCE-IN-DEPTH NOTE (intentional, documented gap): the reason-event
+      -- branch below (event_type IN (...)) is NOT round-scoped — a reason event
+      -- recorded for an earlier round would also satisfy a later close. The
+      -- app-level guards ARE round-scoped (hasCompletionInvariant checks the
+      -- current round/run), so the precise check lives in the application; this
+      -- trigger is a coarse backstop against a *silent* premature close via raw
+      -- SQL. Tightening it to be round-scoped would require a new migration
+      -- (this v12 trigger is append-only and already shipped); the residual
+      -- risk is a non-artifact close carrying a stale reason event, which is
+      -- still an explicit, audited terminal — not the failure mode this guards.
+      CREATE TRIGGER IF NOT EXISTS trg_sessions_close_guard
+      BEFORE UPDATE OF status ON sessions
+      WHEN NEW.status = 'closed' AND OLD.status <> 'closed'
+        AND NOT EXISTS (
+          SELECT 1 FROM orchestration_events e
+           WHERE e.session_id = NEW.id
+             AND (
+               (NEW.workflow_type = 'review' AND e.event_type = 'round_completed' AND e.round = NEW.current_round)
+               OR (NEW.workflow_type = 'map' AND e.event_type = 'map_completed'   AND e.round = NEW.current_map_run)
+               OR e.event_type IN ('session_aborted','session_auto_closed_stale','session_synced','session_legacy_import')
+             )
+        )
+      BEGIN
+        SELECT RAISE(ABORT, 'cannot close session without a completed round/run or an explicit reason event');
+      END;
+
+      -- ── session_completeness view ──
+      -- The published contract for "is this session actually complete, and if
+      -- not, what's missing". Completion is DERIVED from the event log, never a
+      -- mutable flag: a session is complete iff it is closed AND a terminal
+      -- artifact event exists for its current round/run. The dashboard's
+      -- outcome derivation and the agent 'status' command read this view, so
+      -- they cannot disagree.
+      --
+      -- completeness_state is an INTENTIONAL HYBRID: it combines the mutable
+      -- status column (marked_closed) with append-only event evidence (the
+      -- terminal artifact event). This is sound precisely because the
+      -- close-guard trigger above makes the status column trustworthy — a row
+      -- can only reach status='closed' with a completed round/run or an
+      -- explicit reason event — so reading the column is not a regression to
+      -- the old "mutable flag that could lie" model.
+      --
+      --   completeness_state:
+      --     'complete'                — closed + terminal artifact for current round/run
+      --     'closed_without_artifact' — closed but no terminal artifact (the
+      --                                 "completed too soon" condition)
+      --     'in_flight'               — open with a dependent process still running
+      --     'open_no_artifact'        — open, no in-flight dependents
+      CREATE VIEW IF NOT EXISTS session_completeness AS
+      SELECT
+        s.id              AS session_id,
+        s.workflow_type   AS workflow_type,
+        s.status          AS status,
+        s.current_round   AS current_round,
+        s.current_map_run AS current_map_run,
+        CASE WHEN EXISTS (
+          SELECT 1 FROM orchestration_events e
+           WHERE e.session_id = s.id
+             AND (
+               (s.workflow_type = 'review' AND e.event_type = 'round_completed' AND e.round = s.current_round)
+               OR (s.workflow_type = 'map' AND e.event_type = 'map_completed'   AND e.round = s.current_map_run)
+             )
+        ) THEN 1 ELSE 0 END AS has_terminal_artifact,
+        CASE WHEN s.status = 'closed' THEN 1 ELSE 0 END AS marked_closed,
+        CASE WHEN NOT EXISTS (
+          SELECT 1 FROM command_executions ce
+           WHERE ce.workflow_id = s.id AND ce.finished_at IS NULL
+        ) THEN 1 ELSE 0 END AS dependents_settled,
+        CASE
+          WHEN s.status = 'closed' AND EXISTS (
+            SELECT 1 FROM orchestration_events e
+             WHERE e.session_id = s.id
+               AND (
+                 (s.workflow_type = 'review' AND e.event_type = 'round_completed' AND e.round = s.current_round)
+                 OR (s.workflow_type = 'map' AND e.event_type = 'map_completed'   AND e.round = s.current_map_run)
+               )
+          ) THEN 'complete'
+          WHEN s.status = 'closed' THEN 'closed_without_artifact'
+          WHEN EXISTS (
+            SELECT 1 FROM command_executions ce
+             WHERE ce.workflow_id = s.id AND ce.finished_at IS NULL
+          ) THEN 'in_flight'
+          ELSE 'open_no_artifact'
+        END AS completeness_state
+      FROM sessions s;
+    `,
+  },
+  {
+    version: 13,
+    description:
+      "Retire dead parent_id column on command_executions (never written; row kind is derived from command)",
+    // parent_id was reserved for an AI-instance → dashboard-spawn lineage link
+    // that was never wired (no writer, no reader). A process's KIND (supervisor
+    // / reviewer-instance / utility) is derived from columns that are always
+    // present (command + last_heartbeat_at), so the dead lineage column and its
+    // all-NULL index are removed. Re-add a wired parent_id alongside a real
+    // consumer (e.g. a parent→child tree view) if lineage is ever needed.
+    //
+    // Imperative + guarded so the DROP COLUMN (which SQLite can't express as
+    // IF EXISTS) is idempotent under re-application.
+    run: (db) => {
+      if (!columnExists(db, "command_executions", "parent_id")) return;
+      db.run("DROP INDEX IF EXISTS idx_command_executions_parent;");
+      db.run("ALTER TABLE command_executions DROP COLUMN parent_id;");
+    },
+  },
 ];
+
+/** Whether `table` currently has a column named `column` (for idempotent DDL). */
+function columnExists(db: Database, table: string, column: string): boolean {
+  const result = db.exec(`PRAGMA table_info(${table})`);
+  const first = result[0];
+  if (!first) return false;
+  const nameIdx = first.columns.indexOf("name");
+  return first.values.some((row) => row[nameIdx] === column);
+}
 
 /**
  * Creates the schema_version table if it does not exist.
@@ -341,6 +494,16 @@ function ensureSchemaVersionTable(db: Database): void {
       description TEXT NOT NULL
     );
   `);
+}
+
+/**
+ * Returns the current schema version (0 if no migrations applied). Exposed
+ * so callers (e.g. `ensureDatabase`) can detect a pending major upgrade and
+ * snapshot the database before applying it.
+ */
+export function getSchemaVersion(db: Database): number {
+  ensureSchemaVersionTable(db);
+  return getCurrentVersion(db);
 }
 
 /**
@@ -369,9 +532,13 @@ export function runMigrations(db: Database): void {
       continue;
     }
 
-    db.run("BEGIN TRANSACTION;");
+    // BEGIN IMMEDIATE acquires the write lock up front, so a concurrent
+    // opener queues cleanly behind us under WAL instead of starting a
+    // deferred transaction that fails late with SQLITE_BUSY mid-migration.
+    db.run("BEGIN IMMEDIATE;");
     try {
-      db.run(migration.sql);
+      if (migration.sql) db.run(migration.sql);
+      migration.run?.(db);
       db.run(
         "INSERT INTO schema_version (version, description) VALUES (?, ?);",
         [migration.version, migration.description],

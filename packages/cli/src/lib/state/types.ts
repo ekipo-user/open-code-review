@@ -44,6 +44,12 @@ export type TransitionParams = {
 export type CloseParams = {
   sessionId: string;
   ocrDir: string;
+  /**
+   * Abandon the session instead of completing it. Records a distinct
+   * `session_aborted` terminal event (never reported as success) and
+   * bypasses the completion invariant.
+   */
+  abort?: boolean;
 };
 
 // ── Round Meta (orchestrator-first structured data) ──
@@ -116,7 +122,15 @@ export type RoundCompleteParams =
 export type RoundCompleteResult = {
   sessionId: string;
   round: number;
+  /**
+   * Canonical on-disk location of `round-meta.json` for this round. It is the
+   * path the CLI owns — not a guarantee the file currently exists (a caller
+   * that deletes it between an initial call and an idempotent retry will get
+   * the same canonical path back).
+   */
   metaPath?: string;
+  /** Result envelope version so consumers can branch on schema changes. */
+  schema_version: number;
 };
 
 // ── Map Meta (structured map data) ──
@@ -169,6 +183,8 @@ export type MapCompleteResult = {
   sessionId: string;
   mapRun: number;
   metaPath?: string;
+  /** Result envelope version so consumers can branch on schema changes. */
+  schema_version: number;
 };
 
 // ── Reviewers Meta (structured reviewer catalog for dashboard) ──
@@ -204,7 +220,26 @@ export type AgentSessionStatus =
   | "cancelled"
   | "orphaned";
 
-export type AgentVendor = "claude" | "opencode" | "gemini" | string;
+/** The vendors OCR ships first-class support for. */
+export type KnownAgentVendor = "claude" | "opencode" | "gemini";
+
+/**
+ * A vendor identifier. Unknown vendors are accepted (the field is open), but
+ * the `string & {}` intersection keeps editor autocomplete for the known
+ * vendors instead of collapsing the union to a bare `string`.
+ */
+export type AgentVendor = KnownAgentVendor | (string & {});
+
+/**
+ * The role a `command_executions` row plays — derived (never stored) from the
+ * always-present `command` + `last_heartbeat_at` columns:
+ *   - `supervisor` — a workflow-owning process (a dashboard-spawned `ocr
+ *     review`/`map`); its death cascade-terminates its dependents.
+ *   - `instance`   — a reviewer instance journaled via `ocr session
+ *     start-instance` (a dependent; never owns a workflow's lifecycle).
+ *   - `utility`    — a fire-and-forget command with no journaled heartbeat.
+ */
+export type RowKind = "supervisor" | "instance" | "utility";
 
 /**
  * One row in the `agent_sessions` table — a journal entry for an agent-CLI
@@ -221,6 +256,9 @@ export type AgentSession = {
   resolved_model: string | null;
   phase: string | null;
   status: AgentSessionStatus;
+  /** Derived process role — lets a consumer confidently tell what kind of
+   *  process this row represents without parsing the command string. */
+  kind: RowKind;
   pid: number | null;
   started_at: string;
   last_heartbeat_at: string;

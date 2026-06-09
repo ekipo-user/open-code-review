@@ -23,7 +23,6 @@ import { join } from "node:path";
 import { requireOcrSetup } from "../lib/guards.js";
 import {
   ensureDatabase,
-  saveDatabase,
   bumpAgentSessionHeartbeat,
   getAgentSession,
   insertAgentSession,
@@ -50,12 +49,11 @@ function fail(message: string): never {
   process.exit(1);
 }
 
-async function setup(): Promise<{ ocrDir: string; dbPath: string }> {
+async function setup(): Promise<{ ocrDir: string }> {
   const targetDir = process.cwd();
   requireOcrSetup(targetDir);
   const ocrDir = join(targetDir, ".ocr");
-  const dbPath = join(ocrDir, "data", "ocr.db");
-  return { ocrDir, dbPath };
+  return { ocrDir };
 }
 
 // ── start-instance ──
@@ -83,12 +81,14 @@ const startInstanceSubcommand = new Command("start-instance")
       pid?: number;
       note?: string;
     }) => {
-      const { ocrDir, dbPath } = await setup();
+      const { ocrDir } = await setup();
       const db = await ensureDatabase(ocrDir);
 
       try {
-        const workflowId = options.workflow
-          ?? (await resolveActiveSession(ocrDir)).id;
+        const { id: workflowId } = await resolveActiveSession(
+          ocrDir,
+          options.workflow,
+        );
 
         const id = randomUUID();
         const persona = options.persona ?? null;
@@ -117,7 +117,6 @@ const startInstanceSubcommand = new Command("start-instance")
           notes: options.note ?? null,
         });
 
-        saveDatabase(db, dbPath);
         console.log(id);
       } catch (error) {
         fail(error instanceof Error ? error.message : "Failed to start agent session");
@@ -132,12 +131,11 @@ const bindVendorIdSubcommand = new Command("bind-vendor-id")
   .argument("<agent-session-id>", "OCR agent session id")
   .argument("<vendor-session-id>", "Underlying CLI's session id")
   .action(async (agentId: string, vendorId: string) => {
-    const { ocrDir, dbPath } = await setup();
+    const { ocrDir } = await setup();
     const db = await ensureDatabase(ocrDir);
 
     try {
       setAgentSessionVendorId(db, agentId, vendorId);
-      saveDatabase(db, dbPath);
       console.log(`${agentId}: vendor_session_id=${vendorId}`);
     } catch (error) {
       fail(error instanceof Error ? error.message : "Failed to bind vendor session id");
@@ -150,7 +148,7 @@ const beatSubcommand = new Command("beat")
   .description("Bump last_heartbeat_at on an agent session")
   .argument("<agent-session-id>", "OCR agent session id")
   .action(async (agentId: string) => {
-    const { ocrDir, dbPath } = await setup();
+    const { ocrDir } = await setup();
     const db = await ensureDatabase(ocrDir);
 
     try {
@@ -159,7 +157,6 @@ const beatSubcommand = new Command("beat")
         fail(`Agent session not found: ${agentId}`);
       }
       bumpAgentSessionHeartbeat(db, agentId);
-      saveDatabase(db, dbPath);
       console.log(`${agentId}: heartbeat`);
     } catch (error) {
       fail(error instanceof Error ? error.message : "Failed to bump heartbeat");
@@ -182,7 +179,7 @@ const endInstanceSubcommand = new Command("end-instance")
       agentId: string,
       options: { status?: string; exitCode?: number; note?: string },
     ) => {
-      const { ocrDir, dbPath } = await setup();
+      const { ocrDir } = await setup();
       const db = await ensureDatabase(ocrDir);
 
       try {
@@ -216,7 +213,6 @@ const endInstanceSubcommand = new Command("end-instance")
           exitCode: options.exitCode ?? null,
           note: options.note,
         });
-        saveDatabase(db, dbPath);
         console.log(`${agentId}: ${status}`);
       } catch (error) {
         fail(error instanceof Error ? error.message : "Failed to end agent session");
@@ -235,8 +231,10 @@ const listSubcommand = new Command("list")
     const db = await ensureDatabase(ocrDir);
 
     try {
-      const workflowId = options.workflow
-        ?? (await resolveActiveSession(ocrDir)).id;
+      const { id: workflowId } = await resolveActiveSession(
+        ocrDir,
+        options.workflow,
+      );
       const rows = listAgentSessionsForWorkflow(db, workflowId);
 
       if (options.json) {

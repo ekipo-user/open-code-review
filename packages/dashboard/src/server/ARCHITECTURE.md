@@ -1,74 +1,60 @@
 # Dashboard Server Architecture
 
-## Dual-Writer Ownership Model
+## Single-Writer Ownership Model
 
-The CLI and dashboard share a single SQLite database at `.ocr/data/ocr.db`.
-Each process owns a distinct set of tables, avoiding write conflicts.
+The CLI and dashboard share ONE on-disk SQLite database at `.ocr/data/ocr.db`,
+opened with `better-sqlite3` in WAL mode. Native WAL locking serializes writes
+across both processes — there is no in-memory copy, no merge layer, and no save
+hooks. The dashboard's connection reads committed CLI writes live.
 
-### CLI-Owned Tables (Workflow State)
+### CLI-Owned Tables (Workflow Lifecycle)
 
-The CLI owns all workflow orchestration state:
+The CLI is the sole writer of the workflow lifecycle:
 
 - **sessions** -- lifecycle, phase tracking, branch metadata
 - **orchestration_events** -- phase transitions, workflow events
-- **review_rounds** -- round metadata, verdicts, blocker counts
-- **reviewer_outputs** -- per-reviewer file paths, finding counts
+
+The dashboard only reads these. The single exception is the bounded
+"legacy/backfill reconciler" in `services/filesystem-sync.ts`, which backfills
+historical sessions discovered on disk (and safety-net-closes a session whose
+terminal artifact landed but whose `ocr state` close never ran). Those rare
+lifecycle touches route through the CLI's event-backed helpers
+(`insertSession` + a `session_created` event, and `commitReasonClose`) so the
+close-guard trigger ordering and projection invariants are respected.
+
+### Dashboard-Owned Tables
+
+The dashboard owns supervision state and parsed artifact/UX state:
+
+- **command_executions** -- command/agent-session history and output logs
+- **review_rounds** -- round metadata, verdicts, blocker counts (parsed)
+- **reviewer_outputs** -- per-reviewer file paths, finding counts (parsed)
 - **review_findings** -- individual findings parsed from reviewer output
-- **map_runs** -- map run metadata, file counts
-- **map_sections** -- section groupings within a map run
-- **map_files** -- individual files within map sections
+- **map_runs** -- map run metadata, file counts (parsed)
+- **map_sections** -- section groupings within a map run (parsed)
+- **map_files** -- individual files within map sections (parsed)
 - **markdown_artifacts** -- raw markdown content for review/map outputs
-
-The CLI writes to these tables during phase transitions and parse operations.
-These writes are infrequent -- they happen at workflow boundaries (e.g., when
-a review round completes or a map run finishes parsing).
-
-### Dashboard-Owned Tables (User Interaction)
-
-The dashboard owns all user-driven state:
-
 - **user_file_progress** -- file review checkboxes
 - **user_finding_progress** -- finding triage status (read, fixed, wont_fix, etc.)
 - **user_round_progress** -- round-level triage status
 - **user_notes** -- free-text notes attached to any entity
-- **command_executions** -- command history and output logs
 - **chat_conversations** -- AI chat session metadata
 - **chat_messages** -- individual chat messages
 
-These writes are user-driven and happen in response to UI interactions.
+These writes are user- and parse-driven and happen in response to UI
+interactions and filesystem-sync runs.
 
-## Merge-Before-Write Pattern
+## Durability and Concurrency
 
-Both processes use the sql.js in-memory database driver. Since they cannot
-share a file-level WAL lock, the dashboard implements a merge-before-write
-strategy:
+Durability is the engine's job: `better-sqlite3` persists writes on commit and
+WAL locking serializes them across the CLI and dashboard connections. There is
+no explicit flush, no merge-before-write, and no temp-file-then-rename — the
+shared on-disk database with native locking handles all of it.
 
-1. Before exporting the in-memory DB to disk, the dashboard's `DbSyncWatcher`
-   re-reads the CLI-owned tables from the on-disk file
-2. It imports any new or updated rows into the in-memory database
-3. Only then does it write the full database back to disk
+## Change Notification
 
-This ensures CLI writes (which may have happened between dashboard saves)
-are never overwritten. The `saveDb()` function automatically calls
-registered pre/post-save hooks (via `registerSaveHooks()`) for this purpose.
-
-## Atomic Write Pattern
-
-All database writes to disk use a temp-file-then-rename strategy:
-
-1. Export the in-memory database to `ocr.db.tmp`
-2. `renameSync(ocr.db.tmp, ocr.db)` -- atomic on POSIX filesystems
-
-This prevents the CLI (or any reader) from seeing a partially-written file.
-
-## Why This Works
-
-- **CLI writes are infrequent**: phase transitions happen at most a few times
-  per review session, with minutes or hours between them.
-- **Dashboard writes are user-driven**: they happen in response to button
-  clicks and form submissions, not on automated schedules.
-- **Table ownership is disjoint**: the CLI never writes to dashboard tables
-  and the dashboard never writes to CLI tables, so there are no row-level
-  conflicts to resolve.
-- **Merge-before-write catches drift**: even if the CLI wrote while the
-  dashboard was idle, the next dashboard save will incorporate those changes.
+`DbSyncWatcher` watches `ocr.db` (and its `-wal` sidecar) for external writes
+from the CLI. Its sole job is *notification*: it diffs the live database against
+cached snapshots and emits the granular Socket.IO events the dashboard UI
+subscribes to. It performs no merge writes — the CLI-owned tables are already
+authoritative on the shared connection.

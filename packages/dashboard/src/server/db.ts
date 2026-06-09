@@ -6,44 +6,40 @@
  */
 
 /**
- * ## Dual-Writer Ownership Model
+ * ## Single-Writer Ownership Model
  *
- * Two processes can write to `ocr.db`:
+ * The CLI and dashboard share ONE on-disk database (`better-sqlite3` + WAL).
+ * Native WAL locking serializes writes across both processes — there is no
+ * in-memory copy, no merge layer, and no save hooks.
  *
- * - **CLI** (`ocr state init/transition/close`) — owns workflow state:
- *   `sessions`, `orchestration_events`. Writes happen during review/map
- *   workflows when the AI agent calls `ocr state` commands.
+ * - **CLI** (`ocr state begin/advance/...`) — sole writer of the workflow
+ *   lifecycle tables: `sessions`, `orchestration_events`. The dashboard
+ *   reads these and only touches them through the bounded filesystem-sync
+ *   "legacy/backfill reconciler" (see `services/filesystem-sync.ts`), which
+ *   routes its rare lifecycle closes through the CLI's `commitReasonClose`
+ *   helper so the close-guard trigger ordering is respected.
  *
- * - **Dashboard** (this server) — owns user-interaction tables:
- *   `user_file_progress`, `user_finding_progress`, `user_round_progress`,
- *   `user_notes`, `command_executions`, `chat_conversations`, `chat_messages`.
- *   Also writes parsed artifact data: `review_rounds`, `reviewer_outputs`,
- *   `review_findings`, `map_runs`, `map_sections`, `map_files`,
- *   `markdown_artifacts`.
+ * - **Dashboard** (this server) — owns supervision state
+ *   (`command_executions`) and UX state: `user_file_progress`,
+ *   `user_finding_progress`, `user_round_progress`, `user_notes`,
+ *   `chat_conversations`, `chat_messages`. Also writes parsed artifact data:
+ *   `review_rounds`, `reviewer_outputs`, `review_findings`, `map_runs`,
+ *   `map_sections`, `map_files`, `markdown_artifacts`.
  *
- * Concurrency is managed via:
- * 1. **Atomic writes** — temp file + rename prevents partial reads
- * 2. **Merge-before-write** — dashboard calls `DbSyncWatcher.syncFromDisk()`
- *    before saving to pull in CLI changes
- * 3. **File watching** — `DbSyncWatcher` detects external writes and reloads
- *
- * Both processes use sql.js (in-memory WASM SQLite), so there is no
- * file-level locking. The merge-before-write pattern prevents data loss
- * under normal usage but is not a full MVCC solution.
+ * Durability is the engine's job: writes are persisted on commit and
+ * serialized by WAL locking — no explicit flush, merge, or watermarking.
  */
 
-import { existsSync, readFileSync, renameSync, writeFileSync, mkdirSync } from 'node:fs'
-import { join, dirname } from 'node:path'
-import initSqlJs, { type Database } from 'sql.js'
 import {
-  runMigrations,
-  locateWasm,
-  applyPragmas,
+  ensureDatabase,
+  closeDatabase,
   resultToRows,
   resultToRow,
+  type Database,
   type WorkflowType,
   type SessionStatus,
 } from '@open-code-review/cli/db'
+import { join } from 'node:path'
 
 // ── Types ──
 
@@ -194,7 +190,6 @@ export type CommandExecutionRow = {
   output: string | null
   // ── Migration v11 — agent-session journal fields ──
   workflow_id: string | null
-  parent_id: number | null
   vendor: string | null
   vendor_session_id: string | null
   persona: string | null
@@ -229,99 +224,25 @@ export type ChatMessageRow = {
 let cachedDb: Database | null = null
 let cachedDbPath: string | null = null
 
-// ── Pre/post-save hooks ──
-// Registered once at startup by index.ts so every saveDb() call
-// automatically merges CLI changes before writing (pre) and
-// marks its own write to avoid re-triggering the file watcher (post).
-
-let preSaveHook: (() => void) | null = null
-let postSaveHook: (() => void) | null = null
-
 /**
- * Register hooks that run around every saveDb() call.
- *
- * - `preSave`: merge external (CLI) changes before overwriting — prevents data loss.
- * - `postSave`: mark own write so the file watcher doesn't re-trigger.
- */
-export function registerSaveHooks(
-  preSave: () => void,
-  postSave: () => void,
-): void {
-  preSaveHook = preSave
-  postSaveHook = postSave
-}
-
-/**
- * Opens the OCR database at the given `.ocr/` directory path.
- * Caches the connection for reuse.
+ * Opens the OCR database at the given `.ocr/` directory path via the shared
+ * CLI engine (better-sqlite3 + WAL), creating it and running migrations on
+ * first use. The shared module caches the connection per path.
  */
 export async function openDb(ocrDir: string): Promise<Database> {
   const dbPath = join(ocrDir, 'data', 'ocr.db')
-
-  if (cachedDb && cachedDbPath === dbPath) {
-    return cachedDb
-  }
-
-  const wasmBuffer = readFileSync(locateWasm())
-  const wasmBinary = wasmBuffer.buffer.slice(
-    wasmBuffer.byteOffset,
-    wasmBuffer.byteOffset + wasmBuffer.byteLength
-  )
-
-  const SQL = await initSqlJs({ wasmBinary })
-
-  let db: Database
-  if (existsSync(dbPath)) {
-    const fileBuffer = readFileSync(dbPath)
-    db = new SQL.Database(fileBuffer)
-  } else {
-    const dataDir = dirname(dbPath)
-    if (!existsSync(dataDir)) {
-      mkdirSync(dataDir, { recursive: true })
-    }
-    db = new SQL.Database()
-  }
-
-  applyPragmas(db)
-  runMigrations(db)
+  const db = await ensureDatabase(ocrDir)
   cachedDb = db
   cachedDbPath = dbPath
-
   return db
 }
 
 /**
- * Saves the in-memory database state to disk.
- *
- * Automatically calls registered pre-save and post-save hooks:
- * - Pre-save: merges external (CLI) changes before overwriting (merge-before-write).
- * - Post-save: marks own write so the file watcher doesn't re-trigger.
- *
- * Hooks are registered once at startup via `registerSaveHooks()`.
- *
- * Uses atomic write (temp file + rename) to prevent partial reads
- * by concurrent processes.
- */
-export function saveDb(db: Database, ocrDir: string): void {
-  preSaveHook?.()
-  const dbPath = join(ocrDir, 'data', 'ocr.db')
-  const data = db.export()
-  const dir = dirname(dbPath)
-  if (!existsSync(dir)) {
-    mkdirSync(dir, { recursive: true })
-  }
-  const tmpPath = `${dbPath}.${process.pid}.tmp`
-  writeFileSync(tmpPath, Buffer.from(data))
-  renameSync(tmpPath, dbPath)
-  postSaveHook?.()
-}
-
-/**
- * Closes the cached database connection.
+ * Closes the cached database connection (checkpointing the WAL first).
  */
 export function closeDb(): void {
-  if (cachedDb) {
-    cachedDb.close()
+  if (cachedDbPath) {
+    closeDatabase(cachedDbPath)
     cachedDb = null
     cachedDbPath = null
   }
@@ -661,12 +582,35 @@ export function deleteNote(db: Database, noteId: number): void {
 
 // ── Command execution queries ──
 
-export function getCommandHistory(db: Database, limit = 50): CommandExecutionRow[] {
-  return resultToRows<CommandExecutionRow>(
+/**
+ * Like {@link CommandExecutionRow} but with the linked workflow's
+ * event-derived completeness projected on as `workflow_completeness` (via
+ * LEFT JOIN session_completeness). Used by the commands history route to
+ * derive the {@link CommandOutcome} per row in one round-trip rather than
+ * N+1 lookups. `null` when the row has no `workflow_id`.
+ */
+export type CommandExecutionRowWithCompleteness = CommandExecutionRow & {
+  workflow_completeness:
+    | 'complete'
+    | 'closed_without_artifact'
+    | 'in_flight'
+    | 'open_no_artifact'
+    | null
+}
+
+export function getCommandHistory(
+  db: Database,
+  limit = 50,
+): CommandExecutionRowWithCompleteness[] {
+  return resultToRows<CommandExecutionRowWithCompleteness>(
     db.exec(
-      'SELECT * FROM command_executions ORDER BY started_at DESC LIMIT ?',
-      [limit]
-    )
+      `SELECT ce.*, sc.completeness_state AS workflow_completeness
+         FROM command_executions ce
+         LEFT JOIN session_completeness sc ON sc.session_id = ce.workflow_id
+        ORDER BY ce.started_at DESC
+        LIMIT ?`,
+      [limit],
+    ),
   )
 }
 

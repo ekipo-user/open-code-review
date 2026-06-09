@@ -10,26 +10,80 @@
  *
  * Status mapping (derived, no separate column):
  *   running    →  finished_at IS NULL AND last_heartbeat_at fresh
- *   stalled    →  finished_at IS NULL AND last_heartbeat_at stale
- *   orphaned   →  finished_at IS NOT NULL AND exit_code = -3 (sweep sentinel)
+ *   stalled    →  finished_at IS NULL AND last_heartbeat_at stale (advisory
+ *                 only — a stale heartbeat is NOT evidence of death; the
+ *                 process may be alive and simply not beating)
+ *   orphaned   →  finished_at IS NOT NULL AND exit_code = -3 — written only
+ *                 when the supervised pid is confirmed dead (see
+ *                 sweepStaleAgentSessions), never from heartbeat age alone
  *   done       →  exit_code = 0
- *   crashed    →  exit_code IS NOT NULL AND exit_code NOT IN (0, -2, -3)
- *   cancelled  →  exit_code = -2
+ *   crashed    →  exit_code IS NOT NULL AND exit_code NOT IN (0, -2, -3, -4)
+ *   cancelled  →  exit_code = -2 (user cancel) OR -4 (cascade-close: the
+ *                 parent workflow closed)
  */
 
-import type { Database } from "sql.js";
+import type { Database } from "./engine.js";
 import type {
   AgentSessionRow,
   AgentSessionStatus,
   InsertAgentSessionParams,
+  RowKind,
   SweepResult,
   UpdateAgentSessionParams,
 } from "./types.js";
 import { resultToRows, resultToRow } from "./result-mapper.js";
+import { commitReasonClose } from "./queries.js";
+import {
+  type IsAlive,
+  defaultIsAlive,
+  PID_REUSE_GUARD_MS,
+  sqliteUtcMs,
+} from "./liveness.js";
+import {
+  CANCELLED_EXIT_CODE,
+  ORPHAN_EXIT_CODE,
+  CASCADE_CLOSE_EXIT_CODE,
+} from "../state/exit-codes.js";
 
-const ORPHAN_EXIT_CODE = -3;
-const CANCELLED_EXIT_CODE = -2;
 const NOTE_ORPHAN_PREFIX = "orphaned by liveness sweep";
+
+/**
+ * The `command` value of a reviewer-instance row (bare, or `…:<persona>-<idx>`).
+ * This single constant is the load-bearing discriminator for cascade safety —
+ * only non-instance (supervisor) rows fire the cascade — so the writer
+ * ({@link insertAgentSession}) and the reader ({@link rowKind}) MUST share it.
+ */
+const INSTANCE_COMMAND = "session-instance";
+
+/**
+ * Stamp every still-in-flight `command_executions` row for a workflow as
+ * terminal — used when the workflow's owning process goes away so dependent
+ * child rows don't linger. Two callers:
+ *   - `stateClose` (`state/index.ts`) — a clean parent-workflow close.
+ *   - `sweepStaleAgentSessions` (below) — when the liveness sweep confirms a
+ *     workflow's supervising process dead and orphans it.
+ *
+ * Sets `finished_at`, the given `exitCode`, clears `pid`, and appends `note`.
+ * The caller is responsible for running this inside its own transaction so
+ * the cascade commits atomically with the parent's terminal write.
+ */
+export function cascadeTerminateExecutions(
+  db: Database,
+  workflowId: string,
+  exitCode: number,
+  note: string,
+): void {
+  db.run(
+    `UPDATE command_executions
+       SET finished_at = datetime('now'),
+           exit_code   = ?,
+           pid         = NULL,
+           notes       = COALESCE(notes || char(10), '') || ?
+     WHERE workflow_id = ?
+       AND finished_at IS NULL`,
+    [exitCode, note, workflowId],
+  );
+}
 
 /**
  * Internal row shape from `command_executions` SELECTs, mapped to the
@@ -42,7 +96,6 @@ type CommandExecutionRow = {
   command: string;
   args: string | null;
   workflow_id: string | null;
-  parent_id: number | null;
   vendor: string | null;
   vendor_session_id: string | null;
   persona: string | null;
@@ -71,6 +124,7 @@ function rowToAgentSession(row: CommandExecutionRow): AgentSessionRow {
     resolved_model: row.resolved_model,
     phase: null,
     status: deriveStatus(row),
+    kind: rowKind(row),
     pid: row.pid,
     started_at: row.started_at,
     last_heartbeat_at: row.last_heartbeat_at ?? row.started_at,
@@ -87,7 +141,14 @@ function deriveStatus(row: CommandExecutionRow): AgentSessionStatus {
     return "running";
   }
   if (row.exit_code === ORPHAN_EXIT_CODE) return "orphaned";
-  if (row.exit_code === CANCELLED_EXIT_CODE) return "cancelled";
+  // -2 (user cancel) and -4 (cascade-close: stopped because the parent
+  // workflow closed) are both non-failure cancellations, not crashes.
+  if (
+    row.exit_code === CANCELLED_EXIT_CODE ||
+    row.exit_code === CASCADE_CLOSE_EXIT_CODE
+  ) {
+    return "cancelled";
+  }
   if (row.exit_code === 0) return "done";
   return "crashed";
 }
@@ -117,8 +178,8 @@ export function insertAgentSession(
   } = params;
 
   const command = persona && instance_index !== null
-    ? `session-instance:${persona}-${instance_index}`
-    : "session-instance";
+    ? `${INSTANCE_COMMAND}:${persona}-${instance_index}`
+    : INSTANCE_COMMAND;
 
   db.run(
     `INSERT INTO command_executions
@@ -175,7 +236,7 @@ export function listAgentSessionsForWorkflow(
  * and the terminal-handoff route.
  *
  * Resolution requires an explicit `workflow_id` link. The link is
- * established at write time by the CLI's `ocr state init` reading the
+ * established at write time by the CLI's `ocr state begin` reading the
  * dashboard spawn marker file (`.ocr/data/dashboard-active-spawn.json`)
  * and binding the dashboard parent execution to the freshly-created
  * workflow id. That marker is the durable handshake — if it's present
@@ -183,7 +244,7 @@ export function listAgentSessionsForWorkflow(
  *
  * No timing derivation. No heuristic fallback. If the link is missing,
  * the workflow is genuinely unresumable (dashboard wasn't running, AI
- * ran outside the dashboard, or `state init` was never called).
+ * ran outside the dashboard, or `state begin` was never called).
  */
 export function getLatestAgentSessionWithVendorId(
   db: Database,
@@ -316,7 +377,7 @@ export function recordVendorSessionIdForExecution(
 
 /**
  * Late-links a dashboard-spawned `command_executions` row (identified by
- * its `uid`) to a workflow created later by the AI's `ocr state init`
+ * its `uid`) to a workflow created later by the AI's `ocr state begin`
  * call. Idempotent (COALESCE) — if a workflow_id is already set the
  * UPDATE is a no-op.
  *
@@ -444,46 +505,207 @@ export function updateAgentSession(
 }
 
 /**
- * Reclassifies running rows whose heartbeat has gone stale past the given
- * threshold to `orphaned` (exit_code = -3). Stamps `finished_at` and
- * appends a structured note. Returns the uids of affected rows.
+ * Reclaims rows whose supervised process is genuinely gone, stamping them
+ * `orphaned` (exit_code = -3). The terminal verdict is grounded in actual
+ * process liveness (`isAlive`), NOT heartbeat age — a stale heartbeat alone
+ * is no evidence of death (the heartbeat is not refreshed during a run, so a
+ * healthy long command looks "stale" within a minute). A row is orphaned only
+ * when it carries a pid, that pid is within the PID-reuse safety window, and
+ * the pid is confirmed dead. Rows with no pid (no liveness signal) or older
+ * than the window are left for coarser reclamation, never declared dead here.
  *
- * Scoped to rows that participate in the journal (`last_heartbeat_at IS
- * NOT NULL`) — fire-and-forget commands without heartbeat tracking are
- * untouched.
+ * Heartbeat age (`thresholdSeconds`) is used only to bound which rows are
+ * worth probing; it never decides the verdict on its own.
+ *
+ * When the dead row is a workflow's supervising/top-level process (not itself
+ * a reviewer instance), its in-flight dependents are cascade-terminated in the
+ * same transaction with exit `-4` — the parent's confirmed death is positive
+ * evidence that its in-process children are gone too, so they don't linger as
+ * `stalled` (and the session-level sweep isn't wedged by them).
+ *
+ * `isAlive` is injected so this stays a pure, testable db function; the
+ * dashboard passes the real `process.kill`-based probe.
  */
 export function sweepStaleAgentSessions(
   db: Database,
   thresholdSeconds: number,
+  isAlive: IsAlive = defaultIsAlive,
 ): SweepResult {
-  const staleSql = `
-    SELECT uid, id FROM command_executions
-    WHERE finished_at IS NULL
-      AND last_heartbeat_at IS NOT NULL
-      AND (julianday('now') - julianday(last_heartbeat_at)) * 86400 > ?
-  `;
-  const stale = resultToRows<{ uid: string | null; id: number }>(
-    db.exec(staleSql, [thresholdSeconds]),
+  // Phase 1 — candidates: unfinished, journaled, pid-bearing rows whose
+  // heartbeat has lapsed. Only pid-bearing rows can ever be orphaned, because
+  // a terminal verdict needs positive evidence of death and a null pid is none.
+  const candidates = resultToRows<{
+    uid: string | null;
+    id: number;
+    pid: number | null;
+    started_at: string;
+    workflow_id: string | null;
+    command: string;
+    last_heartbeat_at: string | null;
+  }>(
+    db.exec(
+      `SELECT uid, id, pid, started_at, workflow_id, command, last_heartbeat_at
+         FROM command_executions
+        WHERE finished_at IS NULL
+          AND pid IS NOT NULL
+          AND last_heartbeat_at IS NOT NULL
+          AND (julianday('now') - julianday(last_heartbeat_at)) * 86400 > ?`,
+      [thresholdSeconds],
+    ),
   );
-
-  if (stale.length === 0) {
-    return { orphanedIds: [] };
+  if (candidates.length === 0) {
+    return { orphanedIds: [], cascadedWorkflowIds: [] };
   }
 
-  const note = `${NOTE_ORPHAN_PREFIX} (threshold ${thresholdSeconds}s)`;
+  // Phase 2 — keep only rows whose pid is recent enough to trust AND confirmed
+  // dead. A live pid (the bug we are fixing) stays running.
+  const reuseCutoffMs = Date.now() - PID_REUSE_GUARD_MS;
+  const dead = candidates.filter((row) => {
+    if (row.pid === null) return false; // already excluded by SQL; defensive
+    if (sqliteUtcMs(row.started_at) < reuseCutoffMs) return false; // pid not trustworthy
+    // A pid that reads alive within the window stays in-flight. If the OS
+    // recycled a dead supervisor's pid onto a stranger, we cannot prove the
+    // original is dead, so we lean toward NOT issuing a false terminal verdict
+    // — the row is reclaimed later at the coarse session-level sweep.
+    return !isAlive(row.pid);
+  });
+  if (dead.length === 0) {
+    return { orphanedIds: [], cascadedWorkflowIds: [] };
+  }
 
-  db.run(
-    `UPDATE command_executions
-       SET finished_at = datetime('now'),
-           exit_code = ?,
-           notes = COALESCE(notes || char(10), '') || ?
-     WHERE finished_at IS NULL
-       AND last_heartbeat_at IS NOT NULL
-       AND (julianday('now') - julianday(last_heartbeat_at)) * 86400 > ?`,
-    [ORPHAN_EXIT_CODE, note, thresholdSeconds],
-  );
+  // Phase 3 — atomically: stamp orphaned on exactly the dead rows (by id, clear
+  // pid, compare-and-set on `finished_at` so a real completion between phases
+  // wins), then cascade-terminate the in-flight dependents of any dead
+  // workflow-owning process. Reviewer-instance rows (`session-instance:*`)
+  // never trigger a cascade — only a supervising/top-level process does — so an
+  // orphaned instance can't take its live siblings down.
+  const note = `${NOTE_ORPHAN_PREFIX} (threshold ${thresholdSeconds}s)`;
+  const placeholders = dead.map(() => "?").join(", ");
+  const cascadedWorkflowIds: string[] = [];
+  db.transaction(() => {
+    db.run(
+      `UPDATE command_executions
+          SET finished_at = datetime('now'),
+              exit_code = ?,
+              pid = NULL,
+              notes = COALESCE(notes || char(10), '') || ?
+        WHERE id IN (${placeholders})
+          AND finished_at IS NULL`,
+      [ORPHAN_EXIT_CODE, note, ...dead.map((r) => r.id)],
+    );
+    for (const row of dead) {
+      if (row.workflow_id && rowKind(row) === "supervisor") {
+        cascadeTerminateExecutions(
+          db,
+          row.workflow_id,
+          CASCADE_CLOSE_EXIT_CODE,
+          "cascade-closed: workflow process orphaned by liveness sweep",
+        );
+        cascadedWorkflowIds.push(row.workflow_id);
+      }
+    }
+  });
 
   return {
-    orphanedIds: stale.map((row) => row.uid ?? String(row.id)),
+    orphanedIds: dead.map((r) => r.uid ?? String(r.id)),
+    cascadedWorkflowIds,
   };
+}
+
+/**
+ * The role a `command_executions` row plays, derived (never stored) from the
+ * two columns present on every row at every insert site — including after a
+ * JSONL replay, which drops `persona`/`instance_index` but keeps `command`.
+ * The {@link INSTANCE_COMMAND} value is written ONLY by `insertAgentSession`
+ * (either bare, or with a `:<persona>-<idx>` suffix), so it is a total,
+ * unambiguous discriminator.
+ *
+ * NB: an instance is the bare value OR the `…:` suffixed form — matched exactly
+ * so an unrelated future command merely *prefixed* `session-instance` (e.g.
+ * `session-instances`) is NOT misclassified as an instance, which would let an
+ * orphaned instance cascade-kill its siblings.
+ */
+export function rowKind(row: {
+  command: string;
+  last_heartbeat_at: string | null;
+}): RowKind {
+  if (
+    row.command === INSTANCE_COMMAND ||
+    row.command.startsWith(`${INSTANCE_COMMAND}:`)
+  ) {
+    return "instance";
+  }
+  // A journaled (heartbeat-bearing) non-instance row is a workflow supervisor;
+  // a row that was never journaled is a fire-and-forget utility command.
+  return row.last_heartbeat_at == null ? "utility" : "supervisor";
+}
+
+/**
+ * Sweep stale `sessions.status = 'active'` rows.
+ *
+ * A row is considered stale when ALL of the following hold:
+ *   - status is still 'active'
+ *   - no orchestration_event has been recorded for it within
+ *     `thresholdSeconds` (default 7 days at call sites)
+ *   - no dependent command_executions are still in flight
+ *     (every linked row has finished_at NOT NULL)
+ *
+ * Stale rows are flipped to 'closed' with a `session_auto_closed_stale`
+ * event recording the threshold and the last-event-age. This stops them
+ * from poisoning latest-active auto-detect — the exact failure mode that
+ * caused the "wrong session closed" bug.
+ *
+ * Returns the closed session_ids.
+ */
+export function sweepStaleSessions(
+  db: Database,
+  thresholdSeconds: number,
+): import("./types.js").StaleSessionSweepResult {
+  // Find active sessions whose most recent event is older than the
+  // threshold AND have no in-flight dependent rows.
+  const sql = `
+    SELECT s.id
+      FROM sessions s
+      LEFT JOIN (
+        SELECT session_id, MAX(created_at) AS last_event_at
+          FROM orchestration_events
+         GROUP BY session_id
+      ) e ON e.session_id = s.id
+     WHERE s.status = 'active'
+       AND (
+         e.last_event_at IS NULL
+         OR (julianday('now') - julianday(e.last_event_at)) * 86400 > ?
+       )
+       AND NOT EXISTS (
+         SELECT 1 FROM command_executions ce
+          WHERE ce.workflow_id = s.id
+            AND ce.finished_at IS NULL
+       )
+  `;
+  const rows = resultToRows<{ id: string }>(db.exec(sql, [thresholdSeconds]));
+
+  if (rows.length === 0) {
+    return { closedSessionIds: [] };
+  }
+
+  for (const row of rows) {
+    // One transaction per session (reason event FIRST, then the status flip)
+    // via the shared close primitive — upholds the D1 invariant. Per-session
+    // (not whole-loop) so one failing close can't roll back the others.
+    commitReasonClose(
+      db,
+      row.id,
+      {
+        event_type: "session_auto_closed_stale",
+        phase: "complete",
+        metadata: JSON.stringify({
+          reason: "no events past threshold; no in-flight dependents",
+          threshold_seconds: thresholdSeconds,
+        }),
+      },
+      { status: "closed", current_phase: "complete" },
+    );
+  }
+
+  return { closedSessionIds: rows.map((r) => r.id) };
 }

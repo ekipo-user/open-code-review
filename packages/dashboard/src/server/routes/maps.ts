@@ -3,7 +3,7 @@
  */
 
 import { Router } from 'express'
-import type { Database } from 'sql.js'
+import type { Database } from '@open-code-review/cli/db'
 import {
   getSession,
   getMapRunsForSession,

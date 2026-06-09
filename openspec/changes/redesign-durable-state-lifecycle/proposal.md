@@ -1,0 +1,30 @@
+# Change: Durable, event-sourced state lifecycle with an atomic agent API (v2.0.0)
+
+## Why
+
+OCR has shipped a recurring, data-correctness bug: **sessions get marked complete too soon.** A workflow stops mid-flight (e.g. at `synthesis`, with no `round_completed` event) yet the system treats it as done; a later orchestrator must notice the gap and surgically repair it by hand. PR #31 (this branch) hardened *detection* but a four-agent review board found the root causes are structural and remain open:
+
+1. **`ocr state close` is an unguarded back door into `complete`.** It flips `status='closed', current_phase='complete'` with no precondition — no `round_completed` event required. The phase graph guards `transition` but `close` bypasses it. Completion is a mutable flag nobody validates, and the dashboard reads that flag as `success`.
+2. **A concurrent-writer data-loss race can clobber a *correct* close.** The CLI (short-lived processes) and the dashboard (long-lived, holds the whole DB in memory via sql.js) both write the same file through a hand-rolled merge layer with two confirmed clobber bugs (incomplete merge predicate; mtime-gated pre-save merge). A legitimate `close`/`round_completed` write can be silently overwritten — producing the headline symptom with zero agent misbehavior.
+3. **Completion is asserted, not derived.** Truth is smeared across mutable `sessions` columns, the `orchestration_events` log, and filesystem artifacts, which can disagree.
+
+The fix is architectural, not incremental: make incorrect state **unrepresentable**, give orchestrating agents an **atomic, semantic, misuse-proof** state API, and run it on a **durable engine** that the current schema was already designed to adopt.
+
+## What Changes
+
+- **BREAKING (engine):** Migrate the SQLite engine from `sql.js` (in-memory WASM, full-image writes, hand-rolled merge) to **`better-sqlite3` + WAL** (on-disk, OS-level single-writer/multi-reader locking). Deletes the `DbSyncWatcher` merge layer, the mtime watermark, the save hooks, and `db.export()` full-image writes. Adds a native runtime dependency.
+- **BREAKING (model):** The **event log becomes the single source of truth for lifecycle.** `sessions.status`, `current_phase`, `current_round`, and completion become **derived projections** of `orchestration_events` — never independently written. "Closed" means *a terminal event exists*; a flag cannot lie.
+- **BREAKING (write ownership):** Single-writer-per-bounded-context. The **CLI is the sole writer of lifecycle** (`sessions` + `orchestration_events`); the **dashboard shells out to `ocr state`** for all lifecycle mutations and writes only its own contexts (process-supervision journal `command_executions`, and UX state: notes, triage, chat).
+- **NEW (agent API):** An atomic, semantic porcelain — `ocr state begin`, `advance`, `complete-round`, `complete-map`, `finish`, `status` — each a single transaction, invariant-checked, idempotent, with a typed exit-code taxonomy. `complete-round`/`complete-map` either fully finalize a round/run or change nothing. `finish` **refuses** to close a session whose current round is not complete (`--abort` records a distinct `session_aborted` event). Low-level `transition`/`round-complete`/`close` remain as deprecated plumbing.
+- **NEW (dual-layer enforcement):** App-level guards **plus** DB-level constraints/triggers (migration v12): an `event_type` taxonomy guard, a `BEFORE UPDATE` close-guard trigger that aborts `status='closed'` unless a terminal artifact event or an explicit reason event exists, and a `session_completeness` view that the dashboard's outcome derivation reads. Illegal states are unrepresentable even via raw SQL.
+- **NEW (automatic migration):** Seamless, hands-off upgrade. On the first post-upgrade `ocr` invocation or dashboard start, the existing transactional migration runner: snapshots `ocr.db` → `.bak.<fromVersion>`, enables WAL, applies schema v12, and runs **automatic legacy reconciliation** that derives true state from events + filesystem artifacts (synthesizing a `round_completed` from a present `final.md` when provable; grandfathering otherwise; auto-closing stale sessions). Idempotent, `--dry-run`-able, fully logged. No user action.
+- **NEW (release):** Ship as **v2.0.0** (engine + contract change). The change is automatic and backward-compatible at the data-file level; "major" reflects the engine/contract honesty and lets us deprecate plumbing cleanly.
+- **REMOVED:** The deprecated `state.json` dual-write side-effect (events are now authoritative; legacy `state.json` is read-only reconciled, never written).
+- **FUTURE (designed-for, not built):** The atomic verbs are designed to be MCP-tool-ready (typed JSON in/out) so a post-2.0 MCP state server is additive.
+
+## Impact
+
+- **Affected specs:** `sqlite-state` (engine, event-sourcing, migrations, reconciliation, enforcement), `session-management` (derived lifecycle, completion model, reconciliation), `cli` (atomic verbs, exit-code taxonomy, deprecations), `review-orchestration` (orchestrator completion contract), `dashboard` (outcome from completeness view, single-writer, merge-layer removal).
+- **Affected code:** `packages/cli/src/lib/db/{index,migrations,agent-sessions,result-mapper,types}.ts`, `packages/cli/src/lib/state/index.ts`, `packages/cli/src/commands/{state,session}.ts`, `packages/cli/build.mjs` + `package.json` (native dep, `external`), `packages/dashboard/src/server/{index,db}.ts`, `packages/dashboard/src/server/services/{db-sync-watcher,command-outcome}.ts`, `packages/dashboard/src/server/socket/command-runner.ts`, `packages/agents/skills/ocr/references/{workflow,session-state,map-workflow}.md`.
+- **Migration risk (top):** native dependency changes every end-user `npm i -g`. Mitigated by better-sqlite3 prebuilt binaries, an `ocr doctor` native-load check, and clear failure messaging.
+- **Builds on PR #31's groundwork** (phase graph, single resolver, events-as-truth for rounds, sweeps) — those are retained and completed by this change.

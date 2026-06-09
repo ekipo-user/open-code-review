@@ -21,7 +21,18 @@ import { useSocket, useSocketEvent } from './socket-provider'
 import { fetchApi } from '../lib/utils'
 import type { CommandEventsResponse, StreamEvent } from '../lib/api-types'
 
-export type TabStatus = 'running' | 'complete' | 'cancelled' | 'failed'
+export type TabStatus = 'running' | 'complete' | 'incomplete' | 'cancelled' | 'failed'
+
+/** Maps the server's CommandOutcome onto the client's TabStatus vocabulary. */
+function outcomeToTabStatus(
+  outcome: 'success' | 'incomplete' | 'failed' | 'cancelled' | null,
+): TabStatus {
+  if (outcome === 'success') return 'complete'
+  if (outcome === 'incomplete') return 'incomplete'
+  if (outcome === 'failed') return 'failed'
+  if (outcome === 'cancelled') return 'cancelled'
+  return 'running'
+}
 
 export type CommandTab = {
   executionId: number
@@ -203,23 +214,38 @@ export function CommandStateProvider({ children }: { children: ReactNode }) {
     })
   })
 
-  useSocketEvent<{ execution_id: number; exitCode: number }>(
-    'command:finished',
-    (data) => {
-      setTabMap((prev) => {
-        const existing = prev.get(data.execution_id)
-        if (!existing) return prev
+  useSocketEvent<{
+    execution_id: number
+    exitCode: number
+    /**
+     * Server-derived from (exit_code, linked workflow.status). Distinguishes
+     * a cleanly-finished workflow from one whose parent process exited 0
+     * mid-flight (macOS-sleep / network-drop). May be absent on rows from
+     * older server builds — fall back to the exit-code-only mapping.
+     */
+    outcome?: 'success' | 'incomplete' | 'failed' | 'cancelled' | null
+  }>('command:finished', (data) => {
+    setTabMap((prev) => {
+      const existing = prev.get(data.execution_id)
+      if (!existing) return prev
 
-        const next = new Map(prev)
-        next.set(data.execution_id, {
-          ...existing,
-          status: data.exitCode === -2 ? 'cancelled' : data.exitCode === 0 ? 'complete' : 'failed',
-          exitCode: data.exitCode,
-        })
-        return next
+      const next = new Map(prev)
+      const status: TabStatus = data.outcome
+        ? outcomeToTabStatus(data.outcome)
+        : data.exitCode === -2
+          ? 'cancelled'
+          : data.exitCode === 0
+            ? 'complete'
+            : 'failed'
+
+      next.set(data.execution_id, {
+        ...existing,
+        status,
+        exitCode: data.exitCode,
       })
-    },
-  )
+      return next
+    })
+  })
 
   // Actions
   const dismissTab = useCallback(

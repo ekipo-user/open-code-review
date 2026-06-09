@@ -1,16 +1,84 @@
 /**
  * Shared SQLite database access module for OCR.
  *
- * Uses sql.js (WASM) for zero native dependency SQLite access.
- * The database lives at `.ocr/data/ocr.db` within a project.
+ * Uses `better-sqlite3` (native, on-disk, WAL) for durable, cross-process
+ * SQLite access. The database lives at `.ocr/data/ocr.db` within a project.
+ * Engine specifics live in `./engine.ts`; this module owns connection
+ * lifecycle, migrations, and re-exports.
  */
 
-import { existsSync, mkdirSync, readFileSync, renameSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, copyFileSync, statSync } from "node:fs";
 import { dirname, join } from "node:path";
-import { createRequire } from "node:module";
-import { spawnSync } from "node:child_process";
-import initSqlJs, { type Database } from "sql.js";
-import { runMigrations } from "./migrations.js";
+import { openEngine, type Database } from "./engine.js";
+import { runMigrations, getSchemaVersion } from "./migrations.js";
+import { reconcileLegacyState } from "./reconcile.js";
+import type { ReconcileResult } from "./reconcile.js";
+
+/**
+ * Schema version that introduces the v2.0 event-sourced lifecycle. Databases
+ * below this are snapshotted before the upgrade (see {@link ensureDatabase}).
+ */
+const V2_SCHEMA_VERSION = 12;
+
+/**
+ * Snapshot an existing pre-v2 database to `ocr.db.bak.v<n>` before applying
+ * the v12 upgrade — cheap, total recoverability for local-first users. A
+ * brand-new database (version 0) is skipped. WAL is checkpoint-truncated
+ * first so the copied main file is current.
+ *
+ * Returns the backup path when a snapshot was written, else `null`.
+ */
+function maybeSnapshotBeforeUpgrade(
+  db: Database,
+  dbPath: string,
+  fromVersion: number,
+): string | null {
+  if (fromVersion < 1 || fromVersion >= V2_SCHEMA_VERSION) return null;
+  const bakPath = `${dbPath}.bak.v${fromVersion}`;
+  if (existsSync(bakPath)) return bakPath; // already snapshotted on a prior attempt
+  try {
+    if (!existsSync(dbPath) || statSync(dbPath).size === 0) return null;
+    db.pragma("wal_checkpoint(TRUNCATE)");
+    copyFileSync(dbPath, bakPath);
+    return bakPath;
+  } catch {
+    // Snapshot is best-effort insurance; never block the upgrade on it.
+    return null;
+  }
+}
+
+/**
+ * Compose the one-time stderr notice shown when an existing pre-v2 database is
+ * upgraded. Pure + exported so it can be unit-tested. Returns `null` when
+ * there's nothing worth announcing (defensive; the caller only invokes it on a
+ * real upgrade).
+ */
+export function formatUpgradeNotice(
+  bakPath: string | null,
+  reconcile: ReconcileResult | undefined,
+): string | null {
+  const lines = [
+    "Storage upgraded to v2.0 — durable SQLite engine (WAL), event-sourced lifecycle.",
+  ];
+  if (bakPath) {
+    lines.push(`  A backup of your previous database was saved to: ${bakPath}`);
+  }
+  const repairs = (reconcile?.actions ?? []).filter((a) => a.kind !== "ok");
+  if (repairs.length > 0) {
+    const n = (kind: string) => repairs.filter((a) => a.kind === kind).length;
+    const parts: string[] = [];
+    const finalized =
+      n("synthesize-round-completed") + n("synthesize-map-completed");
+    if (finalized > 0) parts.push(`${finalized} finalized from artifacts`);
+    if (n("grandfather") > 0) parts.push(`${n("grandfather")} grandfathered`);
+    if (n("stale-close") > 0) parts.push(`${n("stale-close")} stale closed`);
+    lines.push(
+      `  Reconciled ${repairs.length} legacy session(s): ${parts.join(", ")}.`,
+    );
+  }
+  lines.push("  Run `ocr doctor` to verify the storage engine.");
+  return lines.map((l) => `[ocr] ${l}`).join("\n");
+}
 
 // Re-export public types and functions
 export type {
@@ -39,6 +107,7 @@ export {
   insertEvent,
   getEventsForSession,
   getLatestEventId,
+  commitReasonClose,
 } from "./queries.js";
 
 export {
@@ -54,13 +123,49 @@ export {
   setAgentSessionStatus,
   updateAgentSession,
   sweepStaleAgentSessions,
+  sweepStaleSessions,
+  cascadeTerminateExecutions,
+  rowKind,
 } from "./agent-sessions.js";
 
+// Process-liveness primitives — shared by the dashboard's supervision paths
+// (startup orphan-kill + the periodic liveness sweep) so the "is this pid
+// alive?" policy and the PID-reuse guard are defined once.
+export {
+  type IsAlive,
+  defaultIsAlive,
+  PID_REUSE_GUARD_MS,
+  sqliteUtcMs,
+} from "./liveness.js";
+
 export type { WorkflowType, SessionStatus } from "../state/types.js";
+
+// Canonical exit-code taxonomy, error class, and the negative process
+// sentinels — surfaced through the db barrel so the dashboard (which imports
+// from `@open-code-review/cli/db`) can branch on them without reaching into
+// the state module's internals.
+export {
+  STATE_EXIT,
+  StateError,
+  CANCELLED_EXIT_CODE,
+  ORPHAN_EXIT_CODE,
+  CASCADE_CLOSE_EXIT_CODE,
+} from "../state/exit-codes.js";
 
 export { runMigrations, MIGRATIONS } from "./migrations.js";
 
 export { resultToRows, resultToRow } from "./result-mapper.js";
+
+export type { Database, ExecResult, ExecResultRow, SqlValue, BindParams } from "./engine.js";
+export { probeEngine, isBusyError } from "./engine.js";
+export { reconcileLegacyState } from "./reconcile.js";
+export type {
+  ReconcileResult,
+  ReconcileAction,
+  ReconcileKind,
+  ReconcileOptions,
+} from "./reconcile.js";
+export { getSchemaVersion } from "./migrations.js";
 
 export {
   cacheDir,
@@ -82,35 +187,9 @@ export type {
 const connections = new Map<string, Database>();
 
 /**
- * Resolves the path to the sql.js WASM binary.
- */
-export function locateWasm(): string {
-  const require = createRequire(import.meta.url);
-  const sqlJsPath = require.resolve("sql.js");
-  // require.resolve returns .../sql.js/dist/sql-wasm.js, so dirname is already /dist/
-  return join(dirname(sqlJsPath), "sql-wasm.wasm");
-}
-
-/**
- * Applies required pragmas to every connection.
- *
- * Note: sql.js runs SQLite entirely in-memory (WASM). WAL mode and
- * busy_timeout have no file-level effect here, but they establish the
- * correct configuration if the database is ever opened by a native
- * SQLite client (e.g. `sqlite3 .ocr/data/ocr.db`) or if we migrate
- * to better-sqlite3 in the future. Concurrency between the CLI and
- * dashboard is handled via the merge-before-write pattern in
- * `packages/dashboard/src/server/db.ts`, not WAL locking.
- */
-export function applyPragmas(db: Database): void {
-  db.run("PRAGMA foreign_keys = ON;");
-  db.run("PRAGMA journal_mode = WAL;");
-  db.run("PRAGMA busy_timeout = 5000;");
-}
-
-/**
- * Opens or creates a SQLite database at the given path.
- * Connections are cached by path for reuse.
+ * Opens or creates a SQLite database at the given path via better-sqlite3.
+ * Connections are cached by path for reuse within a process. The directory
+ * is created on demand so callers don't have to pre-create `data/`.
  */
 export async function openDatabase(dbPath: string): Promise<Database> {
   const cached = connections.get(dbPath);
@@ -118,43 +197,14 @@ export async function openDatabase(dbPath: string): Promise<Database> {
     return cached;
   }
 
-  const wasmBuffer = readFileSync(locateWasm());
-  const wasmBinary = wasmBuffer.buffer.slice(
-    wasmBuffer.byteOffset,
-    wasmBuffer.byteOffset + wasmBuffer.byteLength,
-  );
-
-  const SQL = await initSqlJs({
-    wasmBinary,
-  });
-
-  let db: Database;
-  if (existsSync(dbPath)) {
-    const fileBuffer = readFileSync(dbPath);
-    db = new SQL.Database(fileBuffer);
-  } else {
-    db = new SQL.Database();
-  }
-
-  applyPragmas(db);
-  connections.set(dbPath, db);
-
-  return db;
-}
-
-/**
- * Saves the in-memory database state to disk using atomic write
- * (temp file + rename) to prevent partial reads by concurrent processes.
- */
-export function saveDatabase(db: Database, dbPath: string): void {
-  const data = db.export();
   const dir = dirname(dbPath);
   if (!existsSync(dir)) {
     mkdirSync(dir, { recursive: true });
   }
-  const tmpPath = `${dbPath}.${process.pid}.tmp`;
-  writeFileSync(tmpPath, Buffer.from(data));
-  renameSync(tmpPath, dbPath);
+
+  const db = openEngine(dbPath);
+  connections.set(dbPath, db);
+  return db;
 }
 
 /**
@@ -178,28 +228,59 @@ export async function ensureDatabase(ocrDir: string): Promise<Database> {
 
   const dbPath = join(dataDir, "ocr.db");
   const db = await openDatabase(dbPath);
+  let before = 0;
+  try {
+    before = getSchemaVersion(db);
+  } catch {
+    before = 0;
+  }
+  // An upgrade of an EXISTING pre-v2 database (not a brand-new install, which
+  // starts at version 0). Used to gate the snapshot, reconciliation, and the
+  // one-time notice — all of which run exactly once per machine because, after
+  // this, `before` is always >= V2_SCHEMA_VERSION.
+  const isLegacyUpgrade = before >= 1 && before < V2_SCHEMA_VERSION;
+
+  const bakPath = maybeSnapshotBeforeUpgrade(db, dbPath, before);
   runMigrations(db);
-  saveDatabase(db, dbPath);
+
+  // On crossing into the v2 event-sourced model, heal legacy state (derive
+  // truth from events + filesystem artifacts) once, automatically. Runs after
+  // the schema is in place; safe to skip on any error so it never blocks
+  // opening the database.
+  let reconcile: ReconcileResult | undefined;
+  if (before < V2_SCHEMA_VERSION) {
+    try {
+      reconcile = reconcileLegacyState(db, ocrDir);
+    } catch (err) {
+      console.error(
+        `[ocr] legacy reconciliation skipped: ${err instanceof Error ? err.message : String(err)}`,
+      );
+    }
+  }
+
+  // One-time, hands-off migration visibility. Emitted to STDERR so it never
+  // pollutes machine-readable stdout (e.g. `ocr state status --json`). Fires
+  // only when an existing pre-v2 database was actually upgraded.
+  if (isLegacyUpgrade) {
+    const notice = formatUpgradeNotice(bakPath, reconcile);
+    if (notice) console.error(notice);
+  }
 
   return db;
 }
 
 /**
- * Best-effort WAL checkpoint against the on-disk database file.
+ * Checkpoint-truncate the on-disk write-ahead log through a native
+ * better-sqlite3 connection, so the main `.db` file stays current and the
+ * `.db-wal` sidecar doesn't grow without bound.
  *
- * sql.js runs SQLite in-memory, so a `PRAGMA wal_checkpoint(TRUNCATE)`
- * issued through it has no effect on any external `.db-wal` file. To
- * actually reclaim a stale WAL left behind by a native client (e.g. the
- * `sqlite3` CLI, a database GUI, or a future better-sqlite3 process), we
- * attempt to invoke the `sqlite3` binary if it is available on PATH.
+ * Reuses the cached connection when one exists; otherwise opens a transient
+ * one. Never throws — callers treat this as best-effort hygiene.
  *
- * Returns one of:
- *  - "checkpointed" — native sqlite3 was invoked and exited successfully
- *  - "skipped"      — no `sqlite3` binary on PATH, nothing to do
- *  - "failed"       — native sqlite3 was invoked but exited non-zero
- *
- * Never throws — startup callers should treat this as best-effort hygiene
- * and continue regardless of the outcome.
+ * Returns:
+ *  - "checkpointed" — the checkpoint pragma ran
+ *  - "skipped"      — the database file does not exist
+ *  - "failed"       — the checkpoint raised (reported, not thrown)
  */
 export type WalCheckpointResult = "checkpointed" | "skipped" | "failed";
 
@@ -208,33 +289,29 @@ export function walCheckpointTruncate(dbPath: string): WalCheckpointResult {
     return "skipped";
   }
 
-  // No-op probe: spawn `sqlite3 -version` to detect availability without
-  // committing to the checkpoint call. Avoids noisy failure modes when the
-  // binary is missing entirely.
-  try {
-    const probe = spawnSync("sqlite3", ["-version"], {
-      stdio: "ignore",
-      timeout: 2000,
-    });
-    if (probe.status !== 0) {
-      return "skipped";
+  const cached = connections.get(dbPath);
+  if (cached) {
+    try {
+      cached.pragma("wal_checkpoint(TRUNCATE)");
+      return "checkpointed";
+    } catch {
+      return "failed";
     }
-  } catch {
-    return "skipped";
   }
 
+  let transient: Database | undefined;
   try {
-    const result = spawnSync(
-      "sqlite3",
-      [dbPath, "PRAGMA wal_checkpoint(TRUNCATE);"],
-      {
-        stdio: "ignore",
-        timeout: 5000,
-      },
-    );
-    return result.status === 0 ? "checkpointed" : "failed";
+    transient = openEngine(dbPath);
+    transient.pragma("wal_checkpoint(TRUNCATE)");
+    return "checkpointed";
   } catch {
     return "failed";
+  } finally {
+    try {
+      transient?.raw.close();
+    } catch {
+      // already closed / never opened
+    }
   }
 }
 

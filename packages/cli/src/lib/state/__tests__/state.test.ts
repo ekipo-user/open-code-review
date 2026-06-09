@@ -11,11 +11,16 @@ import {
   stateShow,
   stateList,
   stateSync,
-  stateRoundComplete,
-  stateMapComplete,
+  stateBegin,
+  stateAdvance,
+  stateCompleteRound,
+  stateCompleteMap,
   computeRoundCounts,
   computeMapCounts,
+  validateRoundMeta,
+  validateMapMeta,
   resolveActiveSession,
+  STATE_EXIT,
 } from "../index.js";
 import type { RoundMeta, MapMeta } from "../types.js";
 
@@ -37,6 +42,57 @@ afterEach(() => {
 function sessionDir(sessionId: string): string {
   const dir = join(sessionsDir, sessionId);
   mkdirSync(dir, { recursive: true });
+  return dir;
+}
+
+/**
+ * Begin a review session and walk it to `synthesis` — the phase the atomic
+ * `stateCompleteRound` enforces as proof-of-work before it will finalize a
+ * round. Returns the session directory.
+ */
+async function beginReviewAtSynthesis(sessionId: string): Promise<string> {
+  const dir = sessionDir(sessionId);
+  await stateBegin({
+    sessionId,
+    branch: "feat/x",
+    workflowType: "review",
+    sessionDir: dir,
+    ocrDir,
+  });
+  for (const phase of [
+    "change-context",
+    "analysis",
+    "reviews",
+    "aggregation",
+    "discourse",
+    "synthesis",
+  ]) {
+    await stateAdvance({ sessionId, phase, ocrDir });
+  }
+  return dir;
+}
+
+/**
+ * Begin a map session and walk it to `synthesis` — the phase the atomic
+ * `stateCompleteMap` enforces as proof-of-work before it will finalize a run.
+ */
+async function beginMapAtSynthesis(sessionId: string): Promise<string> {
+  const dir = sessionDir(sessionId);
+  await stateBegin({
+    sessionId,
+    branch: "feat/x",
+    workflowType: "map",
+    sessionDir: dir,
+    ocrDir,
+  });
+  for (const phase of [
+    "topology",
+    "flow-analysis",
+    "requirements-mapping",
+    "synthesis",
+  ]) {
+    await stateAdvance({ sessionId, phase, ocrDir });
+  }
   return dir;
 }
 
@@ -152,6 +208,13 @@ describe("stateTransition", () => {
       ocrDir,
     });
 
+    // Walk through legal phases (the graph rejects context → analysis).
+    await stateTransition({
+      sessionId: "phase-event",
+      phase: "change-context",
+      phaseNumber: 2,
+      ocrDir,
+    });
     await stateTransition({
       sessionId: "phase-event",
       phase: "analysis",
@@ -162,7 +225,7 @@ describe("stateTransition", () => {
     const result = await stateShow(ocrDir, "phase-event");
     const events = result?.events ?? [];
     const transitionEvent = events.find(
-      (e) => e.event_type === "phase_transition",
+      (e) => e.event_type === "phase_transition" && e.phase === "analysis",
     );
     expect(transitionEvent).toBeDefined();
     expect(transitionEvent?.phase).toBe("analysis");
@@ -286,9 +349,11 @@ describe("stateClose", () => {
       ocrDir,
     });
 
+    // No completed round — abort is the legitimate way to close it.
     await stateClose({
       sessionId: "close-test",
       ocrDir,
+      abort: true,
     });
 
     const result = await stateShow(ocrDir, "close-test");
@@ -297,15 +362,15 @@ describe("stateClose", () => {
   });
 
   it("inserts a session_closed event", async () => {
-    const dir = sessionDir("close-event");
-    await stateInit({
-      sessionId: "close-event",
-      branch: "feat/ce",
-      workflowType: "review",
-      sessionDir: dir,
-      ocrDir,
-    });
+    await beginReviewAtSynthesis("close-event");
 
+    // Finalize a round so a normal (non-abort) close is permitted.
+    await stateCompleteRound({
+      source: "stdin",
+      ocrDir,
+      sessionId: "close-event",
+      data: JSON.stringify({ schema_version: 1, verdict: "APPROVE", reviewers: [] }),
+    });
     await stateClose({
       sessionId: "close-event",
       ocrDir,
@@ -390,6 +455,7 @@ describe("stateShow", () => {
     await stateClose({
       sessionId: "temp",
       ocrDir,
+      abort: true,
     });
 
     // No active sessions now
@@ -407,10 +473,11 @@ describe("stateShow", () => {
       ocrDir,
     });
 
+    // Walk a legal edge (context → change-context).
     await stateTransition({
       sessionId: "events-show",
-      phase: "analysis",
-      phaseNumber: 3,
+      phase: "change-context",
+      phaseNumber: 2,
       ocrDir,
     });
 
@@ -592,11 +659,273 @@ describe("resolveActiveSession", () => {
     await stateClose({
       sessionId: "closed-resolve",
       ocrDir,
+      abort: true,
     });
 
     await expect(resolveActiveSession(ocrDir)).rejects.toThrow(
       "No active session found",
     );
+  });
+
+  it("refuses ambiguous auto-detect when multiple active sessions exist", async () => {
+    // Two active sessions; no env var; no explicit id → must refuse
+    // rather than silently pick one. This is the structural fix for
+    // the "wrong session got closed" failure mode.
+    await stateInit({
+      sessionId: "amb-one",
+      branch: "feat/a",
+      workflowType: "review",
+      sessionDir: sessionDir("amb-one"),
+      ocrDir,
+    });
+    await stateInit({
+      sessionId: "amb-two",
+      branch: "feat/b",
+      workflowType: "review",
+      sessionDir: sessionDir("amb-two"),
+      ocrDir,
+    });
+
+    await expect(resolveActiveSession(ocrDir)).rejects.toThrow(
+      /Ambiguous auto-detect/,
+    );
+  });
+
+  it("disambiguates via OCR_DASHBOARD_EXECUTION_UID even with multiple active sessions", async () => {
+    // Same setup as the ambiguity test, but with the env var pointing at
+    // a command_executions row linked to the right session. The resolver
+    // must follow that linkage instead of throwing.
+    await stateInit({
+      sessionId: "uid-right",
+      branch: "feat/r",
+      workflowType: "review",
+      sessionDir: sessionDir("uid-right"),
+      ocrDir,
+    });
+    await stateInit({
+      sessionId: "uid-wrong",
+      branch: "feat/w",
+      workflowType: "review",
+      sessionDir: sessionDir("uid-wrong"),
+      ocrDir,
+    });
+
+    const { ensureDatabase: getDb } = await import("../../db/index.js");
+    const db = await getDb(ocrDir);
+    db.run(
+      `INSERT INTO command_executions (uid, command, args, started_at, workflow_id)
+       VALUES (?, 'review', '[]', datetime('now'), ?)`,
+      ["dash-uid-disambig", "uid-right"],
+    );
+
+    const prev = process.env["OCR_DASHBOARD_EXECUTION_UID"];
+    process.env["OCR_DASHBOARD_EXECUTION_UID"] = "dash-uid-disambig";
+    try {
+      const r = await resolveActiveSession(ocrDir);
+      expect(r.id).toBe("uid-right");
+      expect(r.decision).toBe("dashboard-uid");
+    } finally {
+      if (prev === undefined) delete process.env["OCR_DASHBOARD_EXECUTION_UID"];
+      else process.env["OCR_DASHBOARD_EXECUTION_UID"] = prev;
+    }
+  });
+});
+
+describe("stateTransition — phase graph", () => {
+  it("rejects illegal phase jumps (reviews → complete) on a review workflow", async () => {
+    const dir = sessionDir("phase-jump-review");
+    await stateInit({
+      sessionId: "phase-jump-review",
+      branch: "feat/pj",
+      workflowType: "review",
+      sessionDir: dir,
+      ocrDir,
+    });
+    // Walk legal phases up to `reviews` first.
+    for (const [phase, n] of [
+      ["change-context", 2],
+      ["analysis", 3],
+      ["reviews", 4],
+    ] as const) {
+      await stateTransition({
+        sessionId: "phase-jump-review",
+        phase,
+        phaseNumber: n,
+        ocrDir,
+      });
+    }
+    await expect(
+      stateTransition({
+        sessionId: "phase-jump-review",
+        phase: "complete",
+        phaseNumber: 8,
+        ocrDir,
+      }),
+    ).rejects.toThrow(/Illegal phase transition: reviews → complete/);
+  });
+
+  it("rejects cross-workflow-type phases (topology on a review workflow)", async () => {
+    const dir = sessionDir("cross-type");
+    await stateInit({
+      sessionId: "cross-type",
+      branch: "feat/ct",
+      workflowType: "review",
+      sessionDir: dir,
+      ocrDir,
+    });
+    await expect(
+      stateTransition({
+        sessionId: "cross-type",
+        // @ts-expect-error — intentionally passing a map phase
+        phase: "topology",
+        phaseNumber: 2,
+        ocrDir,
+      }),
+    ).rejects.toThrow(/Invalid phase "topology" for workflow_type "review"/);
+  });
+
+  it("allows round-boundary transitions to reset to context", async () => {
+    const dir = sessionDir("round-boundary");
+    await stateInit({
+      sessionId: "round-boundary",
+      branch: "feat/rb",
+      workflowType: "review",
+      sessionDir: dir,
+      ocrDir,
+    });
+    // Walk to complete legitimately.
+    for (const [phase, n] of [
+      ["change-context", 2],
+      ["analysis", 3],
+      ["reviews", 4],
+      ["aggregation", 5],
+      ["discourse", 6],
+      ["synthesis", 7],
+      ["complete", 8],
+    ] as const) {
+      await stateTransition({
+        sessionId: "round-boundary",
+        phase,
+        phaseNumber: n,
+        ocrDir,
+      });
+    }
+    // Start round 2 by jumping back to context with explicit round bump.
+    await expect(
+      stateTransition({
+        sessionId: "round-boundary",
+        phase: "context",
+        phaseNumber: 1,
+        round: 2,
+        ocrDir,
+      }),
+    ).resolves.toBeUndefined();
+  });
+});
+
+describe("stateClose — cascade + idempotency", () => {
+  it("is idempotent on already-closed sessions", async () => {
+    await beginReviewAtSynthesis("idemp");
+    await stateCompleteRound({
+      source: "stdin",
+      ocrDir,
+      sessionId: "idemp",
+      data: JSON.stringify({ schema_version: 1, verdict: "APPROVE", reviewers: [] }),
+    });
+    await stateClose({ sessionId: "idemp", ocrDir });
+    // Second close: must not throw, must not write a duplicate event.
+    await expect(
+      stateClose({ sessionId: "idemp", ocrDir }),
+    ).resolves.toBeUndefined();
+
+    const show = await stateShow(ocrDir, "idemp");
+    const closeEvents =
+      show?.events.filter((e) => e.event_type === "session_closed") ?? [];
+    expect(closeEvents.length).toBe(1);
+  });
+
+  it("cascade-closes in-flight dependent command_executions", async () => {
+    const dir = sessionDir("cascade");
+    await stateInit({
+      sessionId: "cascade",
+      branch: "feat/c",
+      workflowType: "review",
+      sessionDir: dir,
+      ocrDir,
+    });
+
+    const { ensureDatabase: getDb } = await import("../../db/index.js");
+    const db = await getDb(ocrDir);
+    db.run(
+      `INSERT INTO command_executions (uid, command, args, started_at, workflow_id, last_heartbeat_at)
+       VALUES (?, 'review', '[]', datetime('now'), ?, datetime('now'))`,
+      ["dash-cascade-uid", "cascade"],
+    );
+
+    await stateClose({ sessionId: "cascade", ocrDir, abort: true });
+
+    const result = db.exec(
+      `SELECT exit_code, finished_at, notes
+         FROM command_executions
+        WHERE uid = ?`,
+      ["dash-cascade-uid"],
+    );
+    const row = result[0]?.values[0];
+    expect(row).toBeDefined();
+    expect(row?.[0]).toBe(-4); // CASCADE_CLOSE_EXIT_CODE
+    expect(row?.[1]).toBeTruthy(); // finished_at populated
+    expect(String(row?.[2] ?? "")).toMatch(/closed by parent workflow close/);
+  });
+});
+
+describe("stateInit — re-open derives round from events", () => {
+  it("derives next round from MAX(round_completed.round) + 1, ignoring filesystem", async () => {
+    // Setup: complete round 1 via stateCompleteRound, then re-init.
+    const dir = await beginReviewAtSynthesis("round-from-events");
+    const meta = makeRoundMeta({ verdict: "APPROVE", reviewers: [] });
+    const filePath = writeRoundMeta(dir, meta);
+    await stateCompleteRound({
+      source: "file",
+      ocrDir,
+      filePath,
+      sessionId: "round-from-events",
+    });
+    await stateClose({ sessionId: "round-from-events", ocrDir });
+
+    // No filesystem round directories — only the round-meta.json we wrote
+    // is in `dir`, not a `rounds/round-N/` layout. Filesystem inference
+    // would say round 1. Event-based derivation says round 2.
+    const sid = await stateInit({
+      sessionId: "round-from-events",
+      branch: "feat/rfe",
+      workflowType: "review",
+      sessionDir: dir,
+      ocrDir,
+    });
+    expect(sid).toBe("round-from-events");
+    const show = await stateShow(ocrDir, "round-from-events");
+    expect(show?.session.current_round).toBe(2);
+  });
+
+  it("rejects re-open with mismatched workflow_type", async () => {
+    const dir = sessionDir("type-mismatch");
+    await stateInit({
+      sessionId: "type-mismatch",
+      branch: "feat/tm",
+      workflowType: "review",
+      sessionDir: dir,
+      ocrDir,
+    });
+    await stateClose({ sessionId: "type-mismatch", ocrDir, abort: true });
+    await expect(
+      stateInit({
+        sessionId: "type-mismatch",
+        branch: "feat/tm",
+        workflowType: "map",
+        sessionDir: dir,
+        ocrDir,
+      }),
+    ).rejects.toThrow(/Cannot re-open session/);
   });
 });
 
@@ -742,24 +1071,96 @@ describe("computeRoundCounts", () => {
   });
 });
 
-describe("stateRoundComplete", () => {
+// ── round-meta schema validation (extracted pure validator) ──
+//
+// These were originally exercised through the now-deleted round-complete
+// porcelain; the schema-guard behavior they pin lives in the pure
+// `validateRoundMeta`. Re-targeting them there keeps coverage equivalent while
+// dropping the irrelevant session/DB scaffolding.
+
+describe("validateRoundMeta", () => {
+  it("throws on invalid schema_version", () => {
+    expect(() =>
+      validateRoundMeta({ schema_version: 99, verdict: "APPROVE", reviewers: [] }),
+    ).toThrow("Unsupported schema_version: 99");
+  });
+
+  it("throws on missing verdict", () => {
+    expect(() =>
+      validateRoundMeta({ schema_version: 1, reviewers: [] }),
+    ).toThrow("non-empty verdict");
+  });
+
+  it("throws when reviewers is not an array", () => {
+    expect(() =>
+      validateRoundMeta({ schema_version: 1, verdict: "APPROVE" }),
+    ).toThrow("reviewers array");
+  });
+
+  it("throws on invalid finding category", () => {
+    expect(() =>
+      validateRoundMeta({
+        schema_version: 1,
+        verdict: "APPROVE",
+        reviewers: [
+          {
+            type: "principal",
+            instance: 1,
+            findings: [
+              { title: "Bad", category: "critical_issue", severity: "high", summary: "x" },
+            ],
+          },
+        ],
+      }),
+    ).toThrow("invalid category");
+  });
+
+  it("throws on invalid finding severity", () => {
+    expect(() =>
+      validateRoundMeta({
+        schema_version: 1,
+        verdict: "APPROVE",
+        reviewers: [
+          {
+            type: "principal",
+            instance: 1,
+            findings: [
+              { title: "Bad", category: "blocker", severity: "nuclear", summary: "x" },
+            ],
+          },
+        ],
+      }),
+    ).toThrow("invalid severity");
+  });
+
+  it("throws on a non-object finding shape", () => {
+    expect(() =>
+      validateRoundMeta({
+        schema_version: 1,
+        verdict: "APPROVE",
+        reviewers: [{ type: "principal", instance: 1, findings: ["not an object"] }],
+      }),
+    ).toThrow("Each finding must be an object");
+  });
+
+  it("accepts a well-formed round-meta and returns it", () => {
+    const meta = makeRoundMeta();
+    expect(validateRoundMeta(meta)).toBe(meta);
+  });
+});
+
+describe("stateCompleteRound (atomic finalize)", () => {
   it("reads JSON, computes counts, and creates round_completed event", async () => {
-    const dir = sessionDir("round-complete-test");
-    await stateInit({
-      sessionId: "round-complete-test",
-      branch: "feat/rc",
-      workflowType: "review",
-      sessionDir: dir,
-      ocrDir,
-    });
+    const dir = await beginReviewAtSynthesis("round-complete-test");
 
     const meta = makeRoundMeta();
     const filePath = writeRoundMeta(dir, meta);
 
-    await stateRoundComplete({
+    await stateCompleteRound({
       source: "file",
       ocrDir,
       filePath,
+      sessionId: "round-complete-test",
     });
 
     const result = await stateShow(ocrDir, "round-complete-test");
@@ -778,19 +1179,12 @@ describe("stateRoundComplete", () => {
   });
 
   it("auto-detects active session when no session ID given", async () => {
-    const dir = sessionDir("auto-detect-rc");
-    await stateInit({
-      sessionId: "auto-detect-rc",
-      branch: "feat/ad",
-      workflowType: "review",
-      sessionDir: dir,
-      ocrDir,
-    });
+    const dir = await beginReviewAtSynthesis("auto-detect-rc");
 
     const meta = makeRoundMeta({ verdict: "APPROVE", reviewers: [] });
     const filePath = writeRoundMeta(dir, meta);
 
-    await stateRoundComplete({ source: "file", ocrDir, filePath });
+    await stateCompleteRound({ source: "file", ocrDir, filePath });
 
     const result = await stateShow(ocrDir, "auto-detect-rc");
     const rcEvent = result?.events.find((e) => e.event_type === "round_completed");
@@ -799,81 +1193,34 @@ describe("stateRoundComplete", () => {
     expect(metadata.verdict).toBe("APPROVE");
   });
 
-  it("throws on invalid schema_version", async () => {
-    const dir = sessionDir("bad-schema");
-    await stateInit({
-      sessionId: "bad-schema",
-      branch: "feat/bs",
-      workflowType: "review",
-      sessionDir: dir,
-      ocrDir,
-    });
+  it("rejects invalid metadata with SCHEMA_INVALID (atomic path wraps validator)", async () => {
+    const dir = await beginReviewAtSynthesis("bad-schema");
 
     const filePath = join(dir, "round-meta.json");
     writeFileSync(filePath, JSON.stringify({ schema_version: 99, verdict: "APPROVE", reviewers: [] }));
 
     await expect(
-      stateRoundComplete({ source: "file", ocrDir, filePath }),
-    ).rejects.toThrow("Unsupported schema_version: 99");
+      stateCompleteRound({ source: "file", ocrDir, filePath, sessionId: "bad-schema" }),
+    ).rejects.toMatchObject({
+      code: STATE_EXIT.SCHEMA_INVALID,
+      message: expect.stringContaining("Unsupported schema_version: 99"),
+    });
   });
 
-  it("throws on missing verdict", async () => {
-    const dir = sessionDir("no-verdict");
-    await stateInit({
-      sessionId: "no-verdict",
-      branch: "feat/nv",
-      workflowType: "review",
-      sessionDir: dir,
-      ocrDir,
-    });
-
-    const filePath = join(dir, "round-meta.json");
-    writeFileSync(filePath, JSON.stringify({ schema_version: 1, reviewers: [] }));
+  it("wraps a missing input file as SCHEMA_INVALID", async () => {
+    const dir = await beginReviewAtSynthesis("missing-file");
 
     await expect(
-      stateRoundComplete({ source: "file", ocrDir, filePath }),
-    ).rejects.toThrow("non-empty verdict");
-  });
-
-  it("throws on invalid finding category", async () => {
-    const dir = sessionDir("bad-category");
-    await stateInit({
-      sessionId: "bad-category",
-      branch: "feat/bc",
-      workflowType: "review",
-      sessionDir: dir,
-      ocrDir,
+      stateCompleteRound({
+        source: "file",
+        ocrDir,
+        filePath: join(dir, "nonexistent.json"),
+        sessionId: "missing-file",
+      }),
+    ).rejects.toMatchObject({
+      code: STATE_EXIT.SCHEMA_INVALID,
+      message: expect.stringContaining("File not found"),
     });
-
-    const filePath = join(dir, "round-meta.json");
-    writeFileSync(filePath, JSON.stringify({
-      schema_version: 1,
-      verdict: "APPROVE",
-      reviewers: [{
-        type: "principal",
-        instance: 1,
-        findings: [{ title: "Bad", category: "critical_issue", severity: "high", summary: "x" }],
-      }],
-    }));
-
-    await expect(
-      stateRoundComplete({ source: "file", ocrDir, filePath }),
-    ).rejects.toThrow("invalid category");
-  });
-
-  it("throws on missing file", async () => {
-    const dir = sessionDir("missing-file");
-    await stateInit({
-      sessionId: "missing-file",
-      branch: "feat/mf",
-      workflowType: "review",
-      sessionDir: dir,
-      ocrDir,
-    });
-
-    await expect(
-      stateRoundComplete({ source: "file", ocrDir, filePath: join(dir, "nonexistent.json") }),
-    ).rejects.toThrow("File not found");
   });
 
   it("throws when no active session and no session-id given", async () => {
@@ -886,30 +1233,23 @@ describe("stateRoundComplete", () => {
       sessionDir: dir,
       ocrDir,
     });
-    await stateClose({ sessionId: "no-active-rc", ocrDir });
+    await stateClose({ sessionId: "no-active-rc", ocrDir, abort: true });
 
     const meta = makeRoundMeta();
     const filePath = writeRoundMeta(dir, meta);
 
     await expect(
-      stateRoundComplete({ source: "file", ocrDir, filePath }),
+      stateCompleteRound({ source: "file", ocrDir, filePath }),
     ).rejects.toThrow("No active session found");
   });
 
   it("uses explicit session-id and round when provided", async () => {
-    const dir = sessionDir("explicit-rc");
-    await stateInit({
-      sessionId: "explicit-rc",
-      branch: "feat/er",
-      workflowType: "review",
-      sessionDir: dir,
-      ocrDir,
-    });
+    const dir = await beginReviewAtSynthesis("explicit-rc");
 
     const meta = makeRoundMeta({ verdict: "APPROVE", reviewers: [] });
     const filePath = writeRoundMeta(dir, meta);
 
-    await stateRoundComplete({
+    await stateCompleteRound({
       source: "file",
       ocrDir,
       filePath,
@@ -923,7 +1263,63 @@ describe("stateRoundComplete", () => {
     expect(rcEvent?.round).toBe(3);
   });
 
-  it("allows targeting a closed session via explicit session-id", async () => {
+  it("prefers OCR_DASHBOARD_EXECUTION_UID linkage over latest-active fallback", async () => {
+    // Reproduces the auto-detect ambiguity bug: with multiple active
+    // sessions, the latest-active fallback would pick the wrong one.
+    // The dashboard sets OCR_DASHBOARD_EXECUTION_UID for the AI it spawns,
+    // and the capture service binds that uid -> command_executions.workflow_id.
+    // complete-round must follow that linkage.
+
+    // Older "right" session — what the dashboard actually spawned the AI for.
+    // Walk it to synthesis so the atomic finalize's proof-of-work passes.
+    const rightDir = await beginReviewAtSynthesis("right-session");
+
+    // Newer "wrong" session — would win latest-active auto-detect because
+    // its started_at is later. Simulates an unrelated session a user kicked
+    // off in the same project shortly after.
+    await new Promise((r) => setTimeout(r, 1100));
+    await beginReviewAtSynthesis("wrong-session");
+
+    // Seed a command_executions row linked to the right session, mirroring
+    // what the SessionCaptureService produces when the dashboard binds.
+    const { ensureDatabase: getDb } = await import("../../db/index.js");
+    const db = await getDb(ocrDir);
+    db.run(
+      `INSERT INTO command_executions
+         (uid, command, args, started_at, vendor, workflow_id)
+       VALUES (?, 'review', '[]', datetime('now'), 'claude', ?)`,
+      ["dash-uid-test", "right-session"],
+    );
+
+    const meta = makeRoundMeta({ verdict: "APPROVE", reviewers: [] });
+    const filePath = writeRoundMeta(rightDir, meta);
+
+    const prevEnv = process.env["OCR_DASHBOARD_EXECUTION_UID"];
+    process.env["OCR_DASHBOARD_EXECUTION_UID"] = "dash-uid-test";
+    try {
+      const result = await stateCompleteRound({
+        source: "file",
+        ocrDir,
+        filePath,
+      });
+      expect(result.sessionId).toBe("right-session");
+    } finally {
+      if (prevEnv === undefined) delete process.env["OCR_DASHBOARD_EXECUTION_UID"];
+      else process.env["OCR_DASHBOARD_EXECUTION_UID"] = prevEnv;
+    }
+
+    // Wrong session must NOT have a round_completed event.
+    const wrongShow = await stateShow(ocrDir, "wrong-session");
+    expect(
+      wrongShow?.events.find((e) => e.event_type === "round_completed"),
+    ).toBeUndefined();
+  });
+
+  it("refuses to finalize a closed session (INVARIANT_UNMET — not at synthesis)", async () => {
+    // The deleted round-complete porcelain let you write a round_completed
+    // event against a closed session at any phase. The atomic
+    // `stateCompleteRound` enforces proof-of-work: a closed session sits at
+    // "complete", so the finalize must refuse rather than fabricate a completion.
     const dir = sessionDir("closed-target");
     await stateInit({
       sessionId: "closed-target",
@@ -932,40 +1328,32 @@ describe("stateRoundComplete", () => {
       sessionDir: dir,
       ocrDir,
     });
-    await stateClose({ sessionId: "closed-target", ocrDir });
+    await stateClose({ sessionId: "closed-target", ocrDir, abort: true });
 
     const meta = makeRoundMeta({ verdict: "APPROVE", reviewers: [] });
     const filePath = writeRoundMeta(dir, meta);
 
-    // Should succeed — explicit session-id bypasses active-only auto-detect
-    const result = await stateRoundComplete({
-      source: "file",
-      ocrDir,
-      filePath,
-      sessionId: "closed-target",
-    });
-
-    expect(result.sessionId).toBe("closed-target");
-    expect(result.round).toBe(1);
+    await expect(
+      stateCompleteRound({
+        source: "file",
+        ocrDir,
+        filePath,
+        sessionId: "closed-target",
+      }),
+    ).rejects.toMatchObject({ code: STATE_EXIT.INVARIANT_UNMET });
   });
 });
 
-describe("stateRoundComplete with stdin", () => {
+describe("stateCompleteRound with stdin", () => {
   it("accepts raw JSON data and creates round_completed event", async () => {
-    const dir = sessionDir("stdin-basic");
-    await stateInit({
-      sessionId: "stdin-basic",
-      branch: "feat/stdin",
-      workflowType: "review",
-      sessionDir: dir,
-      ocrDir,
-    });
+    await beginReviewAtSynthesis("stdin-basic");
 
     const meta = makeRoundMeta();
-    const result = await stateRoundComplete({
+    const result = await stateCompleteRound({
       source: "stdin",
       ocrDir,
       data: JSON.stringify(meta),
+      sessionId: "stdin-basic",
     });
 
     expect(result.sessionId).toBe("stdin-basic");
@@ -982,20 +1370,14 @@ describe("stateRoundComplete with stdin", () => {
   });
 
   it("writes round-meta.json to the correct session round directory", async () => {
-    const dir = sessionDir("stdin-write");
-    await stateInit({
-      sessionId: "stdin-write",
-      branch: "feat/sw",
-      workflowType: "review",
-      sessionDir: dir,
-      ocrDir,
-    });
+    const dir = await beginReviewAtSynthesis("stdin-write");
 
     const meta = makeRoundMeta();
-    const result = await stateRoundComplete({
+    const result = await stateCompleteRound({
       source: "stdin",
       ocrDir,
       data: JSON.stringify(meta),
+      sessionId: "stdin-write",
     });
 
     const expectedPath = join(dir, "rounds", "round-1", "round-meta.json");
@@ -1008,39 +1390,26 @@ describe("stateRoundComplete with stdin", () => {
   });
 
   it("creates rounds directory if it does not exist", async () => {
-    const dir = sessionDir("stdin-mkdir");
-    await stateInit({
-      sessionId: "stdin-mkdir",
-      branch: "feat/sm",
-      workflowType: "review",
-      sessionDir: dir,
-      ocrDir,
-    });
+    const dir = await beginReviewAtSynthesis("stdin-mkdir");
 
     expect(existsSync(join(dir, "rounds"))).toBe(false);
 
     const meta = makeRoundMeta({ verdict: "APPROVE", reviewers: [] });
-    const result = await stateRoundComplete({
+    const result = await stateCompleteRound({
       source: "stdin",
       ocrDir,
       data: JSON.stringify(meta),
+      sessionId: "stdin-mkdir",
     });
 
     expect(existsSync(result.metaPath!)).toBe(true);
   });
 
   it("uses explicit session-id and round for file path", async () => {
-    const dir = sessionDir("stdin-explicit");
-    await stateInit({
-      sessionId: "stdin-explicit",
-      branch: "feat/se",
-      workflowType: "review",
-      sessionDir: dir,
-      ocrDir,
-    });
+    const dir = await beginReviewAtSynthesis("stdin-explicit");
 
     const meta = makeRoundMeta({ verdict: "APPROVE", reviewers: [] });
-    const result = await stateRoundComplete({
+    const result = await stateCompleteRound({
       source: "stdin",
       ocrDir,
       data: JSON.stringify(meta),
@@ -1054,61 +1423,49 @@ describe("stateRoundComplete with stdin", () => {
     expect(existsSync(expectedPath)).toBe(true);
   });
 
-  it("throws on invalid JSON from stdin", async () => {
-    const dir = sessionDir("stdin-bad-json");
-    await stateInit({
-      sessionId: "stdin-bad-json",
-      branch: "feat/bj",
-      workflowType: "review",
-      sessionDir: dir,
-      ocrDir,
-    });
+  it("throws SCHEMA_INVALID on invalid JSON from stdin", async () => {
+    await beginReviewAtSynthesis("stdin-bad-json");
 
     await expect(
-      stateRoundComplete({
+      stateCompleteRound({
         source: "stdin",
         ocrDir,
         data: "{ invalid json }",
+        sessionId: "stdin-bad-json",
       }),
-    ).rejects.toThrow("Failed to parse stdin");
+    ).rejects.toMatchObject({
+      code: STATE_EXIT.SCHEMA_INVALID,
+      message: expect.stringContaining("Failed to parse stdin"),
+    });
   });
 
-  it("throws on invalid schema from stdin", async () => {
-    const dir = sessionDir("stdin-bad-schema");
-    await stateInit({
-      sessionId: "stdin-bad-schema",
-      branch: "feat/bs2",
-      workflowType: "review",
-      sessionDir: dir,
-      ocrDir,
-    });
+  it("throws SCHEMA_INVALID on invalid schema from stdin", async () => {
+    await beginReviewAtSynthesis("stdin-bad-schema");
 
     await expect(
-      stateRoundComplete({
+      stateCompleteRound({
         source: "stdin",
         ocrDir,
         data: JSON.stringify({ schema_version: 99, verdict: "x", reviewers: [] }),
+        sessionId: "stdin-bad-schema",
       }),
-    ).rejects.toThrow("Unsupported schema_version: 99");
+    ).rejects.toMatchObject({
+      code: STATE_EXIT.SCHEMA_INVALID,
+      message: expect.stringContaining("Unsupported schema_version: 99"),
+    });
   });
 
   it("file mode does not write round-meta.json", async () => {
-    const dir = sessionDir("file-no-write");
-    await stateInit({
-      sessionId: "file-no-write",
-      branch: "feat/fnw",
-      workflowType: "review",
-      sessionDir: dir,
-      ocrDir,
-    });
+    const dir = await beginReviewAtSynthesis("file-no-write");
 
     const meta = makeRoundMeta();
     const filePath = writeRoundMeta(dir, meta);
 
-    const result = await stateRoundComplete({
+    const result = await stateCompleteRound({
       source: "file",
       ocrDir,
       filePath,
+      sessionId: "file-no-write",
     });
 
     expect(result.metaPath).toBeUndefined();
@@ -1176,24 +1533,63 @@ describe("computeMapCounts", () => {
   });
 });
 
-describe("stateMapComplete", () => {
+// ── map-meta schema validation (extracted pure validator) ──
+//
+// Re-targeted from the deleted map-complete porcelain to the pure
+// `validateMapMeta`, keeping the schema-guard coverage without the DB scaffold.
+
+describe("validateMapMeta", () => {
+  it("rejects invalid schema_version", () => {
+    const bad = { ...makeMapMeta(), schema_version: 99 };
+    expect(() => validateMapMeta(bad)).toThrow("Unsupported schema_version");
+  });
+
+  it("rejects missing sections array", () => {
+    expect(() => validateMapMeta({ schema_version: 1 })).toThrow("sections array");
+  });
+
+  it("rejects a section missing its files array", () => {
+    expect(() =>
+      validateMapMeta({
+        schema_version: 1,
+        sections: [{ section_number: 1, title: "Core", description: "x" }],
+      }),
+    ).toThrow("files array");
+  });
+
+  it("rejects a file missing its file_path", () => {
+    expect(() =>
+      validateMapMeta({
+        schema_version: 1,
+        sections: [
+          {
+            section_number: 1,
+            title: "Core",
+            files: [{ role: "Entry point", lines_added: 1, lines_deleted: 0 }],
+          },
+        ],
+      }),
+    ).toThrow("non-empty file_path");
+  });
+
+  it("accepts a well-formed map-meta and returns it", () => {
+    const meta = makeMapMeta();
+    expect(validateMapMeta(meta)).toBe(meta);
+  });
+});
+
+describe("stateCompleteMap (atomic finalize)", () => {
   it("creates a map_completed event from file", async () => {
-    const dir = sessionDir("map-complete-file");
-    await stateInit({
-      sessionId: "map-complete-file",
-      branch: "feat/mcf",
-      workflowType: "map",
-      sessionDir: dir,
-      ocrDir,
-    });
+    const dir = await beginMapAtSynthesis("map-complete-file");
 
     const meta = makeMapMeta();
     const filePath = writeMapMeta(dir, meta);
 
-    const result = await stateMapComplete({
+    const result = await stateCompleteMap({
       source: "file",
       ocrDir,
       filePath,
+      sessionId: "map-complete-file",
     });
 
     expect(result.sessionId).toBe("map-complete-file");
@@ -1211,19 +1607,12 @@ describe("stateMapComplete", () => {
   });
 
   it("auto-detects active session and map run", async () => {
-    const dir = sessionDir("map-auto");
-    await stateInit({
-      sessionId: "map-auto",
-      branch: "feat/ma",
-      workflowType: "map",
-      sessionDir: dir,
-      ocrDir,
-    });
+    const dir = await beginMapAtSynthesis("map-auto");
 
     const meta = makeMapMeta();
     const filePath = writeMapMeta(dir, meta);
 
-    const result = await stateMapComplete({
+    const result = await stateCompleteMap({
       source: "file",
       ocrDir,
       filePath,
@@ -1233,60 +1622,52 @@ describe("stateMapComplete", () => {
     expect(result.mapRun).toBe(1);
   });
 
-  it("rejects invalid schema_version", async () => {
-    const dir = sessionDir("map-bad-schema");
-    await stateInit({
-      sessionId: "map-bad-schema",
-      branch: "feat/mbs",
-      workflowType: "map",
-      sessionDir: dir,
-      ocrDir,
-    });
+  it("wraps invalid schema_version as SCHEMA_INVALID", async () => {
+    const dir = await beginMapAtSynthesis("map-bad-schema");
 
-    const meta = makeMapMeta();
-    const bad = { ...meta, schema_version: 99 };
+    const bad = { ...makeMapMeta(), schema_version: 99 };
     const filePath = writeMapMeta(dir, bad as MapMeta);
 
     await expect(
-      stateMapComplete({ source: "file", ocrDir, filePath }),
-    ).rejects.toThrow("Unsupported schema_version");
+      stateCompleteMap({ source: "file", ocrDir, filePath, sessionId: "map-bad-schema" }),
+    ).rejects.toMatchObject({
+      code: STATE_EXIT.SCHEMA_INVALID,
+      message: expect.stringContaining("Unsupported schema_version"),
+    });
   });
 
-  it("rejects missing sections array", async () => {
-    const dir = sessionDir("map-no-sections");
-    await stateInit({
-      sessionId: "map-no-sections",
+  it("refuses to finalize when not at synthesis (INVARIANT_UNMET)", async () => {
+    // The deleted map-complete porcelain wrote a map_completed event from any
+    // phase. The atomic finalize enforces proof-of-work: a freshly begun map
+    // session sits at "map-context", so the finalize must refuse.
+    const dir = sessionDir("map-not-synth");
+    await stateBegin({
+      sessionId: "map-not-synth",
       branch: "feat/mns",
       workflowType: "map",
       sessionDir: dir,
       ocrDir,
     });
 
-    const filePath = join(dir, "map-meta.json");
-    writeFileSync(filePath, JSON.stringify({ schema_version: 1 }));
+    const meta = makeMapMeta();
+    const filePath = writeMapMeta(dir, meta);
 
     await expect(
-      stateMapComplete({ source: "file", ocrDir, filePath }),
-    ).rejects.toThrow("sections array");
+      stateCompleteMap({ source: "file", ocrDir, filePath, sessionId: "map-not-synth" }),
+    ).rejects.toMatchObject({ code: STATE_EXIT.INVARIANT_UNMET });
   });
 });
 
-describe("stateMapComplete with stdin", () => {
+describe("stateCompleteMap with stdin", () => {
   it("accepts data string and creates event", async () => {
-    const dir = sessionDir("map-stdin");
-    await stateInit({
-      sessionId: "map-stdin",
-      branch: "feat/ms",
-      workflowType: "map",
-      sessionDir: dir,
-      ocrDir,
-    });
+    await beginMapAtSynthesis("map-stdin");
 
     const meta = makeMapMeta();
-    const result = await stateMapComplete({
+    const result = await stateCompleteMap({
       source: "stdin",
       ocrDir,
       data: JSON.stringify(meta),
+      sessionId: "map-stdin",
     });
 
     expect(result.sessionId).toBe("map-stdin");
@@ -1298,20 +1679,14 @@ describe("stateMapComplete with stdin", () => {
   });
 
   it("writes map-meta.json to correct session path", async () => {
-    const dir = sessionDir("map-stdin-write");
-    await stateInit({
-      sessionId: "map-stdin-write",
-      branch: "feat/msw",
-      workflowType: "map",
-      sessionDir: dir,
-      ocrDir,
-    });
+    const dir = await beginMapAtSynthesis("map-stdin-write");
 
     const meta = makeMapMeta();
-    const result = await stateMapComplete({
+    const result = await stateCompleteMap({
       source: "stdin",
       ocrDir,
       data: JSON.stringify(meta),
+      sessionId: "map-stdin-write",
     });
 
     expect(result.metaPath).toBeDefined();
@@ -1325,60 +1700,49 @@ describe("stateMapComplete with stdin", () => {
   });
 
   it("creates run directory if missing", async () => {
-    const dir = sessionDir("map-stdin-mkdir");
-    await stateInit({
-      sessionId: "map-stdin-mkdir",
-      branch: "feat/msm",
-      workflowType: "map",
-      sessionDir: dir,
-      ocrDir,
-    });
+    const dir = await beginMapAtSynthesis("map-stdin-mkdir");
 
     const runDir = join(dir, "map", "runs", "run-1");
     expect(existsSync(runDir)).toBe(false);
 
     const meta = makeMapMeta();
-    await stateMapComplete({
+    await stateCompleteMap({
       source: "stdin",
       ocrDir,
       data: JSON.stringify(meta),
+      sessionId: "map-stdin-mkdir",
     });
 
     expect(existsSync(runDir)).toBe(true);
   });
 
-  it("throws on invalid JSON from stdin", async () => {
-    const dir = sessionDir("map-stdin-bad-json");
-    await stateInit({
-      sessionId: "map-stdin-bad-json",
-      branch: "feat/msbj",
-      workflowType: "map",
-      sessionDir: dir,
-      ocrDir,
-    });
+  it("throws SCHEMA_INVALID on invalid JSON from stdin", async () => {
+    await beginMapAtSynthesis("map-stdin-bad-json");
 
     await expect(
-      stateMapComplete({ source: "stdin", ocrDir, data: "not json" }),
-    ).rejects.toThrow("Failed to parse stdin");
+      stateCompleteMap({
+        source: "stdin",
+        ocrDir,
+        data: "not json",
+        sessionId: "map-stdin-bad-json",
+      }),
+    ).rejects.toMatchObject({
+      code: STATE_EXIT.SCHEMA_INVALID,
+      message: expect.stringContaining("Failed to parse stdin"),
+    });
   });
 
   it("file mode does not write map-meta.json", async () => {
-    const dir = sessionDir("map-file-no-write");
-    await stateInit({
-      sessionId: "map-file-no-write",
-      branch: "feat/mfnw",
-      workflowType: "map",
-      sessionDir: dir,
-      ocrDir,
-    });
+    const dir = await beginMapAtSynthesis("map-file-no-write");
 
     const meta = makeMapMeta();
     const filePath = writeMapMeta(dir, meta);
 
-    const result = await stateMapComplete({
+    const result = await stateCompleteMap({
       source: "file",
       ocrDir,
       filePath,
+      sessionId: "map-file-no-write",
     });
 
     expect(result.metaPath).toBeUndefined();

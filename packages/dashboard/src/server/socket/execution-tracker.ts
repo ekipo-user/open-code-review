@@ -8,8 +8,7 @@
  */
 
 import type { Server as SocketIOServer } from 'socket.io'
-import type { Database } from 'sql.js'
-import { saveDb } from '../db.js'
+import type { Database } from '@open-code-review/cli/db'
 import {
   generateCommandUid,
   appendCommandLog,
@@ -100,7 +99,6 @@ export function startTrackedExecution(
          WHERE id = ?`,
         [exitCode, finishedAt, outputBuffer, executionId],
       )
-      saveDb(db, ocrDir)
 
       // Best-effort JSONL backup
       appendCommandLog(ocrDir, {

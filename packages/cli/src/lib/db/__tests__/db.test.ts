@@ -5,7 +5,6 @@ import { describe, it, expect, beforeEach, afterEach } from "vitest";
 import {
   openDatabase,
   ensureDatabase,
-  saveDatabase,
   closeAllDatabases,
   insertSession,
   updateSession,
@@ -17,7 +16,7 @@ import {
   getLatestEventId,
 } from "../index.js";
 import { runMigrations, MIGRATIONS } from "../migrations.js";
-import type { Database } from "sql.js";
+import type { Database } from "../engine.js";
 
 let tmpDir: string;
 let db: Database;
@@ -145,6 +144,8 @@ describe("Session CRUD", () => {
       session_dir: "/tmp/ocr/sessions/test-session-2",
     });
 
+    // A reason event makes the close-guard trigger permit the close.
+    insertEvent(db, { session_id: "test-session-2", event_type: "session_synced" });
     updateSession(db, "test-session-2", {
       status: "closed",
       current_phase: "synthesis",
@@ -191,6 +192,7 @@ describe("Session CRUD", () => {
       workflow_type: "review",
       session_dir: "/tmp/ocr/sessions/closed-session",
     });
+    insertEvent(db, { session_id: "closed-session", event_type: "session_synced" });
     updateSession(db, "closed-session", { status: "closed" });
 
     const latest = getLatestActiveSession(db);
@@ -227,7 +229,7 @@ describe("Event insertion and querying", () => {
 
     insertEvent(db, {
       session_id: "event-session",
-      event_type: "phase_start",
+      event_type: "phase_transition",
       phase: "context",
       phase_number: 1,
       round: 1,
@@ -235,7 +237,7 @@ describe("Event insertion and querying", () => {
 
     insertEvent(db, {
       session_id: "event-session",
-      event_type: "phase_complete",
+      event_type: "round_completed",
       phase: "context",
       phase_number: 1,
       round: 1,
@@ -244,8 +246,8 @@ describe("Event insertion and querying", () => {
 
     const events = getEventsForSession(db, "event-session");
     expect(events).toHaveLength(2);
-    expect(events[0]?.event_type).toBe("phase_start");
-    expect(events[1]?.event_type).toBe("phase_complete");
+    expect(events[0]?.event_type).toBe("phase_transition");
+    expect(events[1]?.event_type).toBe("round_completed");
     expect(events[1]?.metadata).toBe('{"duration_ms":1200}');
   });
 
@@ -273,7 +275,7 @@ describe("Event insertion and querying", () => {
 
     insertEvent(db, {
       session_id: "event-id-session",
-      event_type: "phase_start",
+      event_type: "phase_transition",
     });
 
     const latestId = getLatestEventId(db);
@@ -295,20 +297,6 @@ describe("ensureDatabase", () => {
     expect(result[0]?.values[0]?.[0]).toBeGreaterThanOrEqual(1);
 
     ensuredDb.close();
-  });
-});
-
-describe("saveDatabase", () => {
-  it("persists the database to disk", () => {
-    insertSession(db, {
-      id: "persist-test",
-      branch: "feat/persist",
-      workflow_type: "review",
-      session_dir: "/tmp/ocr/sessions/persist-test",
-    });
-
-    saveDatabase(db, dbPath);
-    expect(existsSync(dbPath)).toBe(true);
   });
 });
 

@@ -2,7 +2,7 @@
  * Typed query functions for sessions and orchestration events.
  */
 
-import type { Database } from "sql.js";
+import type { Database } from "./engine.js";
 import type {
   EventRow,
   InsertEventParams,
@@ -143,4 +143,34 @@ export function getLatestEventId(db: Database): number {
   }
   const val = result[0]?.values[0]?.[0];
   return typeof val === "number" ? val : 0;
+}
+
+// ── Atomic reason-close ──
+
+/**
+ * Atomically record a terminal "reason" event and flip the session's
+ * projection, in a single transaction with the reason event inserted
+ * BEFORE the status UPDATE.
+ *
+ * Ordering is load-bearing: the `trg_sessions_close_guard` trigger
+ * (see migrations.ts) fires on the active→closed UPDATE and aborts unless
+ * a completed round/run OR a reason event already exists. Writing the
+ * reason event first inside the same transaction guarantees the guard is
+ * satisfied at the moment of the status change.
+ *
+ * Lives in this leaf module (not state/index.ts) so both the state layer
+ * and reconcile.ts — which would otherwise form an import cycle through the
+ * db barrel — can use it. Re-exported from `state/index.ts` and the
+ * `db/index.ts` barrel for external consumers (e.g. the dashboard).
+ */
+export function commitReasonClose(
+  db: Database,
+  sessionId: string,
+  reasonEvent: Omit<InsertEventParams, "session_id">,
+  projectionUpdates: UpdateSessionParams,
+): void {
+  db.transaction(() => {
+    insertEvent(db, { session_id: sessionId, ...reasonEvent });
+    updateSession(db, sessionId, projectionUpdates);
+  });
 }

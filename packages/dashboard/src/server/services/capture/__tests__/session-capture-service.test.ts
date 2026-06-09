@@ -3,8 +3,8 @@
  *
  * These lock in the current behavior of session-id capture and resume-
  * context resolution before downstream call sites are migrated. They
- * exercise the service against a real sql.js database (Khorikov classical
- * school — no internal mocks).
+ * exercise the service against a real better-sqlite3 database (Khorikov
+ * classical school — no internal mocks).
  */
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 import { mkdtempSync, rmSync, mkdirSync } from 'node:fs'
@@ -408,7 +408,11 @@ describe('SessionCaptureService — linkExecutionToActiveSession', () => {
     })
     // Force the session into closed state but with fresh updated_at —
     // the previous unbounded query would have matched this; the
-    // round-1 SF3 fix's `status='active'` filter rejects it.
+    // round-1 SF3 fix's `status='active'` filter rejects it. A reason
+    // event lets the close-guard trigger permit the close.
+    db.run(
+      `INSERT INTO orchestration_events (session_id, event_type, created_at) VALUES ('closed-session', 'session_synced', datetime('now'))`,
+    )
     db.run(
       `UPDATE sessions
          SET status = 'closed',

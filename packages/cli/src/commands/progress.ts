@@ -165,7 +165,7 @@ export const progressCommand = new Command("progress")
         );
         console.error(
           chalk.dim(
-            `The orchestrating agent must create state via 'ocr state init' for progress tracking.`,
+            `The orchestrating agent must create state via 'ocr state begin' for progress tracking.`,
           ),
         );
         process.exit(1);

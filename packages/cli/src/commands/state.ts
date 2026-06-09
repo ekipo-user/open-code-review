@@ -1,14 +1,21 @@
 /**
  * OCR State Command
  *
- * Manages workflow session state exclusively through SQLite.
+ * Manages workflow session state exclusively through SQLite. The atomic
+ * porcelain verbs are the only supported API (v2 direct cutover — the
+ * legacy init/transition/close/round-complete/map-complete subcommands were
+ * removed; their underlying functions remain internal building blocks).
  *
  * Subcommands:
- *   init       — Create a new session
- *   transition — Move session to a new phase
- *   close      — Mark session as closed
- *   show       — Display current session state
- *   sync       — Rebuild session state from filesystem artifacts
+ *   begin          — Start or resume a workflow and report where it stands
+ *   advance        — Advance to a phase (graph-validated, phase number derived)
+ *   complete-round — Atomically finalize a review round
+ *   complete-map   — Atomically finalize a map run
+ *   finish         — Close a workflow (invariant-checked)
+ *   status         — Report completeness + the next action
+ *   show           — Display current session state
+ *   sync           — Rebuild session state from filesystem artifacts
+ *   reconcile      — Heal legacy/drifted session state
  */
 
 import { Command } from "commander";
@@ -17,20 +24,24 @@ import { existsSync, mkdirSync, readFileSync } from "node:fs";
 import { join } from "node:path";
 import { requireOcrSetup } from "../lib/guards.js";
 import {
-  stateInit,
-  stateTransition,
   stateClose,
   stateShow,
   stateSync,
-  stateRoundComplete,
-  stateMapComplete,
+  stateBegin,
+  stateAdvance,
+  stateCompleteRound,
+  stateCompleteMap,
+  stateStatus,
   resolveActiveSession,
+  StateError,
+  STATE_EXIT,
 } from "../lib/state/index.js";
-import type { WorkflowType, ReviewPhase, MapPhase, RoundCompleteResult, MapCompleteResult } from "../lib/state/types.js";
+import type { WorkflowType } from "../lib/state/types.js";
 import { replayCommandLog } from "../lib/db/command-log.js";
+import { ensureDatabase, reconcileLegacyState } from "../lib/db/index.js";
 import {
   getDb,
-  saveDatabase,
+  isBusyError,
   linkDashboardInvocationToWorkflow,
 } from "../lib/db/index.js";
 
@@ -38,7 +49,7 @@ import {
 
 /**
  * Spawn-marker shape — written by the dashboard's command-runner at the
- * moment it spawns an AI workflow, read here by `state init` to bind
+ * moment it spawns an AI workflow, read here by `state begin` to bind
  * `workflow_id` on the dashboard's parent `command_executions` row.
  *
  * The marker is the durable answer to a fragile-by-construction problem:
@@ -79,7 +90,7 @@ function readDashboardSpawnMarker(ocrDir: string): DashboardSpawnMarker | null {
   // not be consumed. `process.kill(pid, 0)` throws ESRCH when the PID
   // is gone — we treat that as "no live dashboard" and ignore the
   // marker. This prevents a crashed dashboard's leftover marker from
-  // mis-linking a future CLI-only `state init` invocation.
+  // mis-linking a future CLI-only `state begin` invocation.
   try {
     process.kill(marker.pid, 0);
   } catch {
@@ -100,220 +111,51 @@ async function readStdin(): Promise<string> {
   return data;
 }
 
-// ── init ──
-
-const initSubcommand = new Command("init")
-  .description("Initialize a new OCR session")
-  .requiredOption("--session-id <id>", "Session ID")
-  .requiredOption("--branch <branch>", "Branch name")
-  .requiredOption(
-    "--workflow-type <type>",
-    "Workflow type (review or map)",
-    (value: string) => {
-      if (value !== "review" && value !== "map") {
-        throw new Error(
-          `Invalid workflow type: "${value}". Must be "review" or "map".`,
-        );
-      }
-      return value as WorkflowType;
-    },
-  )
-  .option("--session-dir <dir>", "Session directory path (auto-resolved if omitted)")
-  .option(
-    "--dashboard-uid <uid>",
-    "Dashboard command_executions uid to link this workflow to. Takes precedence over the OCR_DASHBOARD_EXECUTION_UID env var so AI shells that strip env vars can still wire the linkage.",
-  )
-  .action(
-    async (options: {
-      sessionId: string;
-      branch: string;
-      workflowType: WorkflowType;
-      sessionDir?: string;
-      dashboardUid?: string;
-    }) => {
-      const targetDir = process.cwd();
-      requireOcrSetup(targetDir);
-      const ocrDir = join(targetDir, ".ocr");
-
-      const sessionDir =
-        options.sessionDir ?? join(ocrDir, "sessions", options.sessionId);
-
-      if (!existsSync(sessionDir)) {
-        mkdirSync(sessionDir, { recursive: true });
-      }
-
-      try {
-        const sessionId = await stateInit({
-          sessionId: options.sessionId,
-          branch: options.branch,
-          workflowType: options.workflowType,
-          sessionDir,
-          ocrDir,
-        });
-
-        // Late-link the dashboard's parent command_execution row to this
-        // newly-created session.
-        //
-        // When the dashboard spawns an AI workflow it puts its own
-        // command_executions.uid into `OCR_DASHBOARD_EXECUTION_UID`. The
-        // session row didn't exist at that point, so workflow_id was
-        // unset on the parent row. Now that the AI has created it, fill
-        // the linkage in. After this UPDATE, the parent row has both
-        // `workflow_id` (set here) AND `vendor_session_id` (bound by
-        // command-runner from Claude's stdout) — which is what the
-        // handoff route's `getLatestAgentSessionWithVendorId` lookup
-        // needs to surface a resume command.
-        // Three-source resolution, ordered by reliability:
-        //   1. `--dashboard-uid` flag — explicit, set by command-runner's
-        //      prompt injection. Survives shell stripping.
-        //   2. `OCR_DASHBOARD_EXECUTION_UID` env var — depends on the
-        //      AI's shell preserving unfamiliar env vars; sandboxed
-        //      shells can strip these.
-        //   3. Filesystem spawn marker — written by the dashboard at
-        //      spawn time. This is the durable, guaranteed path: it
-        //      doesn't depend on env-var inheritance or prompt-following.
-        //      Used as the fallback when (1) and (2) miss.
-        const markerUid = readDashboardSpawnMarker(ocrDir)?.execution_uid;
-        const dashboardUid =
-          options.dashboardUid ??
-          process.env["OCR_DASHBOARD_EXECUTION_UID"] ??
-          markerUid;
-        if (dashboardUid) {
-          try {
-            // Linkage flows through the single-owner CLI db helper
-            // (`linkDashboardInvocationToWorkflow`) — same primitive the
-            // dashboard's SessionCaptureService uses. No direct SQL here.
-            const db = await getDb(ocrDir);
-            linkDashboardInvocationToWorkflow(db, dashboardUid, sessionId);
-            saveDatabase(db, join(ocrDir, "data", "ocr.db"));
-            // Diagnostic log so dashboard-linkage failures are visible in
-            // the events JSONL: silently succeeding looks identical to
-            // silently skipping when the env var is missing — and that
-            // ambiguity hid a class of bugs through several iterations.
-            console.error(
-              chalk.gray(
-                `[state init] linked workflow_id=${sessionId} → dashboard uid=${dashboardUid}`,
-              ),
-            );
-          } catch (linkErr) {
-            // Non-fatal — the session is created either way; only resume
-            // discoverability suffers without the linkage.
-            console.error(
-              chalk.yellow(
-                `Warning: failed to link dashboard command_execution to session: ${
-                  linkErr instanceof Error ? linkErr.message : String(linkErr)
-                }`,
-              ),
-            );
-          }
-        } else {
-          // No flag, no env var, no marker. Running outside the
-          // dashboard — leave the parent execution row unlinked.
-          console.error(
-            chalk.gray(
-              `[state init] no dashboard linkage available (flag, env var, and marker file all absent — CLI-only invocation)`,
-            ),
-          );
-        }
-
-        console.log(sessionId);
-      } catch (error) {
-        console.error(
-          chalk.red(
-            `Error: ${error instanceof Error ? error.message : "Failed to initialize session"}`,
-          ),
-        );
-        process.exit(1);
-      }
-    },
-  );
-
-// ── transition ──
-
-const transitionSubcommand = new Command("transition")
-  .description("Transition session to a new phase")
-  .option("--session-id <id>", "Session ID (auto-detects latest active if omitted)")
-  .requiredOption("--phase <phase>", "Target phase name")
-  .requiredOption("--phase-number <number>", "Phase number", parseInt)
-  .option("--current-round <number>", "Round number", parseInt)
-  .option("--current-map-run <number>", "Map run number", parseInt)
-  .action(
-    async (options: {
-      sessionId?: string;
-      phase: string;
-      phaseNumber: number;
-      currentRound?: number;
-      currentMapRun?: number;
-    }) => {
-      const targetDir = process.cwd();
-      requireOcrSetup(targetDir);
-      const ocrDir = join(targetDir, ".ocr");
-
-      const VALID_PHASES = new Set<string>([
-        "context", "change-context", "analysis", "reviews",
-        "aggregation", "discourse", "synthesis", "complete",
-        "map-context", "topology", "flow-analysis", "requirements-mapping",
-      ]);
-      if (!VALID_PHASES.has(options.phase)) {
-        throw new Error(`Invalid phase: "${options.phase}". Must be one of: ${[...VALID_PHASES].join(", ")}`);
-      }
-
-      try {
-        const sessionId = options.sessionId
-          ?? (await resolveActiveSession(ocrDir)).id;
-
-        await stateTransition({
-          sessionId,
-          phase: options.phase as ReviewPhase | MapPhase,
-          phaseNumber: options.phaseNumber,
-          round: options.currentRound,
-          mapRun: options.currentMapRun,
-          ocrDir,
-        });
-
-        console.log(
-          `${sessionId}: ${options.phase} (phase ${options.phaseNumber})`,
-        );
-      } catch (error) {
-        console.error(
-          chalk.red(
-            `Error: ${error instanceof Error ? error.message : "Failed to transition"}`,
-          ),
-        );
-        process.exit(1);
-      }
-    },
-  );
-
-// ── close ──
-
-const closeSubcommand = new Command("close")
-  .description("Close a session")
-  .option("--session-id <id>", "Session ID (auto-detects latest active if omitted)")
-  .action(async (options: { sessionId?: string }) => {
-    const targetDir = process.cwd();
-    requireOcrSetup(targetDir);
-    const ocrDir = join(targetDir, ".ocr");
-
-    try {
-      const sessionId = options.sessionId
-        ?? (await resolveActiveSession(ocrDir)).id;
-
-      await stateClose({
-        sessionId,
-        ocrDir,
-      });
-
-      console.log(`${sessionId}: closed`);
-    } catch (error) {
-      console.error(
-        chalk.red(
-          `Error: ${error instanceof Error ? error.message : "Failed to close session"}`,
-        ),
-      );
-      process.exit(1);
-    }
-  });
+/**
+ * Late-link the dashboard's parent `command_executions` row to a freshly
+ * created session so the dashboard can bind outcome + offer a resume command.
+ *
+ * Resolves the dashboard uid by reliability: `--dashboard-uid` flag →
+ * `OCR_DASHBOARD_EXECUTION_UID` env var → filesystem spawn marker. Non-fatal:
+ * the session is created either way; only resume discoverability suffers.
+ *
+ * Called by `begin` (the v2 create/resume verb) after the session row exists.
+ */
+async function linkDashboardInvocation(
+  ocrDir: string,
+  sessionId: string,
+  explicitUid: string | undefined,
+  label: string,
+): Promise<void> {
+  const markerUid = readDashboardSpawnMarker(ocrDir)?.execution_uid;
+  const dashboardUid =
+    explicitUid ?? process.env["OCR_DASHBOARD_EXECUTION_UID"] ?? markerUid;
+  if (!dashboardUid) {
+    console.error(
+      chalk.gray(
+        `[state ${label}] no dashboard linkage available (flag, env var, and marker file all absent — CLI-only invocation)`,
+      ),
+    );
+    return;
+  }
+  try {
+    const db = await getDb(ocrDir);
+    linkDashboardInvocationToWorkflow(db, dashboardUid, sessionId);
+    console.error(
+      chalk.gray(
+        `[state ${label}] linked workflow_id=${sessionId} → dashboard uid=${dashboardUid}`,
+      ),
+    );
+  } catch (linkErr) {
+    console.error(
+      chalk.yellow(
+        `Warning: failed to link dashboard command_execution to session: ${
+          linkErr instanceof Error ? linkErr.message : String(linkErr)
+        }`,
+      ),
+    );
+  }
+}
 
 // ── show ──
 
@@ -422,7 +264,6 @@ const syncSubcommand = new Command("sync")
       if (totalCmds === 0) {
         const recovered = replayCommandLog(db, ocrDir);
         if (recovered > 0) {
-          saveDatabase(db, join(ocrDir, "data", "ocr.db"));
           console.log(`Recovered ${recovered} command${recovered !== 1 ? "s" : ""} from backup log.`);
         }
       }
@@ -436,150 +277,329 @@ const syncSubcommand = new Command("sync")
     }
   });
 
-// ── round-complete ──
+// ── reconcile ──
 
-const roundCompleteSubcommand = new Command("round-complete")
-  .description("Import structured round data into SQLite")
-  .option("--file <path>", "Path to round-meta.json")
-  .option("--stdin", "Read round-meta JSON from stdin (recommended)")
-  .option("--session-id <id>", "Session ID (auto-detects latest active if omitted)")
-  .option("--round <number>", "Round number (auto-detects current if omitted)", parseInt)
+const reconcileSubcommand = new Command("reconcile")
+  .description(
+    "Heal legacy/drifted session state by deriving truth from events + artifacts",
+  )
+  .option("--dry-run", "Print the repair plan without writing anything")
+  .option("--json", "Output the result as JSON")
+  .action(async (options: { dryRun?: boolean; json?: boolean }) => {
+    const targetDir = process.cwd();
+    requireOcrSetup(targetDir);
+    const ocrDir = join(targetDir, ".ocr");
+
+    try {
+      const db = await ensureDatabase(ocrDir);
+      const result = reconcileLegacyState(db, ocrDir, { dryRun: options.dryRun });
+
+      if (options.json) {
+        console.log(JSON.stringify(result, null, 2));
+        return;
+      }
+
+      const repairs = result.actions.filter((a) => a.kind !== "ok");
+      if (repairs.length === 0) {
+        console.log(chalk.dim("Nothing to reconcile — all sessions consistent."));
+        return;
+      }
+      console.log(
+        result.dryRun
+          ? chalk.bold(`Reconciliation plan (${repairs.length} change(s), dry run):`)
+          : chalk.bold(`Reconciled ${repairs.length} session(s):`),
+      );
+      for (const a of repairs) {
+        console.log(`  ${chalk.cyan(a.kind)}  ${a.sessionId}`);
+        console.log(`    ${chalk.dim(a.detail)}`);
+      }
+    } catch (error) {
+      console.error(
+        chalk.red(
+          `Error: ${error instanceof Error ? error.message : "Failed to reconcile"}`,
+        ),
+      );
+      process.exit(1);
+    }
+  });
+
+// ── Atomic porcelain (the misuse-proof agent API) ──
+
+/** Map a thrown error to its exit code + message, then exit. */
+function exitFromStateError(error: unknown, fallback: string): never {
+  if (error instanceof StateError) {
+    console.error(chalk.red(`Error: ${error.message}`));
+    process.exit(error.code);
+  }
+  // A SQLITE_BUSY that survived the engine's bounded retry surfaces as a
+  // distinct exit code so an orchestrator can back off and retry rather than
+  // treat it as a permanent failure.
+  if (isBusyError(error)) {
+    console.error(
+      chalk.red(
+        `Error: database is busy (locked past retry budget): ${
+          error instanceof Error ? error.message : String(error)
+        }`,
+      ),
+    );
+    process.exit(STATE_EXIT.BUSY);
+  }
+  console.error(
+    chalk.red(`Error: ${error instanceof Error ? error.message : fallback}`),
+  );
+  process.exit(1);
+}
+
+const beginSubcommand = new Command("begin")
+  .description("Start or resume a workflow and report where it stands")
+  .requiredOption("--session-id <id>", "Session ID")
+  .requiredOption("--branch <branch>", "Branch name")
+  .requiredOption("--workflow-type <type>", "Workflow type (review or map)", (v: string) => {
+    if (v !== "review" && v !== "map") {
+      throw new Error(`Invalid workflow type: "${v}". Must be "review" or "map".`);
+    }
+    return v as WorkflowType;
+  })
+  .option("--session-dir <dir>", "Session directory path (auto-resolved if omitted)")
+  .option(
+    "--dashboard-uid <uid>",
+    "Dashboard command_executions uid to link this workflow to (takes precedence over OCR_DASHBOARD_EXECUTION_UID)",
+  )
+  .option("--json", "Output the result as JSON")
   .action(
     async (options: {
-      file?: string;
-      stdin?: boolean;
+      sessionId: string;
+      branch: string;
+      workflowType: WorkflowType;
+      sessionDir?: string;
+      dashboardUid?: string;
+      json?: boolean;
+    }) => {
+      const targetDir = process.cwd();
+      requireOcrSetup(targetDir);
+      const ocrDir = join(targetDir, ".ocr");
+      const sessionDir =
+        options.sessionDir ?? join(ocrDir, "sessions", options.sessionId);
+      if (!existsSync(sessionDir)) mkdirSync(sessionDir, { recursive: true });
+      try {
+        const result = await stateBegin({
+          sessionId: options.sessionId,
+          branch: options.branch,
+          workflowType: options.workflowType,
+          sessionDir,
+          ocrDir,
+        });
+        // Superset of `init`: wire up dashboard linkage so the dashboard can
+        // bind outcome + offer resume.
+        await linkDashboardInvocation(ocrDir, result.session_id, options.dashboardUid, "begin");
+        console.log(
+          options.json
+            ? JSON.stringify(result, null, 2)
+            : `${result.session_id}: round ${result.round}, phase ${result.phase} (${result.completeness ?? "unknown"})`,
+        );
+      } catch (error) {
+        exitFromStateError(error, "Failed to begin session");
+      }
+    },
+  );
+
+const advanceSubcommand = new Command("advance")
+  .description("Advance the workflow to a phase (graph-validated; phase number derived)")
+  .requiredOption("--phase <phase>", "Target phase name")
+  .option("--session-id <id>", "Session ID (auto-detects active if omitted)")
+  .option("--current-round <number>", "Round number", parseInt)
+  .option("--current-map-run <number>", "Map run number", parseInt)
+  // Accepted but ignored — the phase number is DERIVED from the phase, so it
+  // can never desync. Tolerated so the `transition`-era flag remains valid.
+  .option("--phase-number <number>", "(ignored — derived from --phase)", parseInt)
+  .action(
+    async (options: {
+      phase: string;
+      sessionId?: string;
+      currentRound?: number;
+      currentMapRun?: number;
+      phaseNumber?: number;
+    }) => {
+      const targetDir = process.cwd();
+      requireOcrSetup(targetDir);
+      const ocrDir = join(targetDir, ".ocr");
+      try {
+        const { id: sessionId } = await resolveActiveSession(ocrDir, options.sessionId);
+        await stateAdvance({
+          sessionId,
+          phase: options.phase,
+          round: options.currentRound,
+          mapRun: options.currentMapRun,
+          ocrDir,
+        });
+        console.log(`${sessionId}: ${options.phase}`);
+      } catch (error) {
+        exitFromStateError(error, "Failed to advance");
+      }
+    },
+  );
+
+const completeRoundSubcommand = new Command("complete-round")
+  .description("Atomically finalize a review round (validate + record + transition)")
+  .option("--session-id <id>", "Session ID (auto-detects active if omitted)")
+  .option("--round <number>", "Round number (defaults to current)", parseInt)
+  .option("--stdin", "Read round metadata JSON from stdin")
+  .option("--file <path>", "Read round metadata JSON from a file")
+  .option("--require-final", "Require rounds/round-N/final.md to exist")
+  .option("--json", "Output the result as JSON")
+  .action(
+    async (options: {
       sessionId?: string;
       round?: number;
+      stdin?: boolean;
+      file?: string;
+      requireFinal?: boolean;
+      json?: boolean;
     }) => {
       const targetDir = process.cwd();
       requireOcrSetup(targetDir);
       const ocrDir = join(targetDir, ".ocr");
-
-      if (!options.file && !options.stdin) {
-        console.error(chalk.red("Error: Provide either --file <path> or --stdin"));
-        process.exit(1);
-      }
-      if (options.file && options.stdin) {
-        console.error(chalk.red("Error: --file and --stdin are mutually exclusive"));
-        process.exit(1);
-      }
-
       try {
-        let result: RoundCompleteResult;
-
-        if (options.stdin) {
-          const data = await readStdin();
-          result = await stateRoundComplete({
-            source: "stdin",
-            ocrDir,
-            data,
-            sessionId: options.sessionId,
-            round: options.round,
-          });
-        } else if (options.file) {
-          result = await stateRoundComplete({
-            source: "file",
-            ocrDir,
-            filePath: options.file,
-            sessionId: options.sessionId,
-            round: options.round,
-          });
-        } else {
-          // Unreachable — mutual exclusion guard above ensures one is set
-          process.exit(1);
-        }
-
-        console.log(chalk.green("Round data imported successfully."));
-        if (result.metaPath) {
-          console.log(chalk.dim(`Wrote ${result.metaPath}`));
-        }
-      } catch (error) {
-        console.error(
-          chalk.red(
-            `Error: ${error instanceof Error ? error.message : "Failed to import round data"}`,
-          ),
+        const base = options.stdin
+          ? { source: "stdin" as const, data: await readStdin() }
+          : options.file
+            ? { source: "file" as const, filePath: options.file }
+            : (() => {
+                throw new StateError(STATE_EXIT.USAGE, "Provide --stdin or --file with round metadata");
+              })();
+        const result = await stateCompleteRound({
+          ...base,
+          ocrDir,
+          sessionId: options.sessionId,
+          round: options.round,
+          requireFinal: options.requireFinal,
+        });
+        console.log(
+          options.json
+            ? JSON.stringify(result, null, 2)
+            : `${result.sessionId}: round ${result.round} complete`,
         );
-        process.exit(1);
+      } catch (error) {
+        exitFromStateError(error, "Failed to complete round");
       }
     },
   );
 
-// ── map-complete ──
-
-const mapCompleteSubcommand = new Command("map-complete")
-  .description("Import structured map run data into SQLite")
-  .option("--file <path>", "Path to map-meta.json")
-  .option("--stdin", "Read map-meta JSON from stdin (recommended)")
-  .option("--session-id <id>", "Session ID (auto-detects latest active if omitted)")
-  .option("--map-run <number>", "Map run number (auto-detects current if omitted)", parseInt)
+const completeMapSubcommand = new Command("complete-map")
+  .description("Atomically finalize a map run (validate + record + transition)")
+  .option("--session-id <id>", "Session ID (auto-detects active if omitted)")
+  .option("--map-run <number>", "Map run number (defaults to current)", parseInt)
+  .option("--stdin", "Read map metadata JSON from stdin")
+  .option("--file <path>", "Read map metadata JSON from a file")
+  .option("--json", "Output the result as JSON")
   .action(
     async (options: {
-      file?: string;
-      stdin?: boolean;
       sessionId?: string;
       mapRun?: number;
+      stdin?: boolean;
+      file?: string;
+      json?: boolean;
     }) => {
       const targetDir = process.cwd();
       requireOcrSetup(targetDir);
       const ocrDir = join(targetDir, ".ocr");
-
-      if (!options.file && !options.stdin) {
-        console.error(chalk.red("Error: Provide either --file <path> or --stdin"));
-        process.exit(1);
-      }
-      if (options.file && options.stdin) {
-        console.error(chalk.red("Error: --file and --stdin are mutually exclusive"));
-        process.exit(1);
-      }
-
       try {
-        let result: MapCompleteResult;
-
-        if (options.stdin) {
-          const data = await readStdin();
-          result = await stateMapComplete({
-            source: "stdin",
-            ocrDir,
-            data,
-            sessionId: options.sessionId,
-            mapRun: options.mapRun,
-          });
-        } else if (options.file) {
-          result = await stateMapComplete({
-            source: "file",
-            ocrDir,
-            filePath: options.file,
-            sessionId: options.sessionId,
-            mapRun: options.mapRun,
-          });
-        } else {
-          // Unreachable — mutual exclusion guard above ensures one is set
-          process.exit(1);
-        }
-
-        console.log(chalk.green("Map data imported successfully."));
-        if (result.metaPath) {
-          console.log(chalk.dim(`Wrote ${result.metaPath}`));
-        }
-      } catch (error) {
-        console.error(
-          chalk.red(
-            `Error: ${error instanceof Error ? error.message : "Failed to import map data"}`,
-          ),
+        const base = options.stdin
+          ? { source: "stdin" as const, data: await readStdin() }
+          : options.file
+            ? { source: "file" as const, filePath: options.file }
+            : (() => {
+                throw new StateError(STATE_EXIT.USAGE, "Provide --stdin or --file with map metadata");
+              })();
+        const result = await stateCompleteMap({
+          ...base,
+          ocrDir,
+          sessionId: options.sessionId,
+          mapRun: options.mapRun,
+        });
+        console.log(
+          options.json
+            ? JSON.stringify(result, null, 2)
+            : `${result.sessionId}: map run ${result.mapRun} complete`,
         );
-        process.exit(1);
+      } catch (error) {
+        exitFromStateError(error, "Failed to complete map");
       }
     },
   );
+
+const finishSubcommand = new Command("finish")
+  .description("Close a workflow (refuses unless the current round/run is complete)")
+  .option("--session-id <id>", "Session ID (auto-detects active if omitted)")
+  .option("--abort", "Abandon the session — records a distinct, non-success terminal")
+  .action(async (options: { sessionId?: string; abort?: boolean }) => {
+    const targetDir = process.cwd();
+    requireOcrSetup(targetDir);
+    const ocrDir = join(targetDir, ".ocr");
+    try {
+      const { id: sessionId } = await resolveActiveSession(ocrDir, options.sessionId);
+      await stateClose({ sessionId, ocrDir, abort: options.abort });
+      console.log(`${sessionId}: ${options.abort ? "aborted" : "finished"}`);
+    } catch (error) {
+      exitFromStateError(error, "Failed to finish");
+    }
+  });
+
+const statusSubcommand = new Command("status")
+  .description("Report whether a session is complete and, if not, what's missing")
+  .option("--session-id <id>", "Session ID (auto-detects active if omitted)")
+  .option("--json", "Output the result as JSON")
+  .action(async (options: { sessionId?: string; json?: boolean }) => {
+    const targetDir = process.cwd();
+    requireOcrSetup(targetDir);
+    const ocrDir = join(targetDir, ".ocr");
+    try {
+      const result = await stateStatus(ocrDir, options.sessionId);
+      if (options.json) {
+        console.log(JSON.stringify(result, null, 2));
+      } else {
+        console.log(`${result.session_id}: ${result.completeness_state}`);
+        console.log(chalk.dim(`  next: ${result.next_action}`));
+      }
+    } catch (error) {
+      exitFromStateError(error, "Failed to read status");
+    }
+  });
 
 // ── Main state command ──
 
+/** The verbs v2.0 retired, mapped to their atomic replacements. */
+const RETIRED_STATE_VERBS: Record<string, string> = {
+  init: "begin",
+  transition: "advance",
+  "round-complete": "complete-round",
+  "map-complete": "complete-map",
+  close: "finish",
+};
+
 export const stateCommand = new Command("state")
   .description("Manage OCR session state")
-  .addCommand(initSubcommand)
-  .addCommand(transitionSubcommand)
-  .addCommand(closeSubcommand)
+  // Atomic porcelain — the only supported agent API.
+  .addCommand(beginSubcommand)
+  .addCommand(advanceSubcommand)
+  .addCommand(completeRoundSubcommand)
+  .addCommand(completeMapSubcommand)
+  .addCommand(finishSubcommand)
+  .addCommand(statusSubcommand)
+  // Read/maintenance verbs.
   .addCommand(showSubcommand)
   .addCommand(syncSubcommand)
-  .addCommand(roundCompleteSubcommand)
-  .addCommand(mapCompleteSubcommand);
+  .addCommand(reconcileSubcommand)
+  // Commander's default unknown-subcommand path exits 1 with a misleading
+  // "Did you mean finish?" guess. For a CLI whose consumer is an LLM, give a
+  // deterministic typed signal instead: exit 2 (USAGE) routing a v1-pinned
+  // agent to the atomic verb it should use.
+  .showSuggestionAfterError(false)
+  .on("command:*", (operands: string[]) => {
+    const verb = operands[0] ?? "";
+    const replacement = RETIRED_STATE_VERBS[verb];
+    const msg = replacement
+      ? `'ocr state ${verb}' was retired in v2.0 — use 'ocr state ${replacement}'. See 'ocr state --help'.`
+      : `Unknown 'ocr state' subcommand: '${verb}'. See 'ocr state --help'.`;
+    exitFromStateError(new StateError(STATE_EXIT.USAGE, msg), msg);
+  });

@@ -8,12 +8,12 @@
  * (page reload mid-run) and history-replay.
  *
  * Why JSONL on disk rather than a sqlite table:
- *   1. Append-only writes avoid the sql.js merge-before-write rename dance
+ *   1. Append-only writes avoid contending for the shared DB's write lock
  *      under high event throughput
  *   2. The format is trivially `tail -f`-able for humans debugging a run
  *   3. Event volume per execution is bounded but non-trivial (hundreds to
  *      low-thousands per active review) — keeping it out of the DB keeps
- *      the in-memory sql.js DB small
+ *      the shared database lean
  *   4. No schema migration needed if the event union evolves
  *
  * Writes are best-effort and intentionally non-blocking — if the journal

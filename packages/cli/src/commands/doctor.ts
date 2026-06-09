@@ -9,6 +9,7 @@ import {
   printDepChecks,
   printCapabilities,
 } from "../lib/deps.js";
+import { probeEngine } from "../lib/db/index.js";
 
 export const doctorCommand = new Command("doctor")
   .description("Check OCR installation and verify all dependencies")
@@ -63,6 +64,31 @@ export const doctorCommand = new Command("doctor")
 
     if (!ocrStatus.valid) {
       hasIssues = true;
+    }
+
+    // ── Storage engine ──
+    // The SQLite engine (better-sqlite3) is a native module. Probe it so a
+    // missing/incompatible prebuilt binary surfaces as a clear diagnostic
+    // rather than an opaque crash on first DB access.
+    console.log();
+    console.log(chalk.bold("  Storage Engine"));
+    console.log();
+    const engine = probeEngine();
+    if (engine.ok) {
+      console.log(
+        `    ${chalk.green("✓")} better-sqlite3 (SQLite ${engine.version}, WAL)`,
+      );
+    } else {
+      hasIssues = true;
+      console.log(
+        `    ${chalk.red("✗")} better-sqlite3 failed to load`,
+      );
+      console.log(`      ${chalk.dim(engine.error)}`);
+      console.log(
+        `      ${chalk.dim(
+          "Reinstall the CLI; if it persists your platform may need build tools (python3 + a C++ toolchain) or lacks a prebuilt binary.",
+        )}`,
+      );
     }
 
     // ── Capabilities ──
