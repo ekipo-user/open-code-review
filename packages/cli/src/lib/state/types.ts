@@ -231,6 +231,17 @@ export type KnownAgentVendor = "claude" | "opencode" | "gemini";
 export type AgentVendor = KnownAgentVendor | (string & {});
 
 /**
+ * The role a `command_executions` row plays — derived (never stored) from the
+ * always-present `command` + `last_heartbeat_at` columns:
+ *   - `supervisor` — a workflow-owning process (a dashboard-spawned `ocr
+ *     review`/`map`); its death cascade-terminates its dependents.
+ *   - `instance`   — a reviewer instance journaled via `ocr session
+ *     start-instance` (a dependent; never owns a workflow's lifecycle).
+ *   - `utility`    — a fire-and-forget command with no journaled heartbeat.
+ */
+export type RowKind = "supervisor" | "instance" | "utility";
+
+/**
  * One row in the `agent_sessions` table — a journal entry for an agent-CLI
  * process the AI declared it spawned on behalf of a workflow.
  */
@@ -245,6 +256,9 @@ export type AgentSession = {
   resolved_model: string | null;
   phase: string | null;
   status: AgentSessionStatus;
+  /** Derived process role — lets a consumer confidently tell what kind of
+   *  process this row represents without parsing the command string. */
+  kind: RowKind;
   pid: number | null;
   started_at: string;
   last_heartbeat_at: string;

@@ -190,7 +190,6 @@ export type CommandExecutionRow = {
   output: string | null
   // ── Migration v11 — agent-session journal fields ──
   workflow_id: string | null
-  parent_id: number | null
   vendor: string | null
   vendor_session_id: string | null
   persona: string | null

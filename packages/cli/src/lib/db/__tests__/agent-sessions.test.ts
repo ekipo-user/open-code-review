@@ -18,6 +18,7 @@ import {
   sweepStaleSessions,
   commitReasonClose,
   insertEvent,
+  rowKind,
 } from "../index.js";
 import { runMigrations } from "../migrations.js";
 import type { Database } from "../engine.js";
@@ -383,6 +384,88 @@ describe("sweepStaleAgentSessions", () => {
     expect(result.orphanedIds).toEqual(["dead-1"]);
     expect(getAgentSession(db, "alive-1")?.status).toBe("running");
     expect(getAgentSession(db, "dead-1")?.status).toBe("orphaned");
+  });
+});
+
+describe("rowKind", () => {
+  it("classifies the three row kinds from command + heartbeat", () => {
+    // instance — both the persona'd and the bare (persona-less) forms.
+    expect(rowKind({ command: "session-instance:principal-1", last_heartbeat_at: "x" })).toBe("instance");
+    expect(rowKind({ command: "session-instance", last_heartbeat_at: "x" })).toBe("instance");
+    expect(rowKind({ command: "session-instance", last_heartbeat_at: null })).toBe("instance");
+    // supervisor — a journaled (heartbeat-bearing) non-instance command.
+    expect(rowKind({ command: "review", last_heartbeat_at: "x" })).toBe("supervisor");
+    expect(rowKind({ command: "map", last_heartbeat_at: "x" })).toBe("supervisor");
+    // utility — a non-instance command with no journaled heartbeat.
+    expect(rowKind({ command: "post", last_heartbeat_at: null })).toBe("utility");
+    expect(rowKind({ command: "doctor", last_heartbeat_at: null })).toBe("utility");
+  });
+});
+
+describe("sweepStaleAgentSessions — cascade on a dead supervisor", () => {
+  const DEAD = () => false;
+  // Insert a workflow-supervisor row (a real command, not a session-instance).
+  function insertSupervisor(uid: string, workflowId: string, pid: number) {
+    db.run(
+      `INSERT INTO command_executions
+         (uid, command, args, started_at, workflow_id, pid, last_heartbeat_at)
+       VALUES (?, 'review', '[]', datetime('now'), ?, ?, datetime('now', '-300 seconds'))`,
+      [uid, workflowId, pid],
+    );
+  }
+  function makeStale(uid: string) {
+    db.run(
+      `UPDATE command_executions SET last_heartbeat_at = datetime('now', '-300 seconds') WHERE uid = ?`,
+      [uid],
+    );
+  }
+
+  it("cascade-terminates a dead supervisor's in-flight dependents with -4", () => {
+    insertSession(db, { id: "wf-sup", branch: "feat/s", workflow_type: "review", session_dir: ".ocr/sessions/wf-sup" });
+    insertSupervisor("sup-dead", "wf-sup", 4242);
+    // A live in-flight reviewer instance owned by the same workflow.
+    insertAgentSession(db, { id: "child", workflow_id: "wf-sup", vendor: "claude" });
+
+    const result = sweepStaleAgentSessions(db, 60, DEAD);
+
+    expect(result.orphanedIds).toEqual(["sup-dead"]);
+    expect(getAgentSession(db, "sup-dead")?.status).toBe("orphaned"); // -3
+    const child = getAgentSession(db, "child");
+    expect(child?.status).toBe("cancelled"); // -4 derives to cancelled
+    expect(child?.exit_code).toBe(-4);
+    expect(child?.ended_at).toBeTruthy();
+  });
+
+  it("does NOT cascade when the dead row is itself a reviewer instance (colon or bare)", () => {
+    insertSession(db, { id: "wf-inst", branch: "feat/i", workflow_type: "review", session_dir: ".ocr/sessions/wf-inst" });
+    // Two pid-bearing instances in the same workflow; one dead, one (sibling) live.
+    db.run(
+      `INSERT INTO command_executions (uid, command, args, started_at, workflow_id, pid, last_heartbeat_at)
+       VALUES ('inst-dead', 'session-instance:principal-1', '[]', datetime('now'), 'wf-inst', 4242, datetime('now','-300 seconds'))`,
+    );
+    db.run(
+      `INSERT INTO command_executions (uid, command, args, started_at, workflow_id, pid, last_heartbeat_at)
+       VALUES ('inst-sibling', 'session-instance', '[]', datetime('now'), 'wf-inst', 4243, datetime('now'))`,
+    );
+
+    // Only the dead instance's pid is dead; the sibling's heartbeat is fresh.
+    const result = sweepStaleAgentSessions(db, 60, (pid) => pid !== 4242);
+
+    expect(result.orphanedIds).toEqual(["inst-dead"]);
+    expect(getAgentSession(db, "inst-dead")?.status).toBe("orphaned");
+    // The live sibling instance is NOT taken down by its sibling's orphaning.
+    expect(getAgentSession(db, "inst-sibling")?.status).toBe("running");
+    expect(getAgentSession(db, "inst-sibling")?.ended_at).toBeNull();
+  });
+
+  it("a supervisor with no workflow_id orphans without cascading (nothing to cascade)", () => {
+    db.run(
+      `INSERT INTO command_executions (uid, command, args, started_at, pid, last_heartbeat_at)
+       VALUES ('sup-nowf', 'sync-reviewers', '[]', datetime('now'), 4242, datetime('now','-300 seconds'))`,
+    );
+    const result = sweepStaleAgentSessions(db, 60, DEAD);
+    expect(result.orphanedIds).toEqual(["sup-nowf"]);
+    expect(getAgentSession(db, "sup-nowf")?.status).toBe("orphaned");
   });
 });
 

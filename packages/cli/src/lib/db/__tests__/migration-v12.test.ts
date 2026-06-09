@@ -195,8 +195,9 @@ describe("migration v12 — indexes", () => {
 
 describe("migration v12 — pre-upgrade snapshot", () => {
   it("snapshots an existing pre-v12 database before upgrading", async () => {
-    // Build a db, then simulate a pre-v12 state by removing the v12 row from
-    // schema_version (the v12 DDL uses IF NOT EXISTS so re-applying is safe).
+    // Build a db, then simulate a pre-v12 state by removing the v12-and-later
+    // rows from schema_version (the v12 DDL uses IF NOT EXISTS so re-applying
+    // is safe), so getSchemaVersion reports 11.
     const ocrDir = join(tmpDir, "proj", ".ocr");
     const dbPath = join(ocrDir, "data", "ocr.db");
     const conn = await ensureDatabase(ocrDir); // applies v12
@@ -207,7 +208,7 @@ describe("migration v12 — pre-upgrade snapshot", () => {
       workflow_type: "review",
       session_dir: ".ocr/sessions/keep",
     });
-    conn.run("DELETE FROM schema_version WHERE version = 12");
+    conn.run("DELETE FROM schema_version WHERE version >= 12");
     closeAllDatabases();
 
     // Re-open: getSchemaVersion now reports 11 → snapshot fires.
@@ -256,7 +257,7 @@ describe("migration v12 — one-time upgrade notice", () => {
       // Existing pre-v12 db → upgrade notice fires.
       const ocrDir = join(tmpDir, "legacy", ".ocr");
       const conn = await ensureDatabase(ocrDir);
-      conn.run("DELETE FROM schema_version WHERE version = 12");
+      conn.run("DELETE FROM schema_version WHERE version >= 12");
       closeAllDatabases();
       errSpy.mockClear();
 

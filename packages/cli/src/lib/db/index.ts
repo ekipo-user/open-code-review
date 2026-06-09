@@ -125,6 +125,7 @@ export {
   sweepStaleAgentSessions,
   sweepStaleSessions,
   cascadeTerminateExecutions,
+  rowKind,
 } from "./agent-sessions.js";
 
 // Process-liveness primitives — shared by the dashboard's supervision paths

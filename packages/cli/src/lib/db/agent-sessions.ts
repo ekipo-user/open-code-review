@@ -17,8 +17,9 @@
  *                 when the supervised pid is confirmed dead (see
  *                 sweepStaleAgentSessions), never from heartbeat age alone
  *   done       →  exit_code = 0
- *   crashed    →  exit_code IS NOT NULL AND exit_code NOT IN (0, -2, -3)
- *   cancelled  →  exit_code = -2
+ *   crashed    →  exit_code IS NOT NULL AND exit_code NOT IN (0, -2, -3, -4)
+ *   cancelled  →  exit_code = -2 (user cancel) OR -4 (cascade-close: the
+ *                 parent workflow closed)
  */
 
 import type { Database } from "./engine.js";
@@ -26,6 +27,7 @@ import type {
   AgentSessionRow,
   AgentSessionStatus,
   InsertAgentSessionParams,
+  RowKind,
   SweepResult,
   UpdateAgentSessionParams,
 } from "./types.js";
@@ -40,6 +42,7 @@ import {
 import {
   CANCELLED_EXIT_CODE,
   ORPHAN_EXIT_CODE,
+  CASCADE_CLOSE_EXIT_CODE,
 } from "../state/exit-codes.js";
 
 const NOTE_ORPHAN_PREFIX = "orphaned by liveness sweep";
@@ -83,7 +86,6 @@ type CommandExecutionRow = {
   command: string;
   args: string | null;
   workflow_id: string | null;
-  parent_id: number | null;
   vendor: string | null;
   vendor_session_id: string | null;
   persona: string | null;
@@ -112,6 +114,7 @@ function rowToAgentSession(row: CommandExecutionRow): AgentSessionRow {
     resolved_model: row.resolved_model,
     phase: null,
     status: deriveStatus(row),
+    kind: rowKind(row),
     pid: row.pid,
     started_at: row.started_at,
     last_heartbeat_at: row.last_heartbeat_at ?? row.started_at,
@@ -128,7 +131,14 @@ function deriveStatus(row: CommandExecutionRow): AgentSessionStatus {
     return "running";
   }
   if (row.exit_code === ORPHAN_EXIT_CODE) return "orphaned";
-  if (row.exit_code === CANCELLED_EXIT_CODE) return "cancelled";
+  // -2 (user cancel) and -4 (cascade-close: stopped because the parent
+  // workflow closed) are both non-failure cancellations, not crashes.
+  if (
+    row.exit_code === CANCELLED_EXIT_CODE ||
+    row.exit_code === CASCADE_CLOSE_EXIT_CODE
+  ) {
+    return "cancelled";
+  }
   if (row.exit_code === 0) return "done";
   return "crashed";
 }
@@ -497,6 +507,12 @@ export function updateAgentSession(
  * Heartbeat age (`thresholdSeconds`) is used only to bound which rows are
  * worth probing; it never decides the verdict on its own.
  *
+ * When the dead row is a workflow's supervising/top-level process (not itself
+ * a reviewer instance), its in-flight dependents are cascade-terminated in the
+ * same transaction with exit `-4` — the parent's confirmed death is positive
+ * evidence that its in-process children are gone too, so they don't linger as
+ * `stalled` (and the session-level sweep isn't wedged by them).
+ *
  * `isAlive` is injected so this stays a pure, testable db function; the
  * dashboard passes the real `process.kill`-based probe.
  */
@@ -513,9 +529,13 @@ export function sweepStaleAgentSessions(
     id: number;
     pid: number | null;
     started_at: string;
+    workflow_id: string | null;
+    command: string;
+    last_heartbeat_at: string | null;
   }>(
     db.exec(
-      `SELECT uid, id, pid, started_at FROM command_executions
+      `SELECT uid, id, pid, started_at, workflow_id, command, last_heartbeat_at
+         FROM command_executions
         WHERE finished_at IS NULL
           AND pid IS NOT NULL
           AND last_heartbeat_at IS NOT NULL
@@ -539,23 +559,59 @@ export function sweepStaleAgentSessions(
     return { orphanedIds: [] };
   }
 
-  // Phase 3 — stamp orphaned on exactly the dead rows, by id. Clear pid so a
-  // later sweep can't reconsider them, and compare-and-set on `finished_at` so
-  // a genuine completion that landed between phases always wins.
+  // Phase 3 — atomically: stamp orphaned on exactly the dead rows (by id, clear
+  // pid, compare-and-set on `finished_at` so a real completion between phases
+  // wins), then cascade-terminate the in-flight dependents of any dead
+  // workflow-owning process. Reviewer-instance rows (`session-instance:*`)
+  // never trigger a cascade — only a supervising/top-level process does — so an
+  // orphaned instance can't take its live siblings down.
   const note = `${NOTE_ORPHAN_PREFIX} (threshold ${thresholdSeconds}s)`;
   const placeholders = dead.map(() => "?").join(", ");
-  db.run(
-    `UPDATE command_executions
-        SET finished_at = datetime('now'),
-            exit_code = ?,
-            pid = NULL,
-            notes = COALESCE(notes || char(10), '') || ?
-      WHERE id IN (${placeholders})
-        AND finished_at IS NULL`,
-    [ORPHAN_EXIT_CODE, note, ...dead.map((r) => r.id)],
-  );
+  db.transaction(() => {
+    db.run(
+      `UPDATE command_executions
+          SET finished_at = datetime('now'),
+              exit_code = ?,
+              pid = NULL,
+              notes = COALESCE(notes || char(10), '') || ?
+        WHERE id IN (${placeholders})
+          AND finished_at IS NULL`,
+      [ORPHAN_EXIT_CODE, note, ...dead.map((r) => r.id)],
+    );
+    for (const row of dead) {
+      if (row.workflow_id && rowKind(row) === "supervisor") {
+        cascadeTerminateExecutions(
+          db,
+          row.workflow_id,
+          CASCADE_CLOSE_EXIT_CODE,
+          "cascade-closed: workflow process orphaned by liveness sweep",
+        );
+      }
+    }
+  });
 
   return { orphanedIds: dead.map((r) => r.uid ?? String(r.id)) };
+}
+
+/**
+ * The role a `command_executions` row plays, derived (never stored) from the
+ * two columns present on every row at every insert site — including after a
+ * JSONL replay, which drops `persona`/`instance_index` but keeps `command`.
+ * The `session-instance` command prefix is written ONLY by `insertAgentSession`
+ * (see {@link insertAgentSession}), so it is a total, unambiguous discriminator.
+ *
+ * NB: prefix match, not equality — a persona-less instance writes the bare
+ * `session-instance`. Tightening this to `session-instance:` would misclassify
+ * it as a supervisor and let an orphaned instance cascade-kill its siblings.
+ */
+export function rowKind(row: {
+  command: string;
+  last_heartbeat_at: string | null;
+}): RowKind {
+  if (row.command.startsWith("session-instance")) return "instance";
+  // A journaled (heartbeat-bearing) non-instance row is a workflow supervisor;
+  // a row that was never journaled is a fire-and-forget utility command.
+  return row.last_heartbeat_at == null ? "utility" : "supervisor";
 }
 
 /**

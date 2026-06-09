@@ -73,6 +73,7 @@ export type {
   AgentSession,
   AgentSessionStatus,
   AgentVendor,
+  RowKind,
 } from "../state/types.js";
 
 /**
@@ -127,7 +128,15 @@ export type StaleSessionSweepResult = {
 export type Migration = {
   version: number;
   description: string;
-  sql: string;
+  /** Declarative DDL. Optional when an imperative {@link Migration.run} is used. */
+  sql?: string;
+  /**
+   * Imperative step for migrations that need conditional logic SQLite can't
+   * express declaratively (e.g. an idempotent `DROP COLUMN` guarded on column
+   * existence). Runs after `sql` (if both are present), inside the same
+   * migration transaction. Must be safe to re-run.
+   */
+  run?: (db: import("./engine.js").Database) => void;
 };
 
 export type SchemaVersionRow = {

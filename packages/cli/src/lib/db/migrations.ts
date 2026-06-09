@@ -453,7 +453,35 @@ const MIGRATIONS: Migration[] = [
       FROM sessions s;
     `,
   },
+  {
+    version: 13,
+    description:
+      "Retire dead parent_id column on command_executions (never written; row kind is derived from command)",
+    // parent_id was reserved for an AI-instance → dashboard-spawn lineage link
+    // that was never wired (no writer, no reader). A process's KIND (supervisor
+    // / reviewer-instance / utility) is derived from columns that are always
+    // present (command + last_heartbeat_at), so the dead lineage column and its
+    // all-NULL index are removed. Re-add a wired parent_id alongside a real
+    // consumer (e.g. a parent→child tree view) if lineage is ever needed.
+    //
+    // Imperative + guarded so the DROP COLUMN (which SQLite can't express as
+    // IF EXISTS) is idempotent under re-application.
+    run: (db) => {
+      if (!columnExists(db, "command_executions", "parent_id")) return;
+      db.run("DROP INDEX IF EXISTS idx_command_executions_parent;");
+      db.run("ALTER TABLE command_executions DROP COLUMN parent_id;");
+    },
+  },
 ];
+
+/** Whether `table` currently has a column named `column` (for idempotent DDL). */
+function columnExists(db: Database, table: string, column: string): boolean {
+  const result = db.exec(`PRAGMA table_info(${table})`);
+  const first = result[0];
+  if (!first) return false;
+  const nameIdx = first.columns.indexOf("name");
+  return first.values.some((row) => row[nameIdx] === column);
+}
 
 /**
  * Creates the schema_version table if it does not exist.
@@ -509,7 +537,8 @@ export function runMigrations(db: Database): void {
     // deferred transaction that fails late with SQLITE_BUSY mid-migration.
     db.run("BEGIN IMMEDIATE;");
     try {
-      db.run(migration.sql);
+      if (migration.sql) db.run(migration.sql);
+      migration.run?.(db);
       db.run(
         "INSERT INTO schema_version (version, description) VALUES (?, ?);",
         [migration.version, migration.description],
