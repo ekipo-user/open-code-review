@@ -9,10 +9,6 @@ export default defineConfig({
       // The published packages use dist/ via conditional exports, but in the
       // monorepo vitest needs the source files directly.
       '@open-code-review/cli/db': resolve(__dirname, '../cli/src/lib/db/index.ts'),
-      '@open-code-review/cli/exit-codes': resolve(
-        __dirname,
-        '../cli/src/lib/state/exit-codes.ts',
-      ),
       '@open-code-review/cli/vendor-resume': resolve(
         __dirname,
         '../cli/src/lib/vendor-resume.ts',

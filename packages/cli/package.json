@@ -19,12 +19,6 @@
       "import": "./dist/lib/db/index.js",
       "default": "./dist/lib/db/index.js"
     },
-    "./exit-codes": {
-      "types": "./src/lib/state/exit-codes.ts",
-      "source": "./src/lib/state/exit-codes.ts",
-      "import": "./dist/lib/state/exit-codes.js",
-      "default": "./dist/lib/state/exit-codes.js"
-    },
     "./runtime-config": {
       "types": "./src/lib/runtime-config.ts",
       "source": "./src/lib/runtime-config.ts",

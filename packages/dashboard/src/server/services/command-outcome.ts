@@ -16,12 +16,14 @@
  * read is live, so no merge/sync is needed before deriving.
  */
 
-import type { Database } from '@open-code-review/cli/db'
-// Canonical process-sentinel codes — single source of truth in the CLI.
+// Canonical process-sentinel codes — single source of truth in the CLI's
+// exit-codes module, re-exported from the db barrel (the path the dashboard
+// already loads, so no extra build entry / dist file is needed).
 import {
+  type Database,
   CANCELLED_EXIT_CODE as CANCEL_EXIT_CODE,
   CASCADE_CLOSE_EXIT_CODE,
-} from '@open-code-review/cli/exit-codes'
+} from '@open-code-review/cli/db'
 import type { CommandOutcome } from '../../shared/types.js'
 
 /**
