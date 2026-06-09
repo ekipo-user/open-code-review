@@ -45,6 +45,19 @@ describe("CLI smoke tests", () => {
     });
   });
 
+  describe("ocr doctor — storage engine", () => {
+    it("loads node:sqlite and does NOT leak the experimental warning to stderr", async () => {
+      // `doctor` probes the engine, which loads node:sqlite. The runtime guard
+      // must suppress its one-line ExperimentalWarning so the engine load is
+      // honest + clean (the machine-readable stdout contract stays untouched).
+      const result = await spawnCli(["doctor"]);
+
+      expect(result.stdout).toContain("node:sqlite");
+      expect(result.stdout).not.toContain("failed");
+      expect(result.stderr).not.toMatch(/experimental/i);
+    });
+  });
+
   describe("ocr init", () => {
     it("creates .ocr/ directory structure in a git repo", async () => {
       const project = tracked(createTempProject());
