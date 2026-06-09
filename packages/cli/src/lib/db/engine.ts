@@ -10,28 +10,77 @@
  * New code SHOULD prefer the native primitives exposed here — `prepare()`,
  * `transaction()`, `pragma()`, and the `raw` handle.
  *
- * Requires Node >= 22.5 (when `node:sqlite` landed). The CLI entry guards the
- * Node version before this module loads, so a too-old runtime gets a clear
- * message rather than a `Cannot find module 'node:sqlite'` stack.
+ * The engine LOAD is self-guarding: it requires Node >= 22.5 (when `node:sqlite`
+ * landed) and suppresses the experimental warning at the point it actually
+ * loads `node:sqlite` — so every entry point (the `ocr` bin, the
+ * `@open-code-review/cli/db` subpath, the bundled dashboard server) is covered
+ * by construction, not by who imported the bin's runtime-guard first.
  */
 
 import { createRequire } from "node:module";
 import type { DatabaseSync, StatementSync } from "node:sqlite";
+import {
+  isSupportedNode,
+  isSuppressibleSqliteWarning,
+  nodeVersionGuardMessage,
+} from "../runtime-checks.js";
+
+/** SQLite primary result codes for write-lock contention. */
+const SQLITE_BUSY = 5;
+const SQLITE_BUSY_SNAPSHOT = 261;
+
+/** Bounded retry budget for write transactions that hit SQLITE_BUSY. */
+const BUSY_RETRY_ATTEMPTS = 5;
+const BUSY_RETRY_BACKOFF_MS = 50;
+
+/** Name for the SAVEPOINT at a given nesting depth. */
+const savepointName = (depth: number): string => `ocr_sp_${depth}`;
+
+// `createRequire` so the lazy load works in source AND in every bundle (the cli
+// bundle, the `./db` library bundle, the dashboard server bundle), regardless of
+// the banner's `require`.
+const nodeRequire = createRequire(import.meta.url);
+
+/**
+ * Apply the engine's runtime preconditions exactly once, at the point the engine
+ * actually loads — so EVERY entry point is guarded by construction. Suppresses
+ * only node:sqlite's experimental warning, installed before the built-in is
+ * required so the warning can never fire.
+ */
+let _preconditionsApplied = false;
+function applyEnginePreconditions(): void {
+  if (_preconditionsApplied) return;
+  _preconditionsApplied = true;
+  const originalEmitWarning = process.emitWarning.bind(process) as (
+    ...args: unknown[]
+  ) => void;
+  process.emitWarning = ((warning: unknown, ...args: unknown[]) => {
+    if (isSuppressibleSqliteWarning(warning)) return;
+    originalEmitWarning(warning, ...args);
+  }) as typeof process.emitWarning;
+}
 
 // Load `node:sqlite` LAZILY (synchronous `require`, not a static import) so that
-// importing this module does NOT touch the built-in. The CLI entry runs a
-// Node-version guard and the experimental-warning filter first; deferring the
-// load means a Node < 22.5 runtime gets a clear message instead of a hard
-// `Cannot find module 'node:sqlite'` at import time, and the experimental
-// warning is suppressed before it ever fires. Named `nodeRequire` to avoid
-// colliding with the `require` the bundle banner defines.
-const nodeRequire = createRequire(import.meta.url);
+// importing this module does NOT touch the built-in until a DB is actually
+// opened — which lets the preconditions above run first.
 let _DatabaseSyncCtor: { new (path: string): DatabaseSync } | undefined;
 function newDatabase(path: string): DatabaseSync {
   if (!_DatabaseSyncCtor) {
-    _DatabaseSyncCtor = (
-      nodeRequire("node:sqlite") as typeof import("node:sqlite")
-    ).DatabaseSync;
+    applyEnginePreconditions();
+    try {
+      _DatabaseSyncCtor = (
+        nodeRequire("node:sqlite") as typeof import("node:sqlite")
+      ).DatabaseSync;
+    } catch (e) {
+      // On a too-old runtime `node:sqlite` does not exist. Turn the opaque
+      // "Cannot find module 'node:sqlite'" into the actionable guard message —
+      // this is what protects library/dashboard-server entry points that never
+      // run the bin's early Node-version guard.
+      if (!isSupportedNode(process.versions.node)) {
+        throw new Error(nodeVersionGuardMessage(process.versions.node).trim());
+      }
+      throw e;
+    }
   }
   return new _DatabaseSyncCtor(path);
 }
@@ -39,30 +88,30 @@ function newDatabase(path: string): DatabaseSync {
 /** A value that can be bound to a parameter or returned from a column. */
 export type SqlValue = number | string | bigint | Buffer | Uint8Array | null;
 
-/** Bounded retry budget for write transactions that hit SQLITE_BUSY. */
-const BUSY_RETRY_ATTEMPTS = 5;
-const BUSY_RETRY_BACKOFF_MS = 50;
-
 /**
  * True when `e` is a `node:sqlite` lock-contention error. `node:sqlite`
  * surfaces the generic `code === "ERR_SQLITE_ERROR"` and puts the SQLite
- * primary result code in `errcode` (5 = SQLITE_BUSY, 261 = SQLITE_BUSY_SNAPSHOT).
- * Keying on `errcode` is load-bearing: get it wrong and the busy-retry loop
- * silently never fires under contention.
+ * primary result code in `errcode` — for both `exec`-level and prepared
+ * statement (`StatementSync#run`/`#all`) busy errors (verified). Keying on
+ * `errcode` is load-bearing: get it wrong and the busy-retry loop silently
+ * never fires under contention.
  */
 export function isBusyError(e: unknown): boolean {
   const errcode = (e as { errcode?: unknown } | null)?.errcode;
-  return errcode === 5 || errcode === 261;
+  return errcode === SQLITE_BUSY || errcode === SQLITE_BUSY_SNAPSHOT;
 }
+
+// One shared buffer for `sleepSync` — the value at index 0 never changes, so it
+// is safe to reuse across all calls (avoids a fresh SAB per contended retry).
+const SLEEP_BUF = new Int32Array(new SharedArrayBuffer(4));
 
 /**
  * Block the current thread for `ms` milliseconds. Synchronous because
  * `transaction()` is synchronous — we cannot `await` a timer mid-transaction.
- * Uses `Atomics.wait` on a throwaway SharedArrayBuffer, which parks the
- * thread without busy-spinning the CPU.
+ * `Atomics.wait` parks the thread without busy-spinning the CPU.
  */
 function sleepSync(ms: number): void {
-  Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, ms);
+  Atomics.wait(SLEEP_BUF, 0, 0, ms);
 }
 
 /** Positional bind parameters for `exec`/`run`. */
@@ -82,7 +131,13 @@ export type ExecResult = ExecResultRow[];
 
 /**
  * The OCR database handle. Method shapes for `exec`/`run`/`close` match the
- * legacy surface; `prepare`/`transaction`/`pragma`/`raw` are native additions.
+ * legacy surface; `prepare`/`transaction`/`pragma` are native additions.
+ *
+ * Deliberately does NOT expose the underlying `node:sqlite` handle: keeping the
+ * raw connection off the interface is what makes "engine.ts is the only seam"
+ * an INVARIANT, not a convention — no consumer of `@open-code-review/cli/db`
+ * (the dashboard, any third party) can reach past the adapter and couple to the
+ * engine. The adapter still holds the raw handle internally.
  */
 export interface Database {
   /**
@@ -101,8 +156,6 @@ export interface Database {
   transaction<T>(fn: () => T): T;
   /** Issue a PRAGMA against the underlying connection. */
   pragma(source: string): unknown;
-  /** Escape hatch to the underlying node:sqlite handle. */
-  readonly raw: DatabaseSync;
   /** Checkpoint the WAL and close the connection. */
   close(): void;
 }
@@ -130,7 +183,9 @@ class NodeSqliteAdapter implements Database {
       return [];
     }
     stmt.setReturnArrays(true); // rows as positional arrays (the `.raw()` shape)
-    const values = stmt.all(...(params ?? [])) as SqlValue[][];
+    // node:sqlite's types don't model setReturnArrays() flipping the row shape
+    // to arrays, so cast through `unknown`.
+    const values = stmt.all(...(params ?? [])) as unknown as SqlValue[][];
     return values.length > 0
       ? [{ columns: cols.map((c) => c.name as string), values }]
       : [];
@@ -151,57 +206,73 @@ class NodeSqliteAdapter implements Database {
   }
 
   transaction<T>(fn: () => T): T {
-    // Nested call: a SAVEPOINT within the outer transaction's write lock. No
-    // busy-retry here — the outer transaction already holds the lock.
-    if (this.txnDepth > 0) {
-      const name = `ocr_sp_${this.txnDepth}`;
-      this.raw.exec(`SAVEPOINT ${name}`);
-      this.txnDepth++;
-      try {
-        const result = fn();
-        this.raw.exec(`RELEASE ${name}`);
-        this.txnDepth--;
-        return result;
-      } catch (e) {
-        try {
-          this.raw.exec(`ROLLBACK TO ${name}`);
-          this.raw.exec(`RELEASE ${name}`);
-        } catch {
-          // best-effort unwind
-        }
-        this.txnDepth--;
-        throw e;
-      }
-    }
+    return this.txnDepth > 0 ? this.runNested(fn) : this.runOuter(fn);
+  }
 
-    // Outer transaction. `BEGIN IMMEDIATE` acquires the write lock up front so
-    // cross-process writers serialize cleanly under WAL instead of failing late
-    // on upgrade. `busy_timeout` covers most contention; a bounded synchronous
-    // retry absorbs the residual SQLITE_BUSY (e.g. another connection holds the
-    // lock past the timeout, or BUSY_SNAPSHOT). Non-busy errors and the final
-    // attempt re-throw so genuine failures propagate.
-    for (let attempt = 0; ; attempt++) {
+  /**
+   * Nested call: a SAVEPOINT within the outer transaction's write lock. No
+   * busy-retry — the outer transaction already holds the lock. The savepoint
+   * lets the inner block roll back independently while the outer continues.
+   */
+  private runNested<T>(fn: () => T): T {
+    const name = savepointName(this.txnDepth);
+    this.raw.exec(`SAVEPOINT ${name}`);
+    this.txnDepth++;
+    try {
+      const result = fn();
+      this.raw.exec(`RELEASE ${name}`);
+      return result;
+    } catch (e) {
       try {
-        this.raw.exec("BEGIN IMMEDIATE");
-        this.txnDepth = 1;
-        try {
-          const result = fn();
-          this.raw.exec("COMMIT");
-          this.txnDepth = 0;
-          return result;
-        } catch (inner) {
-          try {
-            this.raw.exec("ROLLBACK");
-          } catch {
-            // already rolled back / never began
-          }
-          this.txnDepth = 0;
-          throw inner;
-        }
+        this.raw.exec(`ROLLBACK TO ${name}`);
+        this.raw.exec(`RELEASE ${name}`);
+      } catch {
+        // best-effort unwind
+      }
+      throw e;
+    } finally {
+      this.txnDepth--;
+    }
+  }
+
+  /**
+   * Outer transaction: `BEGIN IMMEDIATE` acquires the write lock up front so
+   * cross-process writers serialize cleanly under WAL instead of failing late
+   * on upgrade. `busy_timeout` covers most contention; a bounded synchronous
+   * retry absorbs the residual SQLITE_BUSY (another connection holds the lock
+   * past the timeout, or BUSY_SNAPSHOT). Non-busy errors and the final attempt
+   * re-throw so genuine failures propagate.
+   */
+  private runOuter<T>(fn: () => T): T {
+    for (let attempt = 0; attempt < BUSY_RETRY_ATTEMPTS; attempt++) {
+      try {
+        return this.runOnce(fn);
       } catch (e) {
-        if (!isBusyError(e) || attempt >= BUSY_RETRY_ATTEMPTS - 1) throw e;
+        if (!isBusyError(e) || attempt === BUSY_RETRY_ATTEMPTS - 1) throw e;
         sleepSync(BUSY_RETRY_BACKOFF_MS);
       }
+    }
+    // Unreachable: the loop returns on success or throws on the final attempt.
+    throw new Error("transaction retry budget exhausted");
+  }
+
+  /** One `BEGIN IMMEDIATE` / `COMMIT` / `ROLLBACK` lifecycle. */
+  private runOnce<T>(fn: () => T): T {
+    this.raw.exec("BEGIN IMMEDIATE"); // busy here propagates with no open txn
+    this.txnDepth = 1;
+    try {
+      const result = fn();
+      this.raw.exec("COMMIT");
+      return result;
+    } catch (e) {
+      try {
+        this.raw.exec("ROLLBACK");
+      } catch {
+        // already rolled back / never began
+      }
+      throw e;
+    } finally {
+      this.txnDepth = 0;
     }
   }
 
@@ -221,11 +292,13 @@ class NodeSqliteAdapter implements Database {
     }
     try {
       this.raw.close();
-    } catch {
+    } catch (e) {
       // Idempotent close: node:sqlite throws "database is not open" on a
-      // double-close, where better-sqlite3 was a no-op. A connection can be
-      // closed directly yet still sit in the connection cache, so a later
-      // closeAll() must not throw on the second close.
+      // double-close (better-sqlite3 was a no-op) — a cached connection can be
+      // closed directly, then closed again by closeAllDatabases(). Swallow ONLY
+      // that; any other close failure (corruption, permissions) must surface.
+      const message = (e as Error | null)?.message ?? "";
+      if (!/database is not open/i.test(message)) throw e;
     }
   }
 }

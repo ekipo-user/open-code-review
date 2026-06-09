@@ -9,11 +9,15 @@ import {
   printDepChecks,
   printCapabilities,
 } from "../lib/deps.js";
-import { probeEngine } from "../lib/db/index.js";
+import { probeEngine, probeWrite } from "../lib/db/index.js";
 
 export const doctorCommand = new Command("doctor")
   .description("Check OCR installation and verify all dependencies")
-  .action(() => {
+  .option(
+    "--probe-write",
+    "additionally exercise an on-disk WAL transaction round-trip (used by the release install gate)",
+  )
+  .action((options: { probeWrite?: boolean }) => {
     printHeader();
 
     const targetDir = process.cwd();
@@ -86,6 +90,18 @@ export const doctorCommand = new Command("doctor")
           "OCR requires Node >= 22.5 (node:sqlite). Upgrade Node, then re-run `ocr doctor`.",
         )}`,
       );
+    }
+    if (options.probeWrite && engine.ok) {
+      const write = probeWrite();
+      if (write.ok) {
+        console.log(
+          `    ${chalk.green("✓")} write probe (on-disk WAL transaction round-trip)`,
+        );
+      } else {
+        hasIssues = true;
+        console.log(`    ${chalk.red("✗")} write probe failed`);
+        console.log(`      ${chalk.dim(write.error)}`);
+      }
     }
 
     // ── Capabilities ──

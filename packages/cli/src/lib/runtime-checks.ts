@@ -29,7 +29,12 @@ export function nodeVersionGuardMessage(version: string): string {
   );
 }
 
-/** `true` only for node:sqlite's experimental warning (so we never swallow others). */
+/**
+ * `true` only for node:sqlite's experimental warning (so we never swallow
+ * others). The substring is a Node-internal string and could change across Node
+ * versions; the cli-e2e `doctor` test (asserts stderr has no `/experimental/i`
+ * from the real built binary) is the backstop that catches a drift.
+ */
 export function isSuppressibleSqliteWarning(warning: unknown): boolean {
   const message =
     typeof warning === "string" ? warning : (warning as Error | undefined)?.message;
