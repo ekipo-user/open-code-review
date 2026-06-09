@@ -1,7 +1,7 @@
 /**
  * Shared SQLite database access module for OCR.
  *
- * Uses `better-sqlite3` (native, on-disk, WAL) for durable, cross-process
+ * Uses Node's built-in `node:sqlite` (on-disk, WAL) for durable, cross-process
  * SQLite access. The database lives at `.ocr/data/ocr.db` within a project.
  * Engine specifics live in `./engine.ts`; this module owns connection
  * lifecycle, migrations, and re-exports.
@@ -187,7 +187,7 @@ export type {
 const connections = new Map<string, Database>();
 
 /**
- * Opens or creates a SQLite database at the given path via better-sqlite3.
+ * Opens or creates a SQLite database at the given path via node:sqlite.
  * Connections are cached by path for reuse within a process. The directory
  * is created on demand so callers don't have to pre-create `data/`.
  */
@@ -271,7 +271,7 @@ export async function ensureDatabase(ocrDir: string): Promise<Database> {
 
 /**
  * Checkpoint-truncate the on-disk write-ahead log through a native
- * better-sqlite3 connection, so the main `.db` file stays current and the
+ * node:sqlite connection, so the main `.db` file stays current and the
  * `.db-wal` sidecar doesn't grow without bound.
  *
  * Reuses the cached connection when one exists; otherwise opens a transient

@@ -12,7 +12,7 @@
  * fact and can never disagree.
  *
  * Used both at finish time (command-runner emits outcome on the socket event)
- * and at read time (commands history route). Under better-sqlite3 + WAL the
+ * and at read time (commands history route). Under node:sqlite + WAL the
  * read is live, so no merge/sync is needed before deriving.
  */
 

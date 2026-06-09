@@ -8,7 +8,7 @@
 /**
  * ## Single-Writer Ownership Model
  *
- * The CLI and dashboard share ONE on-disk database (`better-sqlite3` + WAL).
+ * The CLI and dashboard share ONE on-disk database (`node:sqlite` + WAL).
  * Native WAL locking serializes writes across both processes — there is no
  * in-memory copy, no merge layer, and no save hooks.
  *
@@ -226,7 +226,7 @@ let cachedDbPath: string | null = null
 
 /**
  * Opens the OCR database at the given `.ocr/` directory path via the shared
- * CLI engine (better-sqlite3 + WAL), creating it and running migrations on
+ * CLI engine (node:sqlite + WAL), creating it and running migrations on
  * first use. The shared module caches the connection per path.
  */
 export async function openDb(ocrDir: string): Promise<Database> {

@@ -4,7 +4,7 @@
  * The recovery scans the events JSONL files we already write per
  * execution and surfaces any captured `session_id` event that the
  * relational state missed. This test exercises the helper directly
- * (Khorikov classical school — real fs + real better-sqlite3 DB).
+ * (Khorikov classical school — real fs + real node:sqlite DB).
  */
 import { afterEach, beforeEach, describe, expect, it } from 'vitest'
 import { mkdtempSync, mkdirSync, rmSync, writeFileSync } from 'node:fs'

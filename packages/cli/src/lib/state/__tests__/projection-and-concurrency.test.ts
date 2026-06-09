@@ -2,12 +2,7 @@ import { mkdtempSync, rmSync, mkdirSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
 import { spawn } from "node:child_process";
-import { createRequire } from "node:module";
 import { describe, it, expect, beforeEach, afterEach } from "vitest";
-
-// Absolute path to better-sqlite3 so a spawned child can `require` it
-// regardless of its cwd.
-const betterSqlitePath = createRequire(import.meta.url).resolve("better-sqlite3");
 import {
   openDatabase,
   closeAllDatabases,
@@ -160,19 +155,19 @@ describe("cross-connection co-existence under WAL", () => {
     });
 
     // Child script (CJS): hold the writer lock for ~400ms inside one txn.
+    // Uses Node's built-in node:sqlite (no native dependency to resolve).
     const childPath = join(ocrDir, "data", "lock-holder.cjs");
     writeFileSync(
       childPath,
-      `const BetterSqlite3 = require(${JSON.stringify(betterSqlitePath)});
-       const db = new BetterSqlite3(process.argv[2]);
-       db.pragma("journal_mode = WAL");
-       db.pragma("busy_timeout = 5000");
-       const tx = db.transaction(() => {
-         db.prepare("INSERT INTO command_executions (uid, command, args, started_at, workflow_id) VALUES ('u-child','review','[]',datetime('now'),'wf')").run();
-         const until = Date.now() + 400;
-         while (Date.now() < until) { /* hold the write lock */ }
-       });
-       tx.immediate();
+      `const { DatabaseSync } = require("node:sqlite");
+       const db = new DatabaseSync(process.argv[2]);
+       db.exec("PRAGMA journal_mode = WAL");
+       db.exec("PRAGMA busy_timeout = 5000");
+       db.exec("BEGIN IMMEDIATE");
+       db.prepare("INSERT INTO command_executions (uid, command, args, started_at, workflow_id) VALUES ('u-child','review','[]',datetime('now'),'wf')").run();
+       const until = Date.now() + 400;
+       while (Date.now() < until) { /* hold the write lock */ }
+       db.exec("COMMIT");
        db.close();
       `,
     );

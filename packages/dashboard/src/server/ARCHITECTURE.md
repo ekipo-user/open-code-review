@@ -3,7 +3,7 @@
 ## Single-Writer Ownership Model
 
 The CLI and dashboard share ONE on-disk SQLite database at `.ocr/data/ocr.db`,
-opened with `better-sqlite3` in WAL mode. Native WAL locking serializes writes
+opened with `node:sqlite` in WAL mode. Native WAL locking serializes writes
 across both processes — there is no in-memory copy, no merge layer, and no save
 hooks. The dashboard's connection reads committed CLI writes live.
 
@@ -46,7 +46,7 @@ interactions and filesystem-sync runs.
 
 ## Durability and Concurrency
 
-Durability is the engine's job: `better-sqlite3` persists writes on commit and
+Durability is the engine's job: `node:sqlite` persists writes on commit and
 WAL locking serializes them across the CLI and dashboard connections. There is
 no explicit flush, no merge-before-write, and no temp-file-then-rename — the
 shared on-disk database with native locking handles all of it.

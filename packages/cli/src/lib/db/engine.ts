@@ -1,18 +1,40 @@
 /**
- * SQLite engine adapter — backs OCR's database access with `better-sqlite3`
- * (native, on-disk, WAL) while preserving the small subset of the legacy
- * `sql.js` surface the codebase already uses (`exec`, `run`, `close`). This
- * bounds the migration blast radius: the ~100 existing query call sites that
- * call `db.exec(sql, params)` / `db.run(sql, params)` keep working unchanged.
+ * SQLite engine adapter — backs OCR's database access with Node's built-in
+ * `node:sqlite` (`DatabaseSync`, on-disk, WAL). Synchronous and cross-process
+ * safe via WAL + OS-level file locking, with **no native dependency to
+ * install** — the engine ships inside Node itself, so there is no prebuilt
+ * binary, no ABI matrix, and no install script for a package manager to skip.
  *
- * New code (event-sourced projection, atomic commands) SHOULD prefer the
- * native primitives exposed here — `prepare()`, `transaction()`, `pragma()`,
- * and the `raw` handle — which give real prepared statements and
- * cross-process-safe transactions.
+ * The adapter preserves the small `exec`/`run`/`close` surface the codebase
+ * already uses, so the ~100 existing query call sites keep working unchanged.
+ * New code SHOULD prefer the native primitives exposed here — `prepare()`,
+ * `transaction()`, `pragma()`, and the `raw` handle.
+ *
+ * Requires Node >= 22.5 (when `node:sqlite` landed). The CLI entry guards the
+ * Node version before this module loads, so a too-old runtime gets a clear
+ * message rather than a `Cannot find module 'node:sqlite'` stack.
  */
 
-import BetterSqlite3 from "better-sqlite3";
-import type { Database as BetterSqliteDatabase, Statement } from "better-sqlite3";
+import { createRequire } from "node:module";
+import type { DatabaseSync, StatementSync } from "node:sqlite";
+
+// Load `node:sqlite` LAZILY (synchronous `require`, not a static import) so that
+// importing this module does NOT touch the built-in. The CLI entry runs a
+// Node-version guard and the experimental-warning filter first; deferring the
+// load means a Node < 22.5 runtime gets a clear message instead of a hard
+// `Cannot find module 'node:sqlite'` at import time, and the experimental
+// warning is suppressed before it ever fires. Named `nodeRequire` to avoid
+// colliding with the `require` the bundle banner defines.
+const nodeRequire = createRequire(import.meta.url);
+let _DatabaseSyncCtor: { new (path: string): DatabaseSync } | undefined;
+function newDatabase(path: string): DatabaseSync {
+  if (!_DatabaseSyncCtor) {
+    _DatabaseSyncCtor = (
+      nodeRequire("node:sqlite") as typeof import("node:sqlite")
+    ).DatabaseSync;
+  }
+  return new _DatabaseSyncCtor(path);
+}
 
 /** A value that can be bound to a parameter or returned from a column. */
 export type SqlValue = number | string | bigint | Buffer | Uint8Array | null;
@@ -22,16 +44,15 @@ const BUSY_RETRY_ATTEMPTS = 5;
 const BUSY_RETRY_BACKOFF_MS = 50;
 
 /**
- * True when `e` is a better-sqlite3 lock-contention error. We can't rely on
- * `instanceof BetterSqlite3.SqliteError` alone (different module instances can
- * defeat it), so we also probe the structural `code` field.
+ * True when `e` is a `node:sqlite` lock-contention error. `node:sqlite`
+ * surfaces the generic `code === "ERR_SQLITE_ERROR"` and puts the SQLite
+ * primary result code in `errcode` (5 = SQLITE_BUSY, 261 = SQLITE_BUSY_SNAPSHOT).
+ * Keying on `errcode` is load-bearing: get it wrong and the busy-retry loop
+ * silently never fires under contention.
  */
 export function isBusyError(e: unknown): boolean {
-  if (e instanceof BetterSqlite3.SqliteError) {
-    return e.code === "SQLITE_BUSY" || e.code === "SQLITE_BUSY_SNAPSHOT";
-  }
-  const code = (e as { code?: unknown } | null)?.code;
-  return code === "SQLITE_BUSY" || code === "SQLITE_BUSY_SNAPSHOT";
+  const errcode = (e as { errcode?: unknown } | null)?.errcode;
+  return errcode === 5 || errcode === 261;
 }
 
 /**
@@ -51,8 +72,7 @@ export type BindParams = ReadonlyArray<SqlValue>;
  * Mirror of a `sql.js` `exec()` result set: an array (one entry per
  * row-returning statement) of `{columns, values}`. The codebase only ever
  * runs single statements through `exec`, so this array has length 0 (no
- * rows) or 1 (rows present), matching `sql.js` semantics so
- * `resultToRows`/`resultToRow` continue to work verbatim.
+ * rows) or 1 (rows present), so `resultToRows`/`resultToRow` work verbatim.
  */
 export interface ExecResultRow {
   columns: string[];
@@ -61,14 +81,13 @@ export interface ExecResultRow {
 export type ExecResult = ExecResultRow[];
 
 /**
- * The OCR database handle. Replaces the `sql.js` `Database` type across the
- * codebase. Method shapes for `exec`/`run`/`close` match the legacy surface;
- * `prepare`/`transaction`/`pragma`/`raw` are the native additions.
+ * The OCR database handle. Method shapes for `exec`/`run`/`close` match the
+ * legacy surface; `prepare`/`transaction`/`pragma`/`raw` are native additions.
  */
 export interface Database {
   /**
    * Run a single SQL statement and return its rows in `sql.js` shape.
-   * Returns `[]` when the statement returns no rows (matching `sql.js`).
+   * Returns `[]` when the statement returns no rows.
    */
   exec(sql: string, params?: BindParams): ExecResult;
   /**
@@ -77,34 +96,44 @@ export interface Database {
    */
   run(sql: string, params?: BindParams): void;
   /** Prepare a single statement for repeated/typed execution. */
-  prepare(sql: string): Statement;
+  prepare(sql: string): StatementSync;
   /** Run `fn` inside a single IMMEDIATE transaction (all-or-nothing). */
   transaction<T>(fn: () => T): T;
   /** Issue a PRAGMA against the underlying connection. */
   pragma(source: string): unknown;
-  /** Escape hatch to the underlying better-sqlite3 handle. */
-  readonly raw: BetterSqliteDatabase;
+  /** Escape hatch to the underlying node:sqlite handle. */
+  readonly raw: DatabaseSync;
   /** Checkpoint the WAL and close the connection. */
   close(): void;
 }
 
-class BetterSqliteAdapter implements Database {
-  readonly raw: BetterSqliteDatabase;
+class NodeSqliteAdapter implements Database {
+  readonly raw: DatabaseSync;
+  /**
+   * Transaction nesting depth. `node:sqlite` has no transaction helper, so we
+   * drive `BEGIN IMMEDIATE` ourselves and use SAVEPOINTs for nested calls
+   * (better-sqlite3 did this automatically). 0 = no transaction open.
+   */
+  private txnDepth = 0;
 
-  constructor(db: BetterSqliteDatabase) {
+  constructor(db: DatabaseSync) {
     this.raw = db;
   }
 
   exec(sql: string, params?: BindParams): ExecResult {
     const stmt = this.raw.prepare(sql);
-    if (!stmt.reader) {
-      // Non-row-returning statement invoked via exec — run for side effects.
+    // `columns()` returns [] for non-row statements (INSERT/UPDATE/DDL) and the
+    // result columns for SELECT / INSERT…RETURNING — a reliable discriminator.
+    const cols = stmt.columns();
+    if (cols.length === 0) {
       stmt.run(...(params ?? []));
       return [];
     }
-    const columns = stmt.columns().map((c) => c.name);
-    const values = stmt.raw().all(...(params ?? [])) as SqlValue[][];
-    return values.length > 0 ? [{ columns, values }] : [];
+    stmt.setReturnArrays(true); // rows as positional arrays (the `.raw()` shape)
+    const values = stmt.all(...(params ?? [])) as SqlValue[][];
+    return values.length > 0
+      ? [{ columns: cols.map((c) => c.name as string), values }]
+      : [];
   }
 
   run(sql: string, params?: BindParams): void {
@@ -113,29 +142,63 @@ class BetterSqliteAdapter implements Database {
       return;
     }
     // No params: may be a multi-statement script (migrations) or a bare
-    // statement (BEGIN/COMMIT/PRAGMA). `better-sqlite3.exec` handles both.
+    // statement (BEGIN/COMMIT/PRAGMA). `exec` handles both.
     this.raw.exec(sql);
   }
 
-  prepare(sql: string): Statement {
+  prepare(sql: string): StatementSync {
     return this.raw.prepare(sql);
   }
 
   transaction<T>(fn: () => T): T {
-    // `immediate` acquires the write lock up front so cross-process writers
-    // serialize cleanly under WAL instead of failing late on upgrade.
-    //
-    // `busy_timeout` covers most contention, but a writer can still surface
-    // SQLITE_BUSY (e.g. when another connection holds the write lock past the
-    // timeout, or on BUSY_SNAPSHOT). Bounded synchronous retry with backoff
-    // absorbs those transient cases; we re-throw on any non-busy error and on
-    // the final attempt so genuine failures still propagate.
-    const tx = this.raw.transaction(fn);
+    // Nested call: a SAVEPOINT within the outer transaction's write lock. No
+    // busy-retry here — the outer transaction already holds the lock.
+    if (this.txnDepth > 0) {
+      const name = `ocr_sp_${this.txnDepth}`;
+      this.raw.exec(`SAVEPOINT ${name}`);
+      this.txnDepth++;
+      try {
+        const result = fn();
+        this.raw.exec(`RELEASE ${name}`);
+        this.txnDepth--;
+        return result;
+      } catch (e) {
+        try {
+          this.raw.exec(`ROLLBACK TO ${name}`);
+          this.raw.exec(`RELEASE ${name}`);
+        } catch {
+          // best-effort unwind
+        }
+        this.txnDepth--;
+        throw e;
+      }
+    }
+
+    // Outer transaction. `BEGIN IMMEDIATE` acquires the write lock up front so
+    // cross-process writers serialize cleanly under WAL instead of failing late
+    // on upgrade. `busy_timeout` covers most contention; a bounded synchronous
+    // retry absorbs the residual SQLITE_BUSY (e.g. another connection holds the
+    // lock past the timeout, or BUSY_SNAPSHOT). Non-busy errors and the final
+    // attempt re-throw so genuine failures propagate.
     for (let attempt = 0; ; attempt++) {
       try {
-        return tx.immediate();
+        this.raw.exec("BEGIN IMMEDIATE");
+        this.txnDepth = 1;
+        try {
+          const result = fn();
+          this.raw.exec("COMMIT");
+          this.txnDepth = 0;
+          return result;
+        } catch (inner) {
+          try {
+            this.raw.exec("ROLLBACK");
+          } catch {
+            // already rolled back / never began
+          }
+          this.txnDepth = 0;
+          throw inner;
+        }
       } catch (e) {
-        // Re-throw on any non-busy error, or once the retry budget is spent.
         if (!isBusyError(e) || attempt >= BUSY_RETRY_ATTEMPTS - 1) throw e;
         sleepSync(BUSY_RETRY_BACKOFF_MS);
       }
@@ -143,30 +206,41 @@ class BetterSqliteAdapter implements Database {
   }
 
   pragma(source: string): unknown {
-    return this.raw.pragma(source);
+    // node:sqlite has no `pragma()`; route through `exec`. OCR's pragmas are
+    // all set-style (journal_mode, foreign_keys, busy_timeout, synchronous,
+    // wal_checkpoint) and callers ignore the return value.
+    this.raw.exec(`PRAGMA ${source}`);
+    return undefined;
   }
 
   close(): void {
     try {
-      this.raw.pragma("wal_checkpoint(TRUNCATE)");
+      this.raw.exec("PRAGMA wal_checkpoint(TRUNCATE)");
     } catch {
       // best-effort — never block close on a checkpoint failure
     }
-    this.raw.close();
+    try {
+      this.raw.close();
+    } catch {
+      // Idempotent close: node:sqlite throws "database is not open" on a
+      // double-close, where better-sqlite3 was a no-op. A connection can be
+      // closed directly yet still sit in the connection cache, so a later
+      // closeAll() must not throw on the second close.
+    }
   }
 }
 
 /**
- * Probe that the native `better-sqlite3` binding loads and runs on this
- * platform. Used by `ocr doctor` to give a clear diagnostic instead of an
- * opaque crash when the prebuilt binary is missing or incompatible.
+ * Probe that the SQLite engine loads and runs. Used by `ocr doctor` to confirm
+ * the storage engine is healthy. With `node:sqlite` there is no native binary
+ * to locate — this effectively verifies the runtime provides `node:sqlite`.
  */
 export function probeEngine():
   | { ok: true; version: string }
   | { ok: false; error: string } {
   try {
-    const db = new BetterSqlite3(":memory:");
-    db.pragma("journal_mode = WAL");
+    const db = newDatabase(":memory:");
+    db.exec("PRAGMA journal_mode = WAL");
     db.exec("CREATE TABLE _probe(x); INSERT INTO _probe VALUES (1);");
     const row = db.prepare("SELECT sqlite_version() AS v").get() as {
       v: string;
@@ -179,14 +253,14 @@ export function probeEngine():
 }
 
 /**
- * Open (or create) a better-sqlite3 connection at `dbPath` with OCR's
- * standard pragmas applied, wrapped in the adapter.
+ * Open (or create) a `node:sqlite` connection at `dbPath` with OCR's standard
+ * pragmas applied, wrapped in the adapter.
  */
 export function openEngine(dbPath: string): Database {
-  const native = new BetterSqlite3(dbPath);
-  native.pragma("journal_mode = WAL");
-  native.pragma("foreign_keys = ON");
-  native.pragma("busy_timeout = 5000");
-  native.pragma("synchronous = NORMAL");
-  return new BetterSqliteAdapter(native);
+  const native = newDatabase(dbPath);
+  native.exec("PRAGMA journal_mode = WAL");
+  native.exec("PRAGMA foreign_keys = ON");
+  native.exec("PRAGMA busy_timeout = 5000");
+  native.exec("PRAGMA synchronous = NORMAL");
+  return new NodeSqliteAdapter(native);
 }

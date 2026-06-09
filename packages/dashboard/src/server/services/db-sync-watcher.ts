@@ -1,7 +1,7 @@
 /**
  * Change notifier for `.ocr/data/ocr.db`.
  *
- * Under better-sqlite3 + WAL the CLI and dashboard share a single on-disk
+ * Under node:sqlite + WAL the CLI and dashboard share a single on-disk
  * database with native locking, so there is no in-memory copy to merge —
  * the dashboard's connection reads committed CLI writes live. This watcher's
  * sole remaining job is *notification*: detect external writes (from `ocr

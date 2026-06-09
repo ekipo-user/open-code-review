@@ -67,26 +67,23 @@ export const doctorCommand = new Command("doctor")
     }
 
     // ── Storage engine ──
-    // The SQLite engine (better-sqlite3) is a native module. Probe it so a
-    // missing/incompatible prebuilt binary surfaces as a clear diagnostic
-    // rather than an opaque crash on first DB access.
+    // The SQLite engine is Node's built-in `node:sqlite` (no native module).
+    // Probe it so a too-old runtime or a disabled built-in surfaces clearly.
     console.log();
     console.log(chalk.bold("  Storage Engine"));
     console.log();
     const engine = probeEngine();
     if (engine.ok) {
       console.log(
-        `    ${chalk.green("✓")} better-sqlite3 (SQLite ${engine.version}, WAL)`,
+        `    ${chalk.green("✓")} node:sqlite (SQLite ${engine.version}, WAL)`,
       );
     } else {
       hasIssues = true;
-      console.log(
-        `    ${chalk.red("✗")} better-sqlite3 failed to load`,
-      );
+      console.log(`    ${chalk.red("✗")} node:sqlite unavailable`);
       console.log(`      ${chalk.dim(engine.error)}`);
       console.log(
         `      ${chalk.dim(
-          "Reinstall the CLI; if it persists your platform may need build tools (python3 + a C++ toolchain) or lacks a prebuilt binary.",
+          "OCR requires Node >= 22.5 (node:sqlite). Upgrade Node, then re-run `ocr doctor`.",
         )}`,
       );
     }

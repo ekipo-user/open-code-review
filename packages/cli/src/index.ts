@@ -1,3 +1,6 @@
+// MUST be first: guards Node >= 22.5 (node:sqlite) + suppresses its
+// experimental warning, before any module that touches the engine loads.
+import "./lib/runtime-guard.js";
 import { Command } from "commander";
 import { initCommand } from "./commands/init";
 import { progressCommand } from "./commands/progress";

@@ -15,7 +15,7 @@ import { listAgentSessionsForWorkflow } from '@open-code-review/cli/db'
  * Pull-on-read notification hook. The route invokes this before each read so
  * any external CLI writes are diffed and surfaced as Socket.IO events without
  * waiting for watcher debounce. Reads themselves already see the freshest
- * state — the shared better-sqlite3 + WAL connection reads committed CLI
+ * state — the shared node:sqlite + WAL connection reads committed CLI
  * writes live, so there is no merge or re-parse. The watcher remains the
  * push-based path for socket.io invalidation events.
  */

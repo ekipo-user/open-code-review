@@ -12,10 +12,9 @@ await build({
   bundle: true,
   platform: 'node',
   format: 'esm',
-  target: 'node20',
+  target: 'node22',
   outfile: 'dist/index.js',
   minify: false,
-  external: ['better-sqlite3'],
   banner: {
     js: ['#!/usr/bin/env node', cjsBanner].join('\n'),
   },
@@ -38,14 +37,14 @@ const libraryBundle = (entryPoint, outfile, externals = []) => ({
   bundle: true,
   platform: 'node',
   format: 'esm',
-  target: 'node20',
+  target: 'node22',
   outfile,
   minify: false,
   external: externals,
   tsconfig: 'tsconfig.json',
 })
 
-await build(libraryBundle('src/lib/db/index.ts', 'dist/lib/db/index.js', ['better-sqlite3']))
+await build(libraryBundle('src/lib/db/index.ts', 'dist/lib/db/index.js'))
 await build(libraryBundle('src/lib/runtime-config.ts', 'dist/lib/runtime-config.js'))
 // `yaml` is CommonJS-published, and inlining it via esbuild emits a
 // `require()` call that fails when the consuming dashboard server is

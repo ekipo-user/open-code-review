@@ -63,7 +63,7 @@
   "license": "Apache-2.0",
   "author": "Spencer Marx",
   "engines": {
-    "node": ">=20.0.0"
+    "node": ">=22.5.0"
   },
   "dependencies": {
     "@inquirer/prompts": "^7.2.0",
@@ -74,14 +74,12 @@
     "log-update": "^7.0.2",
     "ora": "^8.1.1",
     "socket.io": "^4.8",
-    "better-sqlite3": "^11.8.1",
     "yaml": "^2.8.3"
   },
   "publishConfig": {
     "access": "public"
   },
   "devDependencies": {
-    "@open-code-review/platform": "workspace:*",
-    "@types/better-sqlite3": "^7.6.12"
+    "@open-code-review/platform": "workspace:*"
   }
 }
