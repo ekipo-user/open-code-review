@@ -429,6 +429,16 @@ describe("rowKind", () => {
     expect(rowKind({ command: "post", last_heartbeat_at: null })).toBe("utility");
     expect(rowKind({ command: "doctor", last_heartbeat_at: null })).toBe("utility");
   });
+
+  it("does NOT classify a command merely PREFIXED 'session-instance' as an instance", () => {
+    // The load-bearing cascade-safety contract: the reader is exact-or-`:`-
+    // suffixed, NOT a loose startsWith. A look-alike command must read as a
+    // supervisor — otherwise an orphaned look-alike could cascade-kill its
+    // workflow's live siblings. A revert to loose `startsWith` must fail here.
+    expect(rowKind({ command: "session-instances", last_heartbeat_at: "x" })).toBe("supervisor");
+    expect(rowKind({ command: "session-instance-x", last_heartbeat_at: "x" })).toBe("supervisor");
+    expect(rowKind({ command: "session-instance ", last_heartbeat_at: "x" })).toBe("supervisor");
+  });
 });
 
 describe("sweepStaleAgentSessions — cascade on a dead supervisor", () => {

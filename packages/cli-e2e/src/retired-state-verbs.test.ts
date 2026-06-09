@@ -32,10 +32,19 @@ function tracked<T extends TempProject>(project: T): T {
   return project;
 }
 
-/** Retired verb → its v2 replacement, per RETIRED_STATE_VERBS in state.ts. */
+/**
+ * The full retired verb → v2 replacement set, mirroring `RETIRED_STATE_VERBS`
+ * in state.ts. Black-box e2e (no internal imports), so the mapping is declared
+ * here; the production source is the authority. `close` → `finish` is the
+ * highest-risk LLM idiom (most likely embedded in pre-trained prompts), so it
+ * is pinned alongside the rest.
+ */
 const RETIRED: ReadonlyArray<readonly [verb: string, replacement: string]> = [
   ["init", "begin"],
   ["transition", "advance"],
+  ["round-complete", "complete-round"],
+  ["map-complete", "complete-map"],
+  ["close", "finish"],
 ];
 
 describe("retired `ocr state` verbs", () => {
