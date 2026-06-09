@@ -326,81 +326,70 @@ describe("ocr session end-instance", () => {
 });
 
 describe("ocr session liveness sweep", () => {
-  it("reclassifies stale 'running' rows to 'orphaned' on next start-instance", async () => {
+  // A reviewer instance carries NO pid — its liveness is the heartbeat it
+  // self-reports via `ocr session beat`. A stale heartbeat is a hint (the
+  // non-terminal 'stalled' display), NOT positive evidence of death, so the
+  // sweep must never stamp such a row terminal-orphaned. Abandoned instances
+  // are reclaimed instead by `end-instance`, the parent-close cascade, or the
+  // coarse session-level sweep.
+  it("does NOT orphan a stale instance that has no pid", async () => {
     const project = tracked(createInitializedProject());
-    // Configure a tight 1-second heartbeat threshold so the test can
-    // observe the sweep without waiting a full minute.
-    writeConfigYaml(
-      project,
-      `runtime:\n  agent_heartbeat_seconds: 1\n`,
-    );
-
+    writeConfigYaml(project, `runtime:\n  agent_heartbeat_seconds: 1\n`);
     const workflowId = await initWorkflow(project);
 
-    // Insert the row that will go stale
     const stale = await spawnCli(
-      [
-        "session",
-        "start-instance",
-        "--workflow",
-        workflowId,
-        "--persona",
-        "principal",
-        "--instance",
-        "1",
-        "--vendor",
-        "claude",
-      ],
+      ["session", "start-instance", "--workflow", workflowId, "--persona", "principal", "--instance", "1", "--vendor", "claude"],
       { cwd: project.dir },
     );
     const staleId = stale.stdout.trim();
 
-    // Wait past the threshold (the heartbeat in the row is rounded to 1s
-    // resolution by SQLite's `datetime('now')`; sleep a bit longer to be
-    // unambiguously stale).
+    await new Promise((r) => setTimeout(r, 2_500)); // past the 1s threshold
+
+    // Next start-instance triggers the opportunistic sweep.
+    await spawnCli(
+      ["session", "start-instance", "--workflow", workflowId, "--persona", "principal", "--instance", "2", "--vendor", "claude"],
+      { cwd: project.dir },
+    );
+
+    const list = await spawnCli(["session", "list", "--workflow", workflowId, "--json"], { cwd: project.dir });
+    const staleRow = JSON.parse(list.stdout).find((r: { id: string }) => r.id === staleId);
+    expect(staleRow.status).toBe("running");
+    expect(staleRow.ended_at).toBeNull();
+  });
+
+  it("orphans a stale instance whose recorded pid is confirmed dead", async () => {
+    const project = tracked(createInitializedProject());
+    writeConfigYaml(project, `runtime:\n  agent_heartbeat_seconds: 1\n`);
+    const workflowId = await initWorkflow(project);
+
+    // A pid that cannot exist on any platform — the liveness probe reports it
+    // dead, so a stale heartbeat on this row IS backed by positive evidence.
+    const DEAD_PID = 2_000_000_000;
+    const stale = await spawnCli(
+      ["session", "start-instance", "--workflow", workflowId, "--persona", "principal", "--instance", "1", "--vendor", "claude", "--pid", String(DEAD_PID)],
+      { cwd: project.dir },
+    );
+    const staleId = stale.stdout.trim();
+
     await new Promise((r) => setTimeout(r, 2_500));
 
-    // A fresh start-instance call triggers the sweep — stale row gets
-    // reclassified to 'orphaned' before the new row is inserted.
-    const fresh = await spawnCli(
-      [
-        "session",
-        "start-instance",
-        "--workflow",
-        workflowId,
-        "--persona",
-        "principal",
-        "--instance",
-        "2",
-        "--vendor",
-        "claude",
-      ],
+    await spawnCli(
+      ["session", "start-instance", "--workflow", workflowId, "--persona", "principal", "--instance", "2", "--vendor", "claude"],
       { cwd: project.dir },
     );
-    const freshId = fresh.stdout.trim();
 
-    const list = await spawnCli(
-      ["session", "list", "--workflow", workflowId, "--json"],
-      { cwd: project.dir },
-    );
-    const rows = JSON.parse(list.stdout);
-
-    const staleRow = rows.find((r: { id: string }) => r.id === staleId);
-    const freshRow = rows.find((r: { id: string }) => r.id === freshId);
-
+    const list = await spawnCli(["session", "list", "--workflow", workflowId, "--json"], { cwd: project.dir });
+    const staleRow = JSON.parse(list.stdout).find((r: { id: string }) => r.id === staleId);
     expect(staleRow.status).toBe("orphaned");
     expect(staleRow.ended_at).toBeTruthy();
     expect(staleRow.notes).toContain("orphaned by liveness sweep");
-    expect(freshRow.status).toBe("running");
   });
 
-  it("leaves a row whose heartbeat was just bumped untouched", async () => {
+  it("session beat refreshes a row's heartbeat and the sweep leaves it running", async () => {
     const project = tracked(createInitializedProject());
-    // 5s threshold (vs the 1s used in the orphan-path test) buys headroom
-    // for the beat → next start-instance window on slow CI runners. With
-    // 1s, two sequential CLI invocations (~700-800ms each on hosted
-    // macOS/Ubuntu) push the sweep past the threshold and the row gets
-    // wrongly reclassified.
+    // Smoke-tests the real `ocr session beat` command end-to-end. (A null-pid
+    // instance is never swept regardless under the liveness model; this also
+    // confirms beat + the opportunistic sweep coexist without error.)
     writeConfigYaml(
       project,
       `runtime:\n  agent_heartbeat_seconds: 5\n`,

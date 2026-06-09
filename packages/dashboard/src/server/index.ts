@@ -42,6 +42,9 @@ import {
   sweepStaleAgentSessions,
   sweepStaleSessions,
   walCheckpointTruncate,
+  defaultIsAlive,
+  PID_REUSE_GUARD_MS,
+  sqliteUtcMs,
 } from '@open-code-review/cli/db'
 import { getAgentHeartbeatSeconds } from '@open-code-review/cli/runtime-config'
 
@@ -235,7 +238,8 @@ export async function startServer(options: StartServerOptions = {}): Promise<voi
     const { columns, values: orphanRows } = orphanResult[0]
     const colIdx = Object.fromEntries(columns.map((c, i) => [c, i]))
 
-    const cutoff = Date.now() - 24 * 60 * 60 * 1000 // 24 hours
+    // Same PID-reuse guard the periodic liveness sweep uses (shared constant).
+    const cutoff = Date.now() - PID_REUSE_GUARD_MS
     let killedCount = 0
 
     for (const row of orphanRows) {
@@ -243,14 +247,12 @@ export async function startServer(options: StartServerOptions = {}): Promise<voi
       const isDetached = (row[colIdx['is_detached']!] as number) === 1
       const startedAt = row[colIdx['started_at']!] as string
 
-      // Safety: skip PIDs from commands started more than 24 hours ago
+      // Safety: skip PIDs from commands started beyond the reuse window
       // to avoid PID-reuse issues with very old stale entries
-      if (new Date(startedAt).getTime() < cutoff) continue
+      if (sqliteUtcMs(startedAt) < cutoff) continue
 
-      try {
-        // Check if process is still alive (signal 0 = no signal, just check)
-        process.kill(pid, 0)
-
+      // Only act on genuinely-live processes (the shared liveness probe).
+      if (defaultIsAlive(pid)) {
         // Process is alive — kill it
         if (isDetached) {
           try { process.kill(-pid, 'SIGTERM') } catch { process.kill(pid, 'SIGTERM') }
@@ -269,9 +271,8 @@ export async function startServer(options: StartServerOptions = {}): Promise<voi
             process.kill(pid, 'SIGKILL')
           } catch { /* already dead */ }
         }, 2000)
-      } catch {
-        // Process not running — PID is stale, will be cleaned up below
       }
+      // else: process not running — PID is stale, cleaned up below.
     }
 
     if (killedCount > 0) {
@@ -299,12 +300,12 @@ export async function startServer(options: StartServerOptions = {}): Promise<voi
   }
 
   // ── Agent-session liveness sweep ──
-  // Reclassifies `running` agent_sessions rows whose heartbeat has gone stale
-  // past the configured threshold to `orphaned`. Fires on dashboard startup
-  // AND via a periodic timer below — so long-running dashboards don't
-  // accumulate stranded rows.
+  // Reclaims supervision rows whose process is genuinely DEAD (probed via
+  // `defaultIsAlive`), stamping them `orphaned`. Heartbeat age only bounds
+  // which rows are worth probing — a live pid is never orphaned, however stale
+  // its heartbeat. Fires on dashboard startup AND via the periodic timer below.
   const heartbeatSeconds = getAgentHeartbeatSeconds(ocrDir)
-  const sweepResult = sweepStaleAgentSessions(db, heartbeatSeconds)
+  const sweepResult = sweepStaleAgentSessions(db, heartbeatSeconds, defaultIsAlive)
   if (sweepResult.orphanedIds.length > 0) {
     console.log(
       `  Cleaned up ${sweepResult.orphanedIds.length} stale agent session(s) (heartbeat threshold ${heartbeatSeconds}s)`
@@ -335,7 +336,7 @@ export async function startServer(options: StartServerOptions = {}): Promise<voi
   const SWEEP_INTERVAL_MS = 5 * 60 * 1000
   const sweepTimer = setInterval(() => {
     try {
-      sweepStaleAgentSessions(db, heartbeatSeconds)
+      sweepStaleAgentSessions(db, heartbeatSeconds, defaultIsAlive)
       sweepStaleSessions(db, STALE_SESSION_THRESHOLD_SECONDS)
     } catch (err) {
       console.error('[sweep] periodic sweep failed:', err)

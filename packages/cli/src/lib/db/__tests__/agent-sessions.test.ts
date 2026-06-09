@@ -197,27 +197,120 @@ describe("agent_sessions journal", () => {
 });
 
 describe("sweepStaleAgentSessions", () => {
-  it("orphans running rows whose heartbeat is past the threshold", () => {
-    insertAgentSession(db, {
-      id: "agent-stale",
-      workflow_id: WORKFLOW_ID,
-      vendor: "claude",
-    });
-    // Backdate the heartbeat to 5 minutes ago.
+  // The terminal "orphaned" verdict is grounded in actual process liveness,
+  // not heartbeat age — the sweep takes an `isAlive(pid)` predicate so these
+  // tests are deterministic without spawning real processes.
+  const ALIVE = () => true;
+  const DEAD = () => false;
+  /** Backdate a row's heartbeat past the 60s threshold. */
+  function makeStale(uid: string) {
     db.run(
       `UPDATE command_executions
          SET last_heartbeat_at = datetime('now', '-300 seconds')
-         WHERE uid = 'agent-stale'`,
+         WHERE uid = ?`,
+      [uid],
     );
+  }
 
-    const result = sweepStaleAgentSessions(db, 60);
+  it("NEVER orphans a row whose pid is alive, even with an ancient heartbeat", () => {
+    // The regression: a long-running review (live pid) must not be falsely
+    // declared dead just because its heartbeat lapsed.
+    insertAgentSession(db, {
+      id: "agent-alive",
+      workflow_id: WORKFLOW_ID,
+      vendor: "claude",
+      pid: 4242,
+    });
+    makeStale("agent-alive");
 
-    expect(result.orphanedIds).toEqual(["agent-stale"]);
-    const row = getAgentSession(db, "agent-stale");
+    const result = sweepStaleAgentSessions(db, 60, ALIVE);
+
+    expect(result.orphanedIds).toEqual([]);
+    const row = getAgentSession(db, "agent-alive");
+    expect(row?.status).toBe("running");
+    expect(row?.ended_at).toBeNull();
+  });
+
+  it("orphans a row whose pid is confirmed dead", () => {
+    insertAgentSession(db, {
+      id: "agent-dead",
+      workflow_id: WORKFLOW_ID,
+      vendor: "claude",
+      pid: 4242,
+    });
+    makeStale("agent-dead");
+
+    const result = sweepStaleAgentSessions(db, 60, DEAD);
+
+    expect(result.orphanedIds).toEqual(["agent-dead"]);
+    const row = getAgentSession(db, "agent-dead");
     expect(row?.status).toBe("orphaned");
     expect(row?.ended_at).toBeTruthy();
     expect(row?.notes).toContain("orphaned by liveness sweep");
     expect(row?.notes).toContain("threshold 60s");
+    // pid cleared so a second sweep can't re-consider it.
+    const pidRow = db.exec(
+      "SELECT pid FROM command_executions WHERE uid = 'agent-dead'",
+    );
+    expect(pidRow[0]?.values[0]?.[0]).toBeNull();
+  });
+
+  it("NEVER orphans a row with no recorded pid (no evidence of death)", () => {
+    insertAgentSession(db, {
+      id: "agent-nopid",
+      workflow_id: WORKFLOW_ID,
+      vendor: "claude",
+      // no pid
+    });
+    makeStale("agent-nopid");
+
+    // The predicate must not even be consulted for a null-pid row.
+    const result = sweepStaleAgentSessions(db, 60, () => {
+      throw new Error("isAlive must not be probed for a null pid");
+    });
+
+    expect(result.orphanedIds).toEqual([]);
+    expect(getAgentSession(db, "agent-nopid")?.status).toBe("running");
+    expect(getAgentSession(db, "agent-nopid")?.ended_at).toBeNull();
+  });
+
+  it("orphans a dead-pid row just inside the 24h PID-reuse window", () => {
+    insertAgentSession(db, {
+      id: "agent-23h",
+      workflow_id: WORKFLOW_ID,
+      vendor: "claude",
+      pid: 4242,
+    });
+    db.run(
+      `UPDATE command_executions
+         SET last_heartbeat_at = datetime('now', '-300 seconds'),
+             started_at = datetime('now', '-23 hours')
+         WHERE uid = 'agent-23h'`,
+    );
+
+    const result = sweepStaleAgentSessions(db, 60, DEAD);
+    expect(result.orphanedIds).toEqual(["agent-23h"]);
+  });
+
+  it("does NOT orphan a row older than the 24h PID-reuse window (pid may be recycled)", () => {
+    insertAgentSession(db, {
+      id: "agent-25h",
+      workflow_id: WORKFLOW_ID,
+      vendor: "claude",
+      pid: 4242,
+    });
+    db.run(
+      `UPDATE command_executions
+         SET last_heartbeat_at = datetime('now', '-300 seconds'),
+             started_at = datetime('now', '-25 hours')
+         WHERE uid = 'agent-25h'`,
+    );
+
+    // Even with a "dead" probe, an ancient row is left alone — its pid can't
+    // be trusted (the OS may have recycled it onto an unrelated process).
+    const result = sweepStaleAgentSessions(db, 60, DEAD);
+    expect(result.orphanedIds).toEqual([]);
+    expect(getAgentSession(db, "agent-25h")?.status).toBe("running");
   });
 
   it("leaves rows with fresh heartbeats untouched", () => {
@@ -225,9 +318,10 @@ describe("sweepStaleAgentSessions", () => {
       id: "agent-fresh",
       workflow_id: WORKFLOW_ID,
       vendor: "claude",
+      pid: 4242,
     });
 
-    const result = sweepStaleAgentSessions(db, 60);
+    const result = sweepStaleAgentSessions(db, 60, DEAD);
 
     expect(result.orphanedIds).toEqual([]);
     const row = getAgentSession(db, "agent-fresh");
@@ -240,18 +334,13 @@ describe("sweepStaleAgentSessions", () => {
       id: "agent-done",
       workflow_id: WORKFLOW_ID,
       vendor: "claude",
+      pid: 4242,
     });
     setAgentSessionStatus(db, "agent-done", "done", { exitCode: 0 });
-    // Backdate heartbeat past threshold; even so the sweep should ignore it
-    // because status is already terminal.
-    db.run(
-      `UPDATE command_executions
-         SET last_heartbeat_at = datetime('now', '-300 seconds')
-         WHERE uid = 'agent-done'`,
-    );
+    makeStale("agent-done");
 
     const before = getAgentSession(db, "agent-done");
-    const result = sweepStaleAgentSessions(db, 60);
+    const result = sweepStaleAgentSessions(db, 60, DEAD);
     const after = getAgentSession(db, "agent-done");
 
     expect(result.orphanedIds).toEqual([]);
@@ -260,30 +349,40 @@ describe("sweepStaleAgentSessions", () => {
   });
 
   it("returns an empty result when no rows are stale", () => {
-    const result = sweepStaleAgentSessions(db, 60);
+    const result = sweepStaleAgentSessions(db, 60, DEAD);
     expect(result.orphanedIds).toEqual([]);
   });
 
-  it("orphans multiple stale rows in one call", () => {
+  it("is idempotent — a second sweep makes no further change", () => {
     insertAgentSession(db, {
-      id: "agent-1",
+      id: "agent-idem",
       workflow_id: WORKFLOW_ID,
       vendor: "claude",
+      pid: 4242,
     });
-    insertAgentSession(db, {
-      id: "agent-2",
-      workflow_id: WORKFLOW_ID,
-      vendor: "claude",
-    });
-    db.run(
-      `UPDATE command_executions SET last_heartbeat_at = datetime('now', '-300 seconds')`,
-    );
+    makeStale("agent-idem");
 
-    const result = sweepStaleAgentSessions(db, 60);
+    const first = sweepStaleAgentSessions(db, 60, DEAD);
+    expect(first.orphanedIds).toEqual(["agent-idem"]);
+    const endedAt = getAgentSession(db, "agent-idem")?.ended_at;
 
-    expect(result.orphanedIds.sort()).toEqual(["agent-1", "agent-2"]);
-    expect(getAgentSession(db, "agent-1")?.status).toBe("orphaned");
-    expect(getAgentSession(db, "agent-2")?.status).toBe("orphaned");
+    const second = sweepStaleAgentSessions(db, 60, DEAD);
+    expect(second.orphanedIds).toEqual([]);
+    expect(getAgentSession(db, "agent-idem")?.ended_at).toBe(endedAt);
+  });
+
+  it("orphans only the dead rows in a mixed batch", () => {
+    insertAgentSession(db, { id: "alive-1", workflow_id: WORKFLOW_ID, vendor: "claude", pid: 1001 });
+    insertAgentSession(db, { id: "dead-1", workflow_id: WORKFLOW_ID, vendor: "claude", pid: 2002 });
+    makeStale("alive-1");
+    makeStale("dead-1");
+
+    // Probe: only pid 2002 is dead.
+    const result = sweepStaleAgentSessions(db, 60, (pid) => pid !== 2002);
+
+    expect(result.orphanedIds).toEqual(["dead-1"]);
+    expect(getAgentSession(db, "alive-1")?.status).toBe("running");
+    expect(getAgentSession(db, "dead-1")?.status).toBe("orphaned");
   });
 });
 

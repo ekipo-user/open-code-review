@@ -10,8 +10,12 @@
  *
  * Status mapping (derived, no separate column):
  *   running    →  finished_at IS NULL AND last_heartbeat_at fresh
- *   stalled    →  finished_at IS NULL AND last_heartbeat_at stale
- *   orphaned   →  finished_at IS NOT NULL AND exit_code = -3 (sweep sentinel)
+ *   stalled    →  finished_at IS NULL AND last_heartbeat_at stale (advisory
+ *                 only — a stale heartbeat is NOT evidence of death; the
+ *                 process may be alive and simply not beating)
+ *   orphaned   →  finished_at IS NOT NULL AND exit_code = -3 — written only
+ *                 when the supervised pid is confirmed dead (see
+ *                 sweepStaleAgentSessions), never from heartbeat age alone
  *   done       →  exit_code = 0
  *   crashed    →  exit_code IS NOT NULL AND exit_code NOT IN (0, -2, -3)
  *   cancelled  →  exit_code = -2
@@ -27,6 +31,12 @@ import type {
 } from "./types.js";
 import { resultToRows, resultToRow } from "./result-mapper.js";
 import { commitReasonClose } from "./queries.js";
+import {
+  type IsAlive,
+  defaultIsAlive,
+  PID_REUSE_GUARD_MS,
+  sqliteUtcMs,
+} from "./liveness.js";
 import {
   CANCELLED_EXIT_CODE,
   ORPHAN_EXIT_CODE,
@@ -475,48 +485,77 @@ export function updateAgentSession(
 }
 
 /**
- * Reclassifies running rows whose heartbeat has gone stale past the given
- * threshold to `orphaned` (exit_code = -3). Stamps `finished_at` and
- * appends a structured note. Returns the uids of affected rows.
+ * Reclaims rows whose supervised process is genuinely gone, stamping them
+ * `orphaned` (exit_code = -3). The terminal verdict is grounded in actual
+ * process liveness (`isAlive`), NOT heartbeat age — a stale heartbeat alone
+ * is no evidence of death (the heartbeat is not refreshed during a run, so a
+ * healthy long command looks "stale" within a minute). A row is orphaned only
+ * when it carries a pid, that pid is within the PID-reuse safety window, and
+ * the pid is confirmed dead. Rows with no pid (no liveness signal) or older
+ * than the window are left for coarser reclamation, never declared dead here.
  *
- * Scoped to rows that participate in the journal (`last_heartbeat_at IS
- * NOT NULL`) — fire-and-forget commands without heartbeat tracking are
- * untouched.
+ * Heartbeat age (`thresholdSeconds`) is used only to bound which rows are
+ * worth probing; it never decides the verdict on its own.
+ *
+ * `isAlive` is injected so this stays a pure, testable db function; the
+ * dashboard passes the real `process.kill`-based probe.
  */
 export function sweepStaleAgentSessions(
   db: Database,
   thresholdSeconds: number,
+  isAlive: IsAlive = defaultIsAlive,
 ): SweepResult {
-  const staleSql = `
-    SELECT uid, id FROM command_executions
-    WHERE finished_at IS NULL
-      AND last_heartbeat_at IS NOT NULL
-      AND (julianday('now') - julianday(last_heartbeat_at)) * 86400 > ?
-  `;
-  const stale = resultToRows<{ uid: string | null; id: number }>(
-    db.exec(staleSql, [thresholdSeconds]),
+  // Phase 1 — candidates: unfinished, journaled, pid-bearing rows whose
+  // heartbeat has lapsed. Only pid-bearing rows can ever be orphaned, because
+  // a terminal verdict needs positive evidence of death and a null pid is none.
+  const candidates = resultToRows<{
+    uid: string | null;
+    id: number;
+    pid: number | null;
+    started_at: string;
+  }>(
+    db.exec(
+      `SELECT uid, id, pid, started_at FROM command_executions
+        WHERE finished_at IS NULL
+          AND pid IS NOT NULL
+          AND last_heartbeat_at IS NOT NULL
+          AND (julianday('now') - julianday(last_heartbeat_at)) * 86400 > ?`,
+      [thresholdSeconds],
+    ),
   );
-
-  if (stale.length === 0) {
+  if (candidates.length === 0) {
     return { orphanedIds: [] };
   }
 
-  const note = `${NOTE_ORPHAN_PREFIX} (threshold ${thresholdSeconds}s)`;
+  // Phase 2 — keep only rows whose pid is recent enough to trust AND confirmed
+  // dead. A live pid (the bug we are fixing) stays running.
+  const reuseCutoffMs = Date.now() - PID_REUSE_GUARD_MS;
+  const dead = candidates.filter((row) => {
+    if (row.pid === null) return false; // already excluded by SQL; defensive
+    if (sqliteUtcMs(row.started_at) < reuseCutoffMs) return false; // pid not trustworthy
+    return !isAlive(row.pid);
+  });
+  if (dead.length === 0) {
+    return { orphanedIds: [] };
+  }
 
+  // Phase 3 — stamp orphaned on exactly the dead rows, by id. Clear pid so a
+  // later sweep can't reconsider them, and compare-and-set on `finished_at` so
+  // a genuine completion that landed between phases always wins.
+  const note = `${NOTE_ORPHAN_PREFIX} (threshold ${thresholdSeconds}s)`;
+  const placeholders = dead.map(() => "?").join(", ");
   db.run(
     `UPDATE command_executions
-       SET finished_at = datetime('now'),
-           exit_code = ?,
-           notes = COALESCE(notes || char(10), '') || ?
-     WHERE finished_at IS NULL
-       AND last_heartbeat_at IS NOT NULL
-       AND (julianday('now') - julianday(last_heartbeat_at)) * 86400 > ?`,
-    [ORPHAN_EXIT_CODE, note, thresholdSeconds],
+        SET finished_at = datetime('now'),
+            exit_code = ?,
+            pid = NULL,
+            notes = COALESCE(notes || char(10), '') || ?
+      WHERE id IN (${placeholders})
+        AND finished_at IS NULL`,
+    [ORPHAN_EXIT_CODE, note, ...dead.map((r) => r.id)],
   );
 
-  return {
-    orphanedIds: stale.map((row) => row.uid ?? String(row.id)),
-  };
+  return { orphanedIds: dead.map((r) => r.uid ?? String(r.id)) };
 }
 
 /**

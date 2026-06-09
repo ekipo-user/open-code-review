@@ -127,6 +127,16 @@ export {
   cascadeTerminateExecutions,
 } from "./agent-sessions.js";
 
+// Process-liveness primitives — shared by the dashboard's supervision paths
+// (startup orphan-kill + the periodic liveness sweep) so the "is this pid
+// alive?" policy and the PID-reuse guard are defined once.
+export {
+  type IsAlive,
+  defaultIsAlive,
+  PID_REUSE_GUARD_MS,
+  sqliteUtcMs,
+} from "./liveness.js";
+
 export type { WorkflowType, SessionStatus } from "../state/types.js";
 
 // Canonical exit-code taxonomy, error class, and the negative process
