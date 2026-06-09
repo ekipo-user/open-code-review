@@ -68,3 +68,10 @@ The dashboard periodically reclaims `command_executions` rows whose supervised p
 - **WHEN** a command finishes normally between the sweep's read and its write
 - **THEN** the sweep's orphan stamp SHALL be a compare-and-set guarded on `finished_at IS NULL`, so the genuine exit code is never overwritten
 - **AND** a second sweep over an already-reclaimed row SHALL make no further change
+
+#### Scenario: A dead workflow process takes its in-flight dependents with it
+
+- **GIVEN** the row being orphaned is a workflow's supervising/top-level process (it has a `workflow_id` and is not itself a `session-instance` reviewer row)
+- **WHEN** the sweep confirms that process dead and orphans it
+- **THEN** in the same transaction it SHALL cascade-terminate that workflow's other in-flight `command_executions` rows with exit `-4` (cascade), since the parent's confirmed death is positive evidence its in-process children are gone — so reviewer instances do not linger as `stalled` and the session-level sweep is not wedged by them
+- **AND** orphaning a `session-instance` row SHALL NOT cascade (an instance never owns a workflow's lifecycle), so a live sibling instance is never taken down
