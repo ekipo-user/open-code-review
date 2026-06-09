@@ -68,4 +68,43 @@ describe("transaction (hand-rolled BEGIN IMMEDIATE + savepoint nesting)", () => 
     ).toThrow("outer boom");
     expect(db.exec("SELECT COUNT(*) AS n FROM t")[0]?.values[0]?.[0]).toBe(1);
   });
+
+  it("retries a SQLITE_BUSY BEGIN exactly the budget, then throws (loop exit condition)", () => {
+    // The load-bearing branch: get the loop bound wrong and contended writes
+    // either spin forever or never retry. Force BEGIN IMMEDIATE to raise a
+    // busy error (errcode 5) every time; assert the loop tries the budget then
+    // gives up — never reaching fn.
+    db = openEngine(":memory:");
+    const raw = (db as unknown as { raw: { exec(sql: string): unknown } }).raw;
+    const realExec = raw.exec.bind(raw);
+    let beginAttempts = 0;
+    raw.exec = (sql: string) => {
+      if (sql.startsWith("BEGIN")) {
+        beginAttempts++;
+        throw Object.assign(new Error("database is locked"), { errcode: 5 });
+      }
+      return realExec(sql);
+    };
+    let fnRan = false;
+    expect(() => db!.transaction(() => (fnRan = true))).toThrow(/locked/);
+    expect(beginAttempts).toBe(5); // BUSY_RETRY_ATTEMPTS
+    expect(fnRan).toBe(false);
+  });
+});
+
+describe("close() error discrimination", () => {
+  it("swallows the double-close (database is not open) but rethrows other failures", () => {
+    // Local handles — these stub raw.close, so they must not flow to afterEach.
+    const ok = openEngine(":memory:");
+    (ok as unknown as { raw: { close(): void } }).raw.close = () => {
+      throw new Error("database is not open"); // node:sqlite double-close
+    };
+    expect(() => ok.close()).not.toThrow();
+
+    const bad = openEngine(":memory:");
+    (bad as unknown as { raw: { close(): void } }).raw.close = () => {
+      throw new Error("disk I/O error"); // a real failure must surface
+    };
+    expect(() => bad.close()).toThrow(/disk I\/O error/);
+  });
 });
