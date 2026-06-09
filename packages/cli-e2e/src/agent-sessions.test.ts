@@ -385,6 +385,48 @@ describe("ocr session liveness sweep", () => {
     expect(staleRow.notes).toContain("orphaned by liveness sweep");
   });
 
+  it("orphaning a dead-pid instance does NOT cascade-terminate a live sibling", async () => {
+    // The dangerous regression: a reviewer instance does not own its workflow's
+    // lifecycle, so orphaning one must never take its siblings down. (Only a
+    // dead supervising process cascades its dependents.)
+    const project = tracked(createInitializedProject());
+    writeConfigYaml(project, `runtime:\n  agent_heartbeat_seconds: 1\n`);
+    const workflowId = await initWorkflow(project);
+
+    const DEAD_PID = 2_000_000_000;
+    // A live sibling instance (no pid) and a doomed dead-pid instance, both
+    // present BEFORE the orphaning sweep so the cascade-safety is real.
+    const sibling = await spawnCli(
+      ["session", "start-instance", "--workflow", workflowId, "--persona", "principal", "--instance", "1", "--vendor", "claude"],
+      { cwd: project.dir },
+    );
+    const siblingId = sibling.stdout.trim();
+    const doomed = await spawnCli(
+      ["session", "start-instance", "--workflow", workflowId, "--persona", "quality", "--instance", "1", "--vendor", "claude", "--pid", String(DEAD_PID)],
+      { cwd: project.dir },
+    );
+    const doomedId = doomed.stdout.trim();
+
+    await new Promise((r) => setTimeout(r, 2_500)); // both rows go stale
+
+    // Trigger the sweep: the dead-pid instance is orphaned; the sweep must NOT
+    // cascade (it's an instance), so the live sibling is untouched.
+    await spawnCli(
+      ["session", "start-instance", "--workflow", workflowId, "--persona", "architect", "--instance", "1", "--vendor", "claude"],
+      { cwd: project.dir },
+    );
+
+    const list = await spawnCli(["session", "list", "--workflow", workflowId, "--json"], { cwd: project.dir });
+    const rows = JSON.parse(list.stdout) as Array<{ id: string; status: string; ended_at: string | null }>;
+    const doomedRow = rows.find((r) => r.id === doomedId);
+    const siblingRow = rows.find((r) => r.id === siblingId);
+
+    expect(doomedRow?.status).toBe("orphaned");
+    // The sibling survives its peer's orphaning — never cascade-terminated.
+    expect(siblingRow?.status).toBe("running");
+    expect(siblingRow?.ended_at).toBeNull();
+  });
+
   it("session beat refreshes a row's heartbeat and the sweep leaves it running", async () => {
     const project = tracked(createInitializedProject());
     // Smoke-tests the real `ocr session beat` command end-to-end. (A null-pid

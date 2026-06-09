@@ -237,6 +237,7 @@ describe("GET /api/agent-sessions", () => {
       persona: string | null;
       resolved_model: string | null;
       status: string;
+      kind: string;
       last_heartbeat_at: string;
     }>;
     expect(rows).toHaveLength(1);
@@ -245,6 +246,9 @@ describe("GET /api/agent-sessions", () => {
       persona: "principal",
       resolved_model: "claude-opus-4-7",
       status: "running",
+      // A start-instance reviewer is surfaced as a derived `kind`, so a
+      // consumer can tell the process role without parsing the command string.
+      kind: "instance",
     });
     expect(rows[0]?.last_heartbeat_at).toBeTruthy();
   });
