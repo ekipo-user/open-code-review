@@ -1,3 +1,26 @@
+## 2.1.0 (2026-06-09)
+
+### 🚀 Features
+
+- ⚠️  **cli:** migrate SQLite engine to Node's built-in node:sqlite ([7aef5b7](https://github.com/spencermarx/open-code-review/commit/7aef5b7))
+
+### 🩹 Fixes
+
+- **cli:** doctor --engine-only so the install gate exits on the engine (PR #34 R2 SF1) ([#34](https://github.com/spencermarx/open-code-review/issues/34))
+- **ci:** resolve the agents dep via override in the install gate ([1a24756](https://github.com/spencermarx/open-code-review/commit/1a24756))
+
+### ⚠️  Breaking Changes
+
+- **cli:** migrate SQLite engine to Node's built-in node:sqlite  ([7aef5b7](https://github.com/spencermarx/open-code-review/commit/7aef5b7))
+  requires Node >= 22.5 (node:sqlite). Existing on-disk databases
+  are unaffected (engine-independent SQLite file format).
+  Co-Authored-By: claude-flow <ruv@ruv.net>
+
+### ❤️ Thank You
+
+- claude-flow @agentic-org
+- Spencer Marx
+
 # 2.0.0 (2026-06-09)
 
 ### 🚀 Features
