@@ -27,11 +27,25 @@
 - [x] 5.1 README + Quick Start: Node `>= 22.5`; "built-in node:sqlite, no native module, any package manager".
 
 ## 6. Release CI
-- [ ] 6.1 Rewrite `.github/workflows/release.yml`: drop the prebuild/ABI matrix; keep `setup` + `publish`
-      (cli + agents) + a ~6-cell `verify-install` (pnpm 10 scripts-blocked + npm × Node 22/24 → `ocr doctor`
-      loads the engine + a real DB command).
+- [x] 6.1 Rewrite `.github/workflows/release.yml`: drop the prebuild/ABI matrix; keep `setup` + `publish`
+      (cli + agents) + a `verify-install` (pnpm 10 scripts-blocked + npm × Node 22/24 → `ocr doctor --probe-write`
+      + a real DB command). Consumer-manifest writer + verify de-duplicated into one step.
 
 ## 7. Validation + release
-- [ ] 7.1 `openspec validate migrate-engine-to-node-sqlite --strict`.
+- [x] 7.1 `openspec validate migrate-engine-to-node-sqlite --strict`.
 - [ ] 7.2 Manual dogfood: `ocr doctor` shows the engine loaded; a Node-<22.5 run prints the guard message.
 - [ ] 7.3 Ship 2.1.0; release notes lead with Node ≥22.5 + the built-in engine; `openspec archive`.
+
+## 8. Round-1 review (PR #34) — addressed
+- [x] 8.1 Blocker: move engine semantics to a `sqlite-state` delta (ADD Built-in SQLite Engine; MODIFY WAL
+      Hygiene + Concurrent Writer Serialization to retire sql.js); trim the `cli` delta to distribution.
+- [x] 8.2 SF1 split `transaction()` (runNested/runOuter/runOnce); SF8b symbolic SQLITE_BUSY constants; S1 hoist
+      the sleep buffer.
+- [x] 8.3 SF2a test retry-exhaustion throw; SF4 discriminating `close()` + test.
+- [x] 8.4 SF3 structural guard: engine load throws the Node-version message + suppresses the warning (covers
+      `./db` + dashboard-server entry points); bin runtime-guard slimmed to the early exit.
+- [x] 8.5 SF5 `ocr doctor --probe-write` (on-disk WAL transaction round-trip) wired into the gate.
+- [x] 8.6 SF6 drop `raw` from the `Database` interface (kept class-only) — public `./db` cannot leak node:sqlite;
+      S3 `walCheckpointTruncate` uses `transient.close()`.
+- [x] 8.7 SF7 test-based seam guard (node:sqlite only in engine.ts; no better-sqlite3 imports).
+- [x] 8.8 SF8a de-dup release.yml consumer-manifest/verify; S2 named timings + comment notes.
