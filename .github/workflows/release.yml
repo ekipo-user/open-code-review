@@ -144,7 +144,11 @@ jobs:
           # build script, so pnpm 10's default script-blocking is a non-issue.
           verify() {
             app="$1"; bin="$app/node_modules/.bin/ocr"
-            "$bin" doctor --probe-write 2>&1 | tee "$app/doctor.out"
+            # --engine-only: this dir is a bare install (no .ocr/, no AI CLI, no
+            # gh), so a FULL doctor would exit 1 on those expected gaps before
+            # reaching the engine — and abort the gate under `set -o pipefail`.
+            # Engine-only checks just the engine + write probe and exits on that.
+            "$bin" doctor --engine-only --probe-write 2>&1 | tee "$app/doctor.out"
             grep -q "node:sqlite (SQLite" "$app/doctor.out"
             grep -q "write probe (on-disk" "$app/doctor.out"
             ! grep -q "unavailable" "$app/doctor.out"

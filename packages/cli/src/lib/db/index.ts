@@ -377,12 +377,24 @@ export function probeWrite(): { ok: true } | { ok: false; error: string } {
   } catch (e) {
     return { ok: false, error: e instanceof Error ? e.message : String(e) };
   } finally {
-    if (dir) {
-      try {
-        rmSync(dir, { recursive: true, force: true });
-      } catch {
-        // temp cleanup is best-effort
-      }
+    if (dir) rmDirBestEffort(dir);
+  }
+}
+
+/**
+ * Remove a temp dir, retrying a few times with a short backoff: on Windows the
+ * OS can hold the just-closed `node:sqlite` file handle briefly, so a single
+ * `rmSync` can race. Best-effort — never throws (ephemeral CI runners tolerate
+ * a residual dir, but we try not to leak one).
+ */
+function rmDirBestEffort(dir: string): void {
+  for (let attempt = 0; attempt < 3; attempt++) {
+    try {
+      rmSync(dir, { recursive: true, force: true });
+      return;
+    } catch {
+      if (attempt === 2) return;
+      Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 10);
     }
   }
 }

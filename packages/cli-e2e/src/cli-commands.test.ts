@@ -56,6 +56,22 @@ describe("CLI smoke tests", () => {
       expect(result.stdout).not.toContain("failed");
       expect(result.stderr).not.toMatch(/experimental/i);
     });
+
+    it("--engine-only --probe-write exits 0 from a non-OCR dir (the install-gate condition)", async () => {
+      // The release install gate runs from a bare consumer dir (no .ocr/, no AI
+      // CLI). A full `doctor` exits 1 on those expected gaps; --engine-only
+      // checks only the engine + write probe and exits on THAT — so the gate's
+      // assertions are reachable under `set -o pipefail`.
+      const bare = tracked(createTempProject()); // git repo, NOT `ocr init`'d
+      const result = await spawnCli(["doctor", "--engine-only", "--probe-write"], {
+        cwd: bare.dir,
+      });
+
+      expect(result.exitCode).toBe(0);
+      expect(result.stdout).toContain("node:sqlite");
+      expect(result.stdout).toContain("write probe");
+      expect(result.stdout).not.toContain("OCR Installation");
+    });
   });
 
   describe("ocr init", () => {
