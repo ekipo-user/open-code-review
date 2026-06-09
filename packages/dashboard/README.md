@@ -107,14 +107,14 @@ src/
 │   ├── routes/               # REST API endpoints
 │   ├── services/             # Filesystem sync, markdown parsers
 │   ├── socket/               # WebSocket handlers, command runner
-│   └── db.ts                 # SQLite via sql.js
+│   └── db.ts                 # SQLite via node:sqlite (Node's built-in)
 └── shared/
     └── types.ts              # Shared type definitions
 ```
 
 **Client**: React 19, React Router 7, TanStack Query, Tailwind CSS 4, Mermaid, Socket.IO Client
 
-**Server**: Express 4, Socket.IO 4, sql.js (SQLite), chokidar (filesystem watching)
+**Server**: Express 4, Socket.IO 4, `node:sqlite` (Node's built-in SQLite, WAL), chokidar (filesystem watching) — requires Node >= 22.5
 
 The server reads from the same `.ocr/` directory and SQLite database (`ocr.db`) used by the CLI and review workflow. Filesystem changes are detected via chokidar and pushed to connected clients in real-time.
 
