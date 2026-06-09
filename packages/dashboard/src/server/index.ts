@@ -307,14 +307,20 @@ export async function startServer(options: StartServerOptions = {}): Promise<voi
   // which rows are worth probing — a live pid is never orphaned, however stale
   // its heartbeat. Fires on dashboard startup AND via the periodic timer below.
   const heartbeatSeconds = getAgentHeartbeatSeconds(ocrDir)
-  const sweepResult = sweepStaleAgentSessions(db, heartbeatSeconds, defaultIsAlive)
-  if (sweepResult.orphanedIds.length > 0) {
-    const cascaded = sweepResult.cascadedWorkflowIds.length
+  // Shared so the startup sweep AND the periodic timer report identically — a
+  // cascade fired on the (higher-traffic) periodic callsite must not vanish.
+  const logAgentSweep = (result: {
+    orphanedIds: string[]
+    cascadedWorkflowIds: string[]
+  }): void => {
+    if (result.orphanedIds.length === 0) return
+    const cascaded = result.cascadedWorkflowIds.length
     console.log(
-      `  Cleaned up ${sweepResult.orphanedIds.length} stale agent session(s) (heartbeat threshold ${heartbeatSeconds}s)` +
+      `  Cleaned up ${result.orphanedIds.length} stale agent session(s) (heartbeat threshold ${heartbeatSeconds}s)` +
       (cascaded > 0 ? `; cascade-closed dependents of ${cascaded} workflow(s)` : '')
     )
   }
+  logAgentSweep(sweepStaleAgentSessions(db, heartbeatSeconds, defaultIsAlive))
 
   // ── Stale-active sessions sweep ──
   // Closes sessions.status='active' rows that have had no events past the
@@ -340,7 +346,7 @@ export async function startServer(options: StartServerOptions = {}): Promise<voi
   const SWEEP_INTERVAL_MS = 5 * 60 * 1000
   const sweepTimer = setInterval(() => {
     try {
-      sweepStaleAgentSessions(db, heartbeatSeconds, defaultIsAlive)
+      logAgentSweep(sweepStaleAgentSessions(db, heartbeatSeconds, defaultIsAlive))
       sweepStaleSessions(db, STALE_SESSION_THRESHOLD_SECONDS)
     } catch (err) {
       console.error('[sweep] periodic sweep failed:', err)

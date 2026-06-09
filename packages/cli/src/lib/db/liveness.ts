@@ -46,7 +46,10 @@ export function defaultIsAlive(pid: number): boolean {
     process.kill(pid, 0);
     return true;
   } catch (err) {
-    return (err as NodeJS.ErrnoException).code !== "ESRCH";
+    // Only ESRCH ("no such process") is positive evidence of death. Read the
+    // code via a type guard (no type assertion) — any other error, or a thrown
+    // non-Error, means we cannot prove the process is gone, so: alive.
+    return !(err instanceof Error && "code" in err && err.code === "ESRCH");
   }
 }
 

@@ -128,10 +128,8 @@ export type StaleSessionSweepResult = {
 
 // ── Migration types ──
 
-export type Migration = {
-  version: number;
-  description: string;
-  /** Declarative DDL. Optional when an imperative {@link Migration.run} is used. */
+type MigrationStep = {
+  /** Declarative DDL. */
   sql?: string;
   /**
    * Imperative step for migrations that need conditional logic SQLite can't
@@ -141,6 +139,19 @@ export type Migration = {
    */
   run?: (db: import("./engine.js").Database) => void;
 };
+
+/**
+ * A schema migration. The union requires AT LEAST ONE of `sql` / `run` — an
+ * empty `{ version, description }` that bumps the schema version without doing
+ * anything is unrepresentable. (Both may be present: `sql` runs, then `run`.)
+ */
+export type Migration = {
+  version: number;
+  description: string;
+} & (
+  | (MigrationStep & { sql: string })
+  | (MigrationStep & { run: (db: import("./engine.js").Database) => void })
+);
 
 export type SchemaVersionRow = {
   version: number;
