@@ -46,13 +46,14 @@ const HEARTBEAT_STALE_MS = 60_000
 /**
  * Process-exit sentinels (canonical definitions live in the CLI's
  * `exit-codes` module). The client bundle mirrors the numeric values rather
- * than importing the Node module. A `-4` row is a child command that was
- * stopped because its PARENT workflow closed — a non-failure distinct from a
- * user cancel (`-2`).
+ * than importing the Node module. These are retained only for the legacy
+ * fallback in `getStatus` (rows that predate the server-derived `outcome` /
+ * `cancellation_reason` fields). The cascade-vs-user-cancel distinction is
+ * now read from the typed `entry.cancellation_reason` field instead of
+ * matching a magic exit-code number.
  */
 const CANCEL_EXIT_CODE = -2
 const ORPHAN_EXIT_CODE = -3
-const CASCADE_CLOSE_EXIT_CODE = -4
 
 // ── Fuzzy match helper ──
 
@@ -92,7 +93,7 @@ function getStatus(entry: CommandHistoryEntry): StatusFilter {
   // Legacy fallback for rows that predate the outcome field.
   if (entry.exit_code === 0) return 'success'
   if (entry.exit_code === CANCEL_EXIT_CODE) return 'cancelled'
-  if (entry.exit_code === CASCADE_CLOSE_EXIT_CODE) return 'cancelled'
+  if (entry.cancellation_reason === 'cascade') return 'cancelled'
   if (entry.exit_code === ORPHAN_EXIT_CODE) return 'orphaned'
   return 'fail'
 }
@@ -116,7 +117,7 @@ function statusLabel(s: StatusFilter): string {
  * bucket but read differently so an operator knows which happened.
  */
 function pillLabel(entry: CommandHistoryEntry, status: StatusFilter): string {
-  if (status === 'cancelled' && entry.exit_code === CASCADE_CLOSE_EXIT_CODE) {
+  if (status === 'cancelled' && entry.cancellation_reason === 'cascade') {
     return 'Superseded'
   }
   return statusLabel(status)
@@ -124,7 +125,7 @@ function pillLabel(entry: CommandHistoryEntry, status: StatusFilter): string {
 
 /** Tooltip elaborating a non-obvious pill (e.g. why a row is "Superseded"). */
 function pillTitle(entry: CommandHistoryEntry, status: StatusFilter): string | undefined {
-  if (status === 'cancelled' && entry.exit_code === CASCADE_CLOSE_EXIT_CODE) {
+  if (status === 'cancelled' && entry.cancellation_reason === 'cascade') {
     return 'Stopped because its parent workflow was closed'
   }
   return undefined

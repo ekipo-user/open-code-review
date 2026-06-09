@@ -17,6 +17,7 @@ import type { Server as SocketIOServer, Socket } from 'socket.io'
 import type { Database } from '@open-code-review/cli/db'
 import {
   deriveCommandOutcome,
+  deriveCancellationReason,
   getWorkflowCompletenessForExecution,
 } from '../services/command-outcome.js'
 import type { SessionCaptureService } from '../services/capture/session-capture-service.js'
@@ -1121,6 +1122,9 @@ function finishExecution(
   // it runs AFTER the exit_code UPDATE above so it sees current data.
   const completeness = getWorkflowCompletenessForExecution(db, executionId)
   const outcome = deriveCommandOutcome(code, completeness)
+  // Orthogonal discriminator within the 'cancelled' bucket — kept in sync
+  // with the /history projection so live and replayed rows agree.
+  const cancellationReason = deriveCancellationReason(code)
 
   // Best-effort JSONL backup
   if (entry?.uid) {
@@ -1144,6 +1148,7 @@ function finishExecution(
     exitCode: code,
     finished_at: finishedAt,
     outcome,
+    cancellation_reason: cancellationReason,
   })
 
   activeCommands.delete(executionId)

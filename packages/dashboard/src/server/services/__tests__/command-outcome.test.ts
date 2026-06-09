@@ -1,5 +1,8 @@
 import { describe, it, expect } from 'vitest'
-import { deriveCommandOutcome } from '../command-outcome'
+import {
+  deriveCommandOutcome,
+  deriveCancellationReason,
+} from '../command-outcome'
 
 describe('deriveCommandOutcome', () => {
   it('returns null when the command has not finished', () => {
@@ -42,5 +45,33 @@ describe('deriveCommandOutcome', () => {
       expect(deriveCommandOutcome(0, 'open_no_artifact')).toBe('incomplete')
       expect(deriveCommandOutcome(0, 'in_flight')).toBe('incomplete')
     })
+  })
+})
+
+describe('deriveCancellationReason', () => {
+  it("maps -2 (user cancel) to 'user'", () => {
+    expect(deriveCancellationReason(-2)).toBe('user')
+  })
+
+  it("maps -4 (cascade close) to 'cascade'", () => {
+    expect(deriveCancellationReason(-4)).toBe('cascade')
+  })
+
+  it('returns null for non-cancel exit codes and not-yet-finished', () => {
+    expect(deriveCancellationReason(0)).toBeNull()
+    expect(deriveCancellationReason(1)).toBeNull()
+    expect(deriveCancellationReason(null)).toBeNull()
+    // Other sentinels (e.g. -1 spawn error, -3 orphan) are not cancels.
+    expect(deriveCancellationReason(-1)).toBeNull()
+    expect(deriveCancellationReason(-3)).toBeNull()
+  })
+
+  it("stays orthogonal to outcome: both cancel reasons still bucket to 'cancelled'", () => {
+    // Cross-check the invariant the field exists to support — the 4-value
+    // outcome union is unchanged; cancellation_reason is the discriminator.
+    expect(deriveCommandOutcome(-2, null)).toBe('cancelled')
+    expect(deriveCommandOutcome(-4, null)).toBe('cancelled')
+    expect(deriveCancellationReason(-2)).toBe('user')
+    expect(deriveCancellationReason(-4)).toBe('cascade')
   })
 })

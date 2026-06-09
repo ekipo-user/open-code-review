@@ -18,6 +18,14 @@ export type CommandHistoryEntry = {
    * `ocr state finish`). Absent on rows from older server builds.
    */
   outcome?: 'success' | 'incomplete' | 'failed' | 'cancelled' | null
+  /**
+   * Orthogonal discriminator within the `outcome: 'cancelled'` bucket:
+   * 'user' for an operator cancel (-2), 'cascade' for a child stopped
+   * because its parent workflow closed (-4). Lets the UI label a
+   * "Superseded" row without reaching past `outcome` to match a magic
+   * exit-code number. Absent/null on non-cancelled rows and older builds.
+   */
+  cancellation_reason?: 'user' | 'cascade' | null
   // ── Agent-session journal fields (added by migration v11) ──
   workflow_id?: string | null
   vendor?: string | null

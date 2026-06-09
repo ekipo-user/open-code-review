@@ -7,7 +7,10 @@ import type { Database } from '@open-code-review/cli/db'
 import { getCommandHistory } from '../db.js'
 import { getActiveCommands } from '../socket/command-runner.js'
 import { readEventJournal } from '../services/event-journal.js'
-import { deriveCommandOutcome } from '../services/command-outcome.js'
+import {
+  deriveCommandOutcome,
+  deriveCancellationReason,
+} from '../services/command-outcome.js'
 
 type CommandDefinition = {
   name: string
@@ -80,6 +83,10 @@ export function createCommandsRouter(db: Database, ocrDir: string): Router {
           // single source of truth shared with the live `command:finished`
           // socket event.
           outcome: deriveCommandOutcome(row.exit_code, workflow_completeness),
+          // Orthogonal discriminator within the 'cancelled' bucket so the
+          // client distinguishes a user cancel from a cascade close without
+          // reaching past `outcome` to match a magic exit-code number.
+          cancellation_reason: deriveCancellationReason(row.exit_code),
         }
       })
       res.json(history)

@@ -63,6 +63,25 @@ export function deriveCommandOutcome(
 }
 
 /**
+ * Orthogonal discriminator for the two cancel sentinels that both bucket
+ * into `outcome: 'cancelled'`. Surfaced as a typed `cancellation_reason`
+ * field so the client never needs to reach past `outcome` and match a
+ * magic exit-code number to tell a user cancel from a cascade close.
+ *
+ *  - 'user'    : exit -2 (CANCEL_EXIT_CODE) — operator cancelled the command
+ *  - 'cascade' : exit -4 (CASCADE_CLOSE_EXIT_CODE) — child stopped because
+ *                its parent workflow closed
+ *  - null      : any other exit code (incl. 0, failures, not-yet-finished)
+ */
+export function deriveCancellationReason(
+  exitCode: number | null,
+): 'user' | 'cascade' | null {
+  if (exitCode === CANCEL_EXIT_CODE) return 'user'
+  if (exitCode === CASCADE_CLOSE_EXIT_CODE) return 'cascade'
+  return null
+}
+
+/**
  * Look up the linked workflow's completeness for a command_executions row.
  * Returns `null` when the row has no `workflow_id` or no workflow matches.
  *
