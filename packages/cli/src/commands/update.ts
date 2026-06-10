@@ -9,7 +9,12 @@ import {
   detectInstalledTools,
   type InstallResult,
 } from "../lib/installer.js";
-import { injectIntoProjectFiles } from "../lib/injector.js";
+import {
+  injectIntoProjectFiles,
+  plannedInstructionFiles,
+  findStaleInstructionFiles,
+  formatStaleWarnings,
+} from "../lib/injector.js";
 import { ensureGitignore } from "../lib/gitignore.js";
 import { requireOcrSetup } from "../lib/guards.js";
 import { getConfiguredToolIds, stampCliVersion } from "../lib/cli-config.js";
@@ -46,7 +51,7 @@ export const updateCommand = new Command("update")
     "--skills",
     "Update only skills (includes templates, references, assets)",
   )
-  .option("--inject", "Update only AGENTS.md/CLAUDE.md injection")
+  .option("--inject", "Update only instruction-file injection (AGENTS.md + each tool's native file)")
   .option("--dry-run", "Preview changes without modifying files")
   .action(async (options: UpdateOptions) => {
     const targetDir = process.cwd();
@@ -181,33 +186,39 @@ export const updateCommand = new Command("update")
       }
     }
 
-    // Update AGENTS.md injection
+    // Update instruction-file injection (AGENTS.md + each tool's native file)
     if (updateInject) {
+      const planned = plannedInstructionFiles(toolsToUpdate);
+
       if (options.dryRun) {
         console.log(chalk.dim("  Would update:"));
-        if (existsSync(join(targetDir, "AGENTS.md"))) {
-          console.log(chalk.dim("    • AGENTS.md (OCR managed block)"));
+        for (const path of planned) {
+          const verb = existsSync(join(targetDir, path)) ? "update" : "create";
+          console.log(chalk.dim(`    • ${path} (${verb} OCR managed block)`));
         }
-        if (existsSync(join(targetDir, "CLAUDE.md"))) {
-          console.log(chalk.dim("    • CLAUDE.md (OCR managed block)"));
+        const staleDry = findStaleInstructionFiles(targetDir, planned);
+        for (const warning of formatStaleWarnings(staleDry, "dry-run")) {
+          console.log(chalk.dim(`    • ${warning}`));
         }
         console.log();
       } else {
-        const spinner = ora("Updating AGENTS.md/CLAUDE.md...").start();
+        const spinner = ora("Updating instruction files...").start();
 
-        const injectResults = injectIntoProjectFiles(targetDir);
+        const injectResults = injectIntoProjectFiles(targetDir, toolsToUpdate);
         spinner.stop();
 
-        if (injectResults.agentsMd || injectResults.claudeMd) {
+        if (injectResults.written.length > 0) {
           console.log(chalk.green("  ✓ Instructions updated"));
-          if (injectResults.agentsMd) {
-            console.log(`    ${chalk.green("✓")} AGENTS.md`);
-          }
-          if (injectResults.claudeMd) {
-            console.log(`    ${chalk.green("✓")} CLAUDE.md`);
+          for (const path of injectResults.written) {
+            console.log(`    ${chalk.green("✓")} ${path}`);
           }
         } else {
           console.log(chalk.dim("  No instruction files to update"));
+        }
+
+        const stale = findStaleInstructionFiles(targetDir, injectResults.written);
+        for (const warning of formatStaleWarnings(stale, "update")) {
+          console.log(chalk.yellow(`    ⚠ ${warning}`));
         }
 
         console.log();

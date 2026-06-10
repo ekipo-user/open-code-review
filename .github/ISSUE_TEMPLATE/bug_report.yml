@@ -39,9 +39,21 @@ body:
     attributes:
       label: AI Environment
       description: Which AI coding environment are you using?
+      # Keep this list in sync with AI_TOOLS in packages/cli/src/lib/config.ts
       options:
+        - Amazon Q Developer
+        - Augment (Auggie)
         - Claude Code
+        - Cline
+        - Codex
+        - Continue
         - Cursor
+        - Gemini CLI
+        - GitHub Copilot
+        - Kilo Code
+        - OpenCode
+        - Qoder
+        - RooCode
         - Windsurf
         - Other (specify below)
     validations:

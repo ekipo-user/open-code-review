@@ -1,20 +1,27 @@
-import { Handshake, Swords, Link2, Lightbulb } from 'lucide-react'
+import { Handshake, Swords, Link2, Lightbulb, MessageCircle } from 'lucide-react'
 import { cn } from '../../lib/utils'
 import { MarkdownRenderer } from './markdown-renderer'
 
 type DiscourseType = 'AGREE' | 'CHALLENGE' | 'CONNECT' | 'SURFACE'
 
+type DiscourseConfig = {
+  icon: typeof Handshake
+  borderColor: string
+  bgColor: string
+  label: string
+}
+
 type DiscourseBlockProps = {
-  type: DiscourseType
+  /** Normally one of the four known types, but kept as a free string so an
+   *  unexpected value (legacy artifact, parser change) degrades to a neutral
+   *  block rather than crashing the whole review report. */
+  type: DiscourseType | string
   content: string
   reviewer?: string
   className?: string
 }
 
-const DISCOURSE_CONFIG: Record<
-  DiscourseType,
-  { icon: typeof Handshake; borderColor: string; bgColor: string; label: string }
-> = {
+const DISCOURSE_CONFIG: Record<DiscourseType, DiscourseConfig> = {
   AGREE: {
     icon: Handshake,
     borderColor: 'border-l-emerald-500',
@@ -41,8 +48,27 @@ const DISCOURSE_CONFIG: Record<
   },
 }
 
+/**
+ * Neutral fallback for an unrecognized discourse type. Mirrors the tolerance
+ * `verdict-banner.tsx` already applies to unknown verdicts: render the raw
+ * type as the label rather than throwing on `config.icon` of `undefined`.
+ */
+const UNKNOWN_DISCOURSE_CONFIG: DiscourseConfig = {
+  icon: MessageCircle,
+  borderColor: 'border-l-zinc-400',
+  bgColor: 'bg-zinc-500/5',
+  label: 'Discourse',
+}
+
+export function resolveDiscourseConfig(type: string): DiscourseConfig {
+  const known = DISCOURSE_CONFIG[type as DiscourseType]
+  if (known) return known
+  const label = type.trim()
+  return { ...UNKNOWN_DISCOURSE_CONFIG, label: label || UNKNOWN_DISCOURSE_CONFIG.label }
+}
+
 export function DiscourseBlock({ type, content, reviewer, className }: DiscourseBlockProps) {
-  const config = DISCOURSE_CONFIG[type]
+  const config = resolveDiscourseConfig(type)
   const Icon = config.icon
 
   return (

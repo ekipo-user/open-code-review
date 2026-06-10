@@ -58,28 +58,38 @@ The system SHALL auto-create the SQLite database with full schema when any consu
 
 ### Requirement: Schema Migrations
 
-The system SHALL use a versioned migration system to manage the SQLite schema.
+The system SHALL use a versioned, transactional, idempotent migration system that snapshots the database before applying a major schema change and runs reconciliation as part of the upgrade.
 
 #### Scenario: Version tracking
 
-- **GIVEN** the database is created
 - **WHEN** migrations run
-- **THEN** each applied migration is recorded in the `schema_version` table with version number, timestamp, and description
+- **THEN** each applied migration is recorded in `schema_version` with version, timestamp, and description
 
-#### Scenario: Sequential migrations
+#### Scenario: Sequential, append-only, raw SQL
 
-- **GIVEN** the database is at schema version 2
-- **WHEN** a new version of OCR introduces schema version 3
-- **THEN** only migration 3 runs (not 1 or 2)
-- **AND** the `schema_version` table records version 3
+- **GIVEN** the database is at an earlier schema version
+- **WHEN** a newer OCR introduces later versions
+- **THEN** only the pending migrations run, in order, each in its own transaction
+- **AND** migrations SHALL be raw SQL, sequential, and never modified once shipped
 
-#### Scenario: No ORM
+#### Scenario: Pre-migration snapshot for the v12 upgrade
 
-- **WHEN** migrations are defined
-- **THEN** they SHALL be raw SQL files with no ORM dependency
-- **AND** they SHALL be sequential and append-only (existing migrations are never modified)
+- **GIVEN** an `ocr.db` written by a pre-2.0 version
+- **WHEN** the v12 migration is about to apply
+- **THEN** the system SHALL copy `ocr.db` to `ocr.db.bak.<fromVersion>` before mutating it
 
----
+#### Scenario: Reconciliation runs as part of the upgrade
+
+- **WHEN** the v12 migration applies
+- **THEN** legacy reconciliation SHALL run as part of the upgrade, after the schema (including the close-guard trigger) is installed — reconciliation needs filesystem access for artifact evidence, so it runs in the application's `ensureDatabase` step, not inside the SQL migration
+- **AND** running it after the trigger is safe because (a) the close-guard trigger only fires on an active→closed status change, and (b) reconciliation writes its reason event (`session_legacy_import` / `session_auto_closed_stale`) before any status change, so every reconcile-driven close satisfies the guard
+- **AND** the upgrade SHALL complete without any manual user action
+
+#### Scenario: Crash-safe and idempotent
+
+- **GIVEN** a migration is interrupted mid-apply
+- **WHEN** the next `ocr` invocation opens the database
+- **THEN** the incomplete migration SHALL have rolled back and SHALL re-apply cleanly
 
 ### Requirement: Shared DB Access Layer
 
@@ -262,22 +272,30 @@ All data SHALL survive dashboard restarts, full filesystem re-syncs, CLI upgrade
 
 ### Requirement: SQLite Connection Pragmas
 
-The system SHALL apply specific pragmas on every SQLite connection open.
+The system SHALL apply concurrency and integrity pragmas on every `node:sqlite` connection open, and write transactions SHALL use immediate locking with bounded retry.
 
 #### Scenario: WAL mode
 
 - **WHEN** a connection to `ocr.db` is opened
-- **THEN** `PRAGMA journal_mode = WAL` SHALL be set for concurrent read/write safety
+- **THEN** `PRAGMA journal_mode = WAL` SHALL be set and SHALL take effect on the on-disk file
 
 #### Scenario: Foreign keys
 
 - **WHEN** a connection to `ocr.db` is opened
-- **THEN** `PRAGMA foreign_keys = ON` SHALL be set to enforce referential integrity
+- **THEN** `PRAGMA foreign_keys = ON` SHALL be set
 
-#### Scenario: Busy timeout
+#### Scenario: Busy timeout and synchronous
 
 - **WHEN** a connection to `ocr.db` is opened
-- **THEN** `PRAGMA busy_timeout = 5000` SHALL be set to wait 5 seconds on lock contention
+- **THEN** `PRAGMA busy_timeout = 5000` and `PRAGMA synchronous = NORMAL` SHALL be set
+
+#### Scenario: Immediate write transactions with retry
+
+- **WHEN** a writer opens a transaction
+- **THEN** it SHALL use `BEGIN IMMEDIATE`
+- **AND** on `SQLITE_BUSY` it SHALL retry with bounded backoff (recommended: 5 retries, 50ms backoff)
+
+---
 
 ### Requirement: Source Tracking on Artifact Tables
 
@@ -310,87 +328,30 @@ The `review_rounds` and `map_runs` artifact tables SHALL include a `source` colu
 - **THEN** it SHALL include a `section_count` column (INTEGER, default 0)
 - **AND** it SHALL include a `source` column (TEXT, default NULL)
 
-### Requirement: Agent Sessions Table
-
-The system SHALL maintain an `agent_sessions` table in `.ocr/data/ocr.db` that journals every agent-CLI process the AI declares it has started on behalf of a workflow session, providing the durable record needed for liveness, resume, and per-instance model attribution.
-
-#### Scenario: Table exists with required columns
-
-- **GIVEN** the OCR database is initialized
-- **WHEN** the `agent_sessions` table is inspected
-- **THEN** it SHALL contain at minimum the columns:
-  - `id` (TEXT PRIMARY KEY) — OCR-owned UUID
-  - `workflow_id` (TEXT NOT NULL, FK to `sessions.id`, ON DELETE RESTRICT)
-  - `vendor` (TEXT NOT NULL) — e.g. `claude`, `opencode`, `gemini`
-  - `vendor_session_id` (TEXT, nullable) — the underlying CLI's session id, recorded once known
-  - `persona` (TEXT, nullable) — e.g. `principal`, `architect`
-  - `instance_index` (INTEGER, nullable) — 1-based ordinal within `(workflow_id, persona)`
-  - `name` (TEXT, nullable) — `{persona}-{instance_index}` by default; user-overridable
-  - `resolved_model` (TEXT, nullable) — exact string passed to `--model` after alias resolution
-  - `phase` (TEXT, nullable)
-  - `status` (TEXT NOT NULL) — one of `spawning`, `running`, `done`, `crashed`, `cancelled`, `orphaned`
-  - `pid` (INTEGER, nullable)
-  - `started_at` (TEXT NOT NULL) — ISO 8601
-  - `last_heartbeat_at` (TEXT NOT NULL) — ISO 8601
-  - `ended_at` (TEXT, nullable) — ISO 8601
-  - `exit_code` (INTEGER, nullable)
-  - `notes` (TEXT, nullable) — free-form, e.g. structured warnings about host CLI limitations
-
-#### Scenario: Indexes exist for common queries
-
-- **GIVEN** the `agent_sessions` table is created
-- **WHEN** indexes are inspected
-- **THEN** the system SHALL maintain at minimum:
-  - `idx_agent_sessions_workflow` on `(workflow_id)` for per-workflow listing
-  - `idx_agent_sessions_status_heartbeat` on `(status, last_heartbeat_at)` for liveness sweeps
-
-#### Scenario: Workflow deletion is restricted while agent_sessions exist
-
-- **GIVEN** a workflow `sessions` row has at least one `agent_sessions` child row
-- **WHEN** an attempt is made to delete the workflow row
-- **THEN** the delete SHALL be rejected by the foreign-key constraint
-- **AND** the audit trail SHALL remain intact
-
----
-
 ### Requirement: WAL Hygiene on Dashboard Startup
 
-The system SHALL attempt to checkpoint the on-disk SQLite write-ahead-log before the dashboard process accepts client connections, so that stale `.db-wal` files left behind by external native clients (e.g. the `sqlite3` CLI, database GUIs, prior native-driver builds) do not persist across sessions.
+The system SHALL checkpoint the on-disk SQLite write-ahead log before the
+dashboard process accepts client connections, so that a stale or unbounded
+`.db-wal` does not persist across sessions.
 
-OCR's primary engine is sql.js (WASM, in-memory), which loads the entire database into memory and serializes it back to disk via atomic file rename. sql.js does not produce its own WAL file. The implementation is therefore a best-effort cleanup against any WAL produced by *other* clients that happen to open the same DB file.
+The engine is Node's built-in `node:sqlite` (WAL mode), so the dashboard issues
+the checkpoint **directly against its own connection** (`walCheckpointTruncate`
+in `packages/cli/src/lib/db/index.ts`) — no external `sqlite3` shellout is
+required.
 
-#### Scenario: Native sqlite3 is on PATH
-
-- **GIVEN** the dashboard process is starting
-- **AND** the native `sqlite3` binary is available on PATH
-- **WHEN** initialization reaches the database-readiness step, before sql.js opens the file
-- **THEN** the system SHALL invoke `sqlite3 <db-path> "PRAGMA wal_checkpoint(TRUNCATE);"` against `.ocr/data/ocr.db`
-- **AND** any stale `.db-wal` shall be reclaimed by the native client
-
-#### Scenario: Native sqlite3 is unavailable
+#### Scenario: Dashboard checkpoints the WAL at startup
 
 - **GIVEN** the dashboard process is starting
-- **AND** the native `sqlite3` binary is not on PATH
 - **WHEN** initialization reaches the database-readiness step
-- **THEN** the WAL checkpoint step SHALL be skipped without error
-- **AND** the system SHALL continue startup normally
+- **THEN** the system SHALL issue `PRAGMA wal_checkpoint(TRUNCATE)` against `.ocr/data/ocr.db` via its own node:sqlite connection
 
 #### Scenario: WAL checkpoint failure does not block startup
 
 - **GIVEN** the dashboard process is starting
-- **AND** the native `sqlite3` invocation exits non-zero (e.g. permissions, locked file)
-- **WHEN** the WAL checkpoint step completes
+- **AND** the checkpoint raises (e.g. permissions, a locked file)
+- **WHEN** the checkpoint step completes
 - **THEN** the system SHALL continue startup normally
 - **AND** the failure SHALL NOT raise an exception or terminate the process
-
-#### Scenario: Future native-SQLite engine performs the checkpoint directly
-
-- **GIVEN** OCR has been migrated to a native SQLite engine (e.g. `better-sqlite3`)
-- **WHEN** dashboard startup runs the WAL checkpoint
-- **THEN** the system SHALL issue `PRAGMA wal_checkpoint(TRUNCATE)` directly against its primary connection
-- **AND** the external `sqlite3` shellout SHALL no longer be required
-
----
 
 ### Requirement: Liveness Sweep on Startup
 
@@ -414,29 +375,169 @@ The system SHALL run an `agent_sessions` liveness sweep before the dashboard pro
 
 ### Requirement: Concurrent Writer Serialization
 
-The system SHALL serialize concurrent writes to `.ocr/data/ocr.db` from the CLI process and the dashboard process via the established merge-before-write pattern, so that neither writer's changes are silently overwritten by the other.
+The system SHALL serialize concurrent writes to `.ocr/data/ocr.db` from the CLI
+process and the dashboard process via the engine's WAL locking, so that neither
+writer's changes are silently overwritten by the other.
 
-OCR's current SQLite engine is sql.js (WASM, in-memory). Each process loads the DB into its own memory, mutates locally, and persists via atomic file rename. Cross-process atomicity is therefore not provided by SQL transactions but by file-level merge semantics, owned by `DbSyncWatcher` in the dashboard server and the global save hooks (`registerSaveHooks` in `packages/dashboard/src/server/db.ts`).
+The engine is Node's built-in `node:sqlite` in WAL mode. Cross-process atomicity
+is provided by SQLite's own single-writer/multi-reader WAL locking and SQL
+transactions — **not** by any file-level merge layer. The former `sql.js`
+merge-before-write path (`DbSyncWatcher`, `registerSaveHooks`, the save hooks) is
+retired.
 
-#### Scenario: Dashboard merges CLI changes before writing
+#### Scenario: Writers acquire the write lock up front
 
-- **GIVEN** the CLI has written to `.ocr/data/ocr.db` while the dashboard server is running
-- **WHEN** the dashboard next saves its in-memory database
-- **THEN** the dashboard SHALL re-read the on-disk file via `DbSyncWatcher`, merge any external changes into its in-memory state, and only then write its own atomic rename
-- **AND** the resulting on-disk file SHALL contain both the CLI's and the dashboard's changes
+- **GIVEN** a process opens a write transaction
+- **WHEN** the transaction begins
+- **THEN** it SHALL use `BEGIN IMMEDIATE` (acquire the write lock up front) rather than deferred mode
+- **AND** it SHALL retry on `SQLITE_BUSY` (errcode 5 / 261) with bounded backoff (5 retries × 50ms)
 
-#### Scenario: Save hook sequencing
+#### Scenario: A contended write waits out a held lock rather than failing
 
-- **GIVEN** any consumer in the dashboard process invokes `saveDb`
-- **WHEN** the save executes
-- **THEN** the registered pre-save hook SHALL run (`syncFromDisk`) followed by the registered post-save hook (`markOwnWrite`)
-- **AND** the watcher's "own writes" tracker SHALL NOT trigger a redundant resync on the very file the dashboard just wrote
+- **GIVEN** one process holds the WAL write lock
+- **WHEN** a second process opens its own write transaction against the same DB
+- **THEN** the second writer SHALL block (via `busy_timeout` + the bounded retry) until the lock is released, then commit
+- **AND** both writers' changes SHALL be durably present — neither is lost to contention
 
-#### Scenario: Migration to native SQLite adopts BEGIN IMMEDIATE
+### Requirement: Event Log as Lifecycle Source of Truth
 
-- **GIVEN** OCR has been migrated to a native SQLite engine that supports cross-process file locking
-- **WHEN** any writer opens a transaction
-- **THEN** writers SHALL use `BEGIN IMMEDIATE` rather than the default deferred mode
-- **AND** writers SHALL retry on `SQLITE_BUSY` with bounded backoff (recommended: 5 retries with 50ms backoff)
-- **AND** the merge-before-write pattern MAY be retired in favor of native serialization
+The `orchestration_events` log SHALL be the single source of truth for session lifecycle (status, current phase, current round, current map run, completion). The `sessions` table SHALL be a projection derived from the event log, never written independently of the event that justifies it.
+
+#### Scenario: Lifecycle mutation is atomic with its event
+
+- **WHEN** a lifecycle mutation occurs (e.g. phase advance, round completion, finish)
+- **THEN** the corresponding `orchestration_events` row and the `sessions` projection update SHALL be committed in a single `node:sqlite` transaction
+- **AND** the projection SHALL never reflect a lifecycle fact absent from the event log
+
+#### Scenario: Completion is derived, not asserted
+
+- **WHEN** a consumer needs to know whether a review round is complete
+- **THEN** completeness SHALL be derived from the existence of a `round_completed` event for the current round
+- **AND** there SHALL be no independently-writable boolean "complete" flag that can disagree with the log
+
+#### Scenario: Projection is rebuildable from the log
+
+- **GIVEN** the `sessions` projection for a session
+- **WHEN** it is recomputed from that session's `orchestration_events`
+- **THEN** the recomputed status, phase, round, and map run SHALL equal the stored projection
+
+---
+
+### Requirement: Event Type Taxonomy Constraint
+
+The system SHALL constrain `orchestration_events.event_type` to a closed, canonical vocabulary at the database layer so that a typo cannot silently corrupt lifecycle derivation.
+
+#### Scenario: Known event types are accepted
+
+- **WHEN** an event with `event_type` in {`session_created`, `session_resumed`, `round_started`, `phase_transition`, `round_completed`, `map_completed`, `session_closed`, `session_aborted`, `session_auto_closed_stale`, `session_synced`, `session_legacy_import`} is inserted
+- **THEN** the insert SHALL succeed
+
+#### Scenario: Unknown event type is rejected
+
+- **WHEN** an event with an `event_type` outside the canonical vocabulary (e.g. `round_complete`) is inserted
+- **THEN** the database SHALL reject the insert
+- **AND** lifecycle derivation SHALL be protected from the typo
+
+---
+
+### Requirement: Session Completion Invariant Enforcement
+
+The system SHALL enforce, at the database layer, that a session cannot be marked `closed` without either a terminal artifact event for its current round/run or an explicit reason event, so that "completed too soon" is unrepresentable even via direct SQL.
+
+#### Scenario: Close with a completed round is allowed
+
+- **GIVEN** a review session whose current round has a `round_completed` event
+- **WHEN** its `status` is set to `closed`
+- **THEN** the update SHALL succeed
+
+#### Scenario: Silent premature close is rejected
+
+- **GIVEN** a review session whose current round has no `round_completed` event
+- **WHEN** an attempt is made to set `status = 'closed'` with no reason event present
+- **THEN** the database SHALL abort the update
+
+#### Scenario: Explicit non-artifact close is allowed via reason event
+
+- **GIVEN** a session being aborted, auto-closed for staleness, synced, or legacy-imported
+- **WHEN** `status` is set to `closed` together with the corresponding reason event (`session_aborted`, `session_auto_closed_stale`, `session_synced`, or `session_legacy_import`)
+- **THEN** the update SHALL succeed
+- **AND** the session SHALL carry a queryable record of why it closed without an artifact
+
+---
+
+### Requirement: Session Completeness View
+
+The system SHALL expose a `session_completeness` view that derives, per session, whether it is genuinely complete and — when not — which obligations are unmet, as the published contract consumed by the dashboard and the agent `status` command.
+
+`completeness_state` is an intentional hybrid of the mutable `status` column (marked closed) and append-only event evidence (the terminal artifact event). This is sound because the close-guard trigger makes the `status` column trustworthy — a row can only reach `status = 'closed'` with a completed round/run or an explicit reason event — so reading the column is not a regression to a mutable flag that could lie.
+
+#### Scenario: View reports completeness state
+
+- **WHEN** the `session_completeness` view is queried for a session
+- **THEN** it SHALL return a `completeness_state` of one of `complete`, `closed_without_artifact`, `in_flight`, or `open_no_artifact`
+- **AND** it SHALL return per-obligation booleans (terminal artifact present, marked closed, dependents settled)
+
+#### Scenario: Premature completion is a single-query detection
+
+- **WHEN** the view is queried with `completeness_state = 'closed_without_artifact'`
+- **THEN** it SHALL return exactly the sessions that were closed without a completed round/run
+- **AND** this query SHALL be the canonical detection for the "completed too soon" condition
+
+---
+
+### Requirement: Automatic Legacy State Reconciliation
+
+The system SHALL provide an idempotent reconciliation that derives true lifecycle state from the event log and filesystem artifacts and repairs the projection, run automatically during migration and on demand via `ocr state reconcile`.
+
+#### Scenario: Synthesize completion from a provable artifact
+
+- **GIVEN** a legacy session closed without a `round_completed` event
+- **AND** the latest round directory contains a `final.md`
+- **WHEN** reconciliation runs
+- **THEN** it SHALL synthesize a `round_completed` event for that round from the artifact
+- **AND** it SHALL record a reconciliation event documenting the synthesis
+
+#### Scenario: Grandfather when completion cannot be proven
+
+- **GIVEN** a legacy closed session with no `round_completed` event and no `final.md`
+- **WHEN** reconciliation runs
+- **THEN** it SHALL emit a `session_legacy_import` reason event rather than fabricate completion
+- **AND** the close SHALL satisfy the completion-invariant via that reason event
+
+#### Scenario: Dry run reports the plan without writing
+
+- **WHEN** `ocr state reconcile --dry-run` runs
+- **THEN** it SHALL print every repair it would perform
+- **AND** it SHALL make no changes to the database
+
+#### Scenario: Reconciliation is idempotent
+
+- **WHEN** reconciliation runs twice in succession
+- **THEN** the second run SHALL make no further changes
+
+### Requirement: Built-in SQLite Engine
+
+OCR's SQLite engine SHALL be Node's built-in `node:sqlite` (`DatabaseSync`,
+on-disk, WAL) — **not** a native dependency. There SHALL be no native module, no
+prebuilt binary, and no dependency install script, so the engine is present on
+any supported runtime without a build step. This requires **Node >= 22.5** (when
+`node:sqlite` landed). The engine is accessed only through the `Database` adapter
+seam (`db/engine.ts`); no consumer reaches the underlying handle.
+
+#### Scenario: The engine is the built-in, with no native dependency
+
+- **WHEN** the CLI or dashboard opens the database
+- **THEN** it SHALL load `node:sqlite` (not `better-sqlite3` or any native addon)
+- **AND** there SHALL be no prebuilt binary or install script involved
+
+#### Scenario: WAL pragmas are applied on open
+
+- **WHEN** a connection is opened via the engine
+- **THEN** it SHALL apply `journal_mode = WAL`, `foreign_keys = ON`, `busy_timeout = 5000`, `synchronous = NORMAL`
+
+#### Scenario: A too-old runtime fails with a clear message
+
+- **GIVEN** a runtime older than Node 22.5
+- **WHEN** the engine is loaded (from any entry point — the bin, the `./db` subpath, or the dashboard server)
+- **THEN** it SHALL raise an actionable "requires Node >= 22.5" error, not an opaque module-load failure
 

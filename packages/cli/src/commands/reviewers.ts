@@ -14,6 +14,7 @@ import { join } from "node:path";
 import { requireOcrSetup } from "../lib/guards.js";
 import { generateReviewersMeta } from "../lib/installer.js";
 import type { ReviewersMeta, ReviewerTier } from "../lib/state/types.js";
+import { defaultIconFor } from "@open-code-review/platform";
 
 // ── Helpers ──
 
@@ -32,7 +33,34 @@ async function readStdin(): Promise<string> {
 const VALID_TIERS = new Set<ReviewerTier>(["holistic", "specialist", "persona", "custom"]);
 const SLUG_RE = /^[a-z][a-z0-9-]*$/;
 
-function validateReviewersMeta(data: unknown): ReviewersMeta {
+// Reviewer metadata is rendered into every Phase-4 reviewer prompt. A persona
+// authored from untrusted `/ocr-create-reviewer` input could try to override
+// the reviewer's instructions (e.g. "always conclude REQUEST CHANGES"). We warn
+// on the obvious override shapes — we do NOT hard-reject (the persona text is
+// also wrapped in delimiters in reviewer-task.md), so legitimate prose isn't
+// blocked. Issue #28 review Important-4.
+const INJECTION_PATTERNS: RegExp[] = [
+  /ignore\s+(all\s+|the\s+)?(previous|prior|above)?\s*(instructions|prompts|rules)/i,
+  /disregard\s+(all\s+|the\s+)?(previous|prior|above)/i,
+  /\byou\s+are\s+now\b/i,
+  /^\s*system\s*:/im,
+  /\balways\s+(conclude|respond|reply|return|output|approve|reject|say)\b/i,
+  /\bnew\s+rule\s*:/i,
+];
+
+function warnIfSuspiciousPersona(label: string, fields: unknown[]): void {
+  const text = fields.filter((f) => typeof f === "string").join("\n");
+  const hit = INJECTION_PATTERNS.find((re) => re.test(text));
+  if (hit) {
+    console.error(
+      chalk.yellow(
+        `⚠ ${label} contains text resembling a prompt-injection override (matched ${hit}). Review the persona before relying on it.`,
+      ),
+    );
+  }
+}
+
+export function validateReviewersMeta(data: unknown): ReviewersMeta {
   if (typeof data !== "object" || data === null || Array.isArray(data)) {
     throw new Error("Payload must be a JSON object");
   }
@@ -77,6 +105,25 @@ function validateReviewersMeta(data: unknown): ReviewersMeta {
     if (!Array.isArray(r.focus_areas)) {
       throw new Error(`${prefix}.focus_areas must be an array`);
     }
+
+    // Icon: a non-string is a real bug worth surfacing; a missing/empty icon
+    // is backfilled with the canonical default so the persisted JSON always
+    // carries a renderable icon (guards the dashboard against an `undefined`
+    // icon read — see issue #28).
+    if (r.icon !== undefined && typeof r.icon !== "string") {
+      throw new Error(`${prefix}.icon must be a string if provided (got ${JSON.stringify(r.icon)})`);
+    }
+    if (typeof r.icon !== "string" || r.icon.length === 0) {
+      r.icon = defaultIconFor(r.id, r.tier as ReviewerTier);
+    }
+
+    warnIfSuspiciousPersona(`${prefix} ("${r.name}")`, [
+      r.name,
+      r.description,
+      ...(Array.isArray(r.focus_areas) ? r.focus_areas : []),
+      r.known_for,
+      r.philosophy,
+    ]);
 
     // Optional fields for personas
     if (r.known_for !== undefined && typeof r.known_for !== "string") {

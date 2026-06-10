@@ -13,6 +13,7 @@ import { updateCommand } from "./commands/update";
 import { dashboardCommand } from "./commands/dashboard";
 import { doctorCommand } from "./commands/doctor";
 import { reviewersCommand } from "./commands/reviewers";
+import { hostCommand } from "./commands/host";
 import { checkForUpdate, printUpdateNotification } from "./lib/update-check.js";
 import { checkLocalArtifactVersion, printLocalVersionHint } from "./lib/cli-config.js";
 import { CLI_VERSION } from "./lib/version.js";
@@ -42,6 +43,7 @@ program.addCommand(updateCommand);
 program.addCommand(dashboardCommand);
 program.addCommand(doctorCommand);
 program.addCommand(reviewersCommand);
+program.addCommand(hostCommand);
 
 await program.parseAsync();
 

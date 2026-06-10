@@ -2,7 +2,13 @@ import { resolve } from "node:path";
 import { writeFileSync, mkdtempSync, rmSync, realpathSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { describe, it, expect, afterAll } from "vitest";
-import { importModule, execBinary, execBinaryAsync } from "../index.js";
+import {
+  importModule,
+  execBinary,
+  execBinaryAsync,
+  defaultIconFor,
+  BUILTIN_ICON_MAP,
+} from "../index.js";
 
 /**
  * Behavioral tests for platform utilities.
@@ -127,5 +133,30 @@ describe("spawnBinary", () => {
     });
 
     expect(output).toBe(tmpDir);
+  });
+});
+
+describe("defaultIconFor", () => {
+  it("returns the mapped glyph for a built-in reviewer id", () => {
+    expect(defaultIconFor("architect", "holistic")).toBe("blocks");
+    expect(defaultIconFor("security", "specialist")).toBe("shield-alert");
+    expect(defaultIconFor("docs-writer", "specialist")).toBe("file-text");
+  });
+
+  it("falls back to 'brain' for an unknown persona", () => {
+    expect(defaultIconFor("unknown-persona", "persona")).toBe("brain");
+  });
+
+  it("falls back to 'user' for an unknown non-persona reviewer", () => {
+    expect(defaultIconFor("my-custom-reviewer", "custom")).toBe("user");
+    expect(defaultIconFor("whatever", "specialist")).toBe("user");
+  });
+
+  it("never returns an empty string", () => {
+    for (const id of ["", "x", "architect", ...Object.keys(BUILTIN_ICON_MAP)]) {
+      for (const tier of ["holistic", "specialist", "persona", "custom"]) {
+        expect(defaultIconFor(id, tier).length).toBeGreaterThan(0);
+      }
+    }
   });
 });

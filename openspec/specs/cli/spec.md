@@ -223,38 +223,6 @@ The CLI SHALL provide clear error messages for common failure scenarios.
 
 ---
 
-### Requirement: AGENTS.md Instruction Injection
-
-The CLI SHALL inject OCR instructions into the user's `AGENTS.md` and `CLAUDE.md` files during initialization, following the OpenSpec managed block pattern.
-
-#### Scenario: First-time injection
-
-- **GIVEN** user runs `ocr init` in a project without OCR instructions
-- **WHEN** installation completes
-- **THEN** a managed block `<!-- OCR:START -->...<!-- OCR:END -->` is appended to `AGENTS.md`
-- **AND** the same block is appended to `CLAUDE.md` if it exists or is created
-
-#### Scenario: Update existing instructions
-
-- **GIVEN** `AGENTS.md` already contains an OCR managed block
-- **WHEN** user runs `ocr init` again
-- **THEN** the existing managed block is replaced with the updated version
-- **AND** content outside the managed block is preserved
-
-#### Scenario: Instruction content
-
-- **GIVEN** the OCR managed block is injected
-- **WHEN** an AI assistant reads `AGENTS.md`
-- **THEN** the block instructs the assistant to open `.ocr/AGENTS.md` for code review requests
-
-#### Scenario: Skip injection with flag
-
-- **GIVEN** user runs `ocr init --no-inject`
-- **WHEN** installation completes
-- **THEN** `AGENTS.md` and `CLAUDE.md` are not modified
-
----
-
 ### Requirement: Agents Package Dependency
 
 The CLI SHALL depend on the `@open-code-review/agents` package for skill files, commands, and reviewer personas.
@@ -633,53 +601,10 @@ The dashboard code SHALL NOT be loaded unless the user runs `ocr dashboard`. Com
 
 #### Scenario: Dashboard dependencies isolated
 
-- **GIVEN** the dashboard adds significant dependencies (React, Socket.IO, sql.js client bundle)
+- **GIVEN** the dashboard pulls in heavy client dependencies (such as its UI framework, real-time transport, and any diagramming library)
 - **WHEN** user runs `ocr init` or `ocr progress`
 - **THEN** none of these dependencies are loaded
 - **AND** CLI startup time is unaffected
-
----
-
-### Requirement: OCR State Round-Complete Command
-
-The `ocr state round-complete` CLI subcommand SHALL accept structured review round data, validate it, optionally write `round-meta.json`, and record a `round_completed` orchestration event.
-
-#### Scenario: Stdin mode (recommended)
-
-- **GIVEN** a review round has completed
-- **WHEN** the orchestrator pipes structured JSON to `ocr state round-complete --stdin`
-- **THEN** the CLI SHALL:
-  - Parse and validate the JSON against the `RoundMeta` schema (`schema_version`, `verdict`, `reviewers` array with findings)
-  - Derive finding counts from the findings array (never trust self-reported counts)
-  - Write `round-meta.json` to the correct session round directory (`{session_dir}/rounds/round-{n}/round-meta.json`)
-  - Insert a `round_completed` event into `orchestration_events` with metadata containing derived counts and `source: "orchestrator"`
-  - Return the session ID, round number, and written file path
-
-#### Scenario: File mode
-
-- **GIVEN** a `round-meta.json` file already exists on disk
-- **WHEN** the user runs `ocr state round-complete --file <path>`
-- **THEN** the CLI SHALL read and validate the file, record the orchestration event, but NOT write the file (it already exists)
-- **AND** the returned result SHALL have `metaPath` as undefined
-
-#### Scenario: Auto-detect session and round
-
-- **GIVEN** neither `--session-id` nor `--round` is provided
-- **WHEN** `ocr state round-complete` runs
-- **THEN** the CLI SHALL auto-detect the active session and use its `current_round`
-
-#### Scenario: Invalid schema
-
-- **GIVEN** the piped JSON has `schema_version` other than 1 or is missing required fields
-- **WHEN** `ocr state round-complete --stdin` processes the input
-- **THEN** the CLI SHALL throw a validation error with a descriptive message
-
-#### Scenario: Mutual exclusion
-
-- **WHEN** neither `--file` nor `--stdin` is provided, or both are provided
-- **THEN** the CLI SHALL exit with an error explaining that exactly one source is required
-
----
 
 ### Requirement: OCR State Map-Complete Command
 
@@ -932,4 +857,198 @@ The CLI's `ocr review` command SHALL accept a `--resume <workflow-session-id>` f
 - **WHEN** user runs `ocr review --resume <workflow-session-id>`
 - **THEN** the system SHALL print a clear message that no resume token is available
 - **AND** SHALL exit with a non-zero status without spawning the host CLI
+
+### Requirement: Instruction File Injection
+
+The CLI SHALL inject OCR instructions into project instruction files based on the selected tools, following the OpenSpec managed block pattern. The CLI SHALL always write the universal `AGENTS.md`, and additionally write each selected tool's native instruction file(s) as declared by `AIToolConfig.instructionFiles`. The CLI SHALL NOT write a tool-specific instruction file for a tool that was not selected — in particular, `CLAUDE.md` is written only when Claude Code is selected. A file shared by the selection (such as `AGENTS.md`) SHALL be written at most once.
+
+#### Scenario: AGENTS.md is always written
+
+- **GIVEN** user runs `ocr init` selecting any set of tools with injection enabled
+- **WHEN** installation completes
+- **THEN** a managed block `<!-- OCR:START -->...<!-- OCR:END -->` is appended to `AGENTS.md` (created if absent)
+
+#### Scenario: Claude Code selected
+
+- **GIVEN** user runs `ocr init` and Claude Code is among the selected tools
+- **WHEN** installation completes
+- **THEN** the managed block is also written to `CLAUDE.md`
+
+#### Scenario: Non-Claude tool gets its native file, not CLAUDE.md
+
+- **GIVEN** user runs `ocr init` selecting only Gemini CLI
+- **WHEN** installation completes
+- **THEN** the managed block is written to `GEMINI.md`
+- **AND** no `CLAUDE.md` is created
+
+#### Scenario: Tool that reads AGENTS.md natively gets no extra file
+
+- **GIVEN** user runs `ocr init` selecting only Codex
+- **WHEN** installation completes
+- **THEN** only `AGENTS.md` receives the managed block and no tool-specific instruction file is created
+
+#### Scenario: Non-markdown instruction file uses plaintext markers
+
+- **GIVEN** user runs `ocr init` selecting Windsurf, whose native file is `.windsurfrules`
+- **WHEN** installation completes
+- **THEN** the managed block in `.windsurfrules` is delimited by line-comment markers (`# OCR:START` / `# OCR:END`) rather than HTML-comment markers
+
+#### Scenario: Update existing instructions
+
+- **GIVEN** an instruction file already contains an OCR managed block
+- **WHEN** user runs `ocr init` or `ocr update` again
+- **THEN** the existing managed block is replaced with the updated version
+- **AND** content outside the managed block is preserved
+
+#### Scenario: Stale instruction file is reported, not deleted
+
+- **GIVEN** a `CLAUDE.md` contains an OCR managed block but Claude Code is no longer a configured tool
+- **WHEN** user runs `ocr update`
+- **THEN** the CLI warns that the file holds a stale OCR block
+- **AND** the CLI does not delete or rewrite the file
+
+#### Scenario: Skip injection with flag
+
+- **GIVEN** user runs `ocr init --no-inject`
+- **WHEN** installation completes
+- **THEN** no instruction files are created or modified
+
+### Requirement: Tool Instruction-File Mapping
+
+The CLI SHALL maintain, as part of each tool's `AIToolConfig`, the tool's native instruction file(s) (`instructionFiles`) beyond the universal `AGENTS.md`. This mapping is the single source of truth that drives instruction injection, so that supporting a new tool is a configuration-only change. A tool that reads `AGENTS.md` natively SHALL declare no additional instruction file.
+
+#### Scenario: Native file declared per tool
+
+- **WHEN** the tool registry is consulted for injection
+- **THEN** Claude Code maps to `CLAUDE.md`, Gemini CLI to `GEMINI.md`, GitHub Copilot to `.github/copilot-instructions.md`, and Windsurf to `.windsurfrules`
+- **AND** Codex, OpenCode, and Cursor declare no additional file (they read `AGENTS.md`)
+
+#### Scenario: Each instruction file declares its format
+
+- **WHEN** an instruction file is a non-markdown file such as `.windsurfrules`
+- **THEN** its mapping declares a `plaintext` format so the injector uses line-comment managed-block markers
+
+### Requirement: Host Capability Query Command
+
+The CLI SHALL provide `ocr host capabilities` so the review skill can determine, at runtime, how to run Phase 4 on its host. The command SHALL report, per tool, whether the host can spawn sub-agents (`subagentSpawn`) and vary the model per task (`perTaskModel`), plus the implied Phase-4 strategy. A host that does not declare capabilities SHALL resolve to the conservative default (no sub-agent spawn, no per-task model), so the skill never assumes a Claude-style Task tool exists.
+
+#### Scenario: Query a single host as JSON
+
+- **WHEN** a user or the skill runs `ocr host capabilities --tool gemini --json`
+- **THEN** the output SHALL be a JSON object including `subagentSpawn: false`, `perTaskModel: false`, and `phase4: "sequential"`
+
+#### Scenario: Capable host reports parallel strategy
+
+- **WHEN** `ocr host capabilities --tool claude --json` is run
+- **THEN** the output SHALL include `subagentSpawn: true` and `phase4: "parallel-subagents"`
+
+#### Scenario: Every supported tool resolves to a complete descriptor
+
+- **WHEN** `ocr host capabilities --json` is run with no `--tool`
+- **THEN** every supported tool SHALL appear with boolean `subagentSpawn` and `perTaskModel` values — no host is omitted or left undefined
+
+#### Scenario: Unknown tool id is rejected
+
+- **WHEN** `ocr host capabilities --tool nonsense` is run
+- **THEN** the command SHALL exit non-zero with an error listing the valid tool ids
+
+### Requirement: Atomic State Lifecycle Commands
+
+The CLI SHALL provide a semantic, atomic porcelain for workflow lifecycle so that orchestrating agents make correct state updates by default and cannot leave a round partially completed. Each command SHALL perform all of its mutations within a single database transaction.
+
+#### Scenario: Begin starts or resumes a workflow
+
+- **WHEN** an agent runs `ocr state begin --workflow-type review`
+- **THEN** the command SHALL create or resume the session and emit JSON `{session_id, round, phase, completeness}`
+- **AND** session resolution SHALL follow `--session-id` → `OCR_DASHBOARD_EXECUTION_UID` → single active session, refusing when more than one active session exists and none is specified
+
+#### Scenario: Advance validates the phase graph and derives the phase number
+
+- **WHEN** an agent runs `ocr state advance --phase reviews`
+- **THEN** the command SHALL reject the transition if it is not a legal edge for the session's workflow type
+- **AND** the phase number SHALL be derived from the phase name (no separate `--phase-number` argument is required)
+
+#### Scenario: Complete-round is atomic and invariant-checked
+
+- **WHEN** an agent pipes round metadata to `ocr state complete-round --stdin`
+- **THEN** the command SHALL, in one transaction, validate the metadata, assert the session has reached `synthesis`, write `round-meta.json`, append a `round_completed` event, advance `current_round`, and transition the phase to `complete`
+- **AND** if any precondition fails, the command SHALL make no changes and exit with the invariant-unmet code
+- **AND** re-running it for an already-completed round SHALL be a safe no-op
+
+#### Scenario: Complete-map is atomic for map runs
+
+- **WHEN** an agent pipes map metadata to `ocr state complete-map --stdin`
+- **THEN** the command SHALL atomically write `map-meta.json`, append a `map_completed` event for the current map run, and transition the phase to `complete`
+
+#### Scenario: Finish refuses to close an incomplete session
+
+- **WHEN** an agent runs `ocr state finish`
+- **AND** the current round has no `round_completed` event
+- **THEN** the command SHALL refuse with the invariant-unmet code and SHALL NOT close the session
+
+#### Scenario: Finish with abort records an explicit reason
+
+- **WHEN** an agent runs `ocr state finish --abort`
+- **THEN** the session SHALL be closed with a `session_aborted` event
+- **AND** the closed session SHALL never be reported as a successful completion
+
+#### Scenario: Status reports completeness and what is missing
+
+- **WHEN** an agent runs `ocr state status --json`
+- **THEN** the command SHALL return the session's `completeness_state`, per-obligation booleans, and a `next_action` string describing how to finish
+
+---
+
+### Requirement: State Command Exit Code Taxonomy
+
+State lifecycle commands SHALL use a stable, documented exit-code taxonomy so that an orchestrating agent can branch on the failure class without parsing prose.
+
+#### Scenario: Distinct codes per failure class
+
+- **WHEN** a state command fails
+- **THEN** it SHALL exit with `2` for usage errors, `3` for ambiguous session resolution, `4` for session-not-found, `5` for an illegal phase transition, `6` for an unmet invariant, `7` for schema-invalid input, and `8` for database-busy past the retry budget
+- **AND** it SHALL exit `0` only on success
+
+#### Scenario: Ambiguity is a typed refusal
+
+- **GIVEN** more than one active session exists and no `--session-id` is provided
+- **WHEN** a state command resolves the session
+- **THEN** it SHALL exit with code `3` and name the candidate sessions
+
+#### Scenario: Busy is the retry signal
+
+- **WHEN** a transaction surfaces `SQLITE_BUSY` past the bounded retry budget
+- **THEN** the command SHALL exit with code `8`, signalling the orchestrator to wait briefly and retry the same call
+
+### Requirement: Engine Distribution and Runtime Floor
+
+The CLI SHALL install and run with a working SQLite engine under any package
+manager (npm, pnpm including 10+, yarn) with **no native build step and no
+install script**, and SHALL fail clearly on an unsupported runtime rather than
+crashing. (The engine itself — Node's built-in `node:sqlite` — is specified
+under the `sqlite-state` capability; this requirement covers distribution and
+the runtime floor.)
+
+#### Scenario: Installs with no native build under any package manager
+
+- **WHEN** the CLI is installed with npm, pnpm (incl. 10+ with build scripts blocked), or yarn
+- **THEN** no native module is compiled and no install script runs
+- **AND** `ocr doctor` reports the storage engine loaded and on-disk DB commands succeed
+
+#### Scenario: Too-old Node fails fast with a clear message
+
+- **GIVEN** a runtime older than Node 22.5
+- **WHEN** any `ocr` command runs
+- **THEN** the CLI SHALL print a message stating it requires Node >= 22.5 and how to upgrade, and exit non-zero
+- **AND** it SHALL NOT emit a `Cannot find module 'node:sqlite'` stack trace
+
+#### Scenario: The experimental warning does not pollute output
+
+- **WHEN** the engine loads
+- **THEN** `node:sqlite`'s one-line experimental warning SHALL be suppressed, leaving the machine-readable stdout contract (e.g. `ocr state status --json`) untouched
+
+#### Scenario: The published tarball is install-verified before release
+
+- **WHEN** a release is prepared
+- **THEN** CI SHALL install the **published cli tarball** under **both npm and pnpm 10 (default, scripts blocked)** on supported Node versions, asserting the engine loads (including an on-disk WAL transaction round-trip via `ocr doctor --probe-write`) and a real DB command succeeds, **before** promoting the release to the `latest` dist-tag
 

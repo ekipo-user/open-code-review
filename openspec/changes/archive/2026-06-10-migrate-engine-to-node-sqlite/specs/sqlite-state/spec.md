@@ -78,3 +78,11 @@ retired.
 - **WHEN** a second process opens its own write transaction against the same DB
 - **THEN** the second writer SHALL block (via `busy_timeout` + the bounded retry) until the lock is released, then commit
 - **AND** both writers' changes SHALL be durably present — neither is lost to contention
+
+## REMOVED Requirements
+
+### Requirement: Native SQLite Engine
+
+**Reason**: Superseded by "Built-in SQLite Engine". v2.1.0 migrated the engine from the `better-sqlite3` native dependency to Node's built-in `node:sqlite`, so the better-sqlite3 requirement no longer reflects the implementation. The specs must describe the current built-in engine, not the retired native one.
+
+**Migration**: Engine access is unchanged behind the `Database` adapter seam (`db/engine.ts`); the on-disk SQLite file format is identical, so an existing `.ocr/data/ocr.db` opens in place with no export/import. The only operational change is the Node >= 22.5 floor required by `node:sqlite`.

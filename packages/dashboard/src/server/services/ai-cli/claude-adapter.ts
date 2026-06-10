@@ -48,6 +48,8 @@ export class ClaudeCodeAdapter implements AiCliAdapter {
   // Claude Code subagent definitions support per-subagent model frontmatter,
   // so per-task model overrides are honored at the host level.
   readonly supportsPerTaskModel = true
+  // Claude Code can spawn reviewer sub-agents via its Task tool.
+  readonly supportsSubagentSpawn = true
 
   buildResumeArgs(vendorSessionId: string): string[] {
     return buildResumeArgsShared('claude', vendorSessionId)

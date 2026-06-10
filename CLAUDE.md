@@ -22,6 +22,7 @@ Keep this managed block so 'openspec update' can refresh the instructions.
 
 - **TypeScript only**: Do not create raw `.js` or `.mjs` files unless they serve a config purpose (e.g., `vite.config.mjs`, `eslint.config.mjs`). All project code, scripts, and utilities must be written in TypeScript.
 - **Nx-native automation**: Release process automation must use Nx extension points (e.g., `VersionActions`, `preVersionCommand`), not npm lifecycle scripts or standalone scripts.
+- **Agent assets — edit source, then sync**: Agent docs, skills, commands, references, and other agent-related files have their **source of truth in `packages/agents/`**. ALWAYS edit them there, then run `nx run cli:update` to write the changes out to the local project's `.ocr/` directory. Never hand-edit the generated `.ocr/` copies directly — they will be overwritten on the next sync and your edits will drift from source.
 
 <!-- OCR:START -->
 ## Open Code Review Instructions
@@ -41,5 +42,4 @@ Use `.ocr/skills/SKILL.md` to learn:
 - Session management and output format
 
 Keep this managed block so `ocr init` can refresh the instructions.
-
 <!-- OCR:END -->
