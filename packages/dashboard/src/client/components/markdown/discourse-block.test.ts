@@ -31,6 +31,6 @@ describe('parseDiscourseContent', () => {
     const md = '### AGREE — alice\nLooks good.\n\n### CHALLENGE\nNot so fast.'
     const sections = parseDiscourseContent(md)
     expect(sections.map((s) => s.type)).toEqual(['AGREE', 'CHALLENGE'])
-    expect(sections[0].reviewer).toBe('alice')
+    expect(sections[0]?.reviewer).toBe('alice')
   })
 })

@@ -32,8 +32,8 @@ describe('readReviewersMeta — icon backfill (issue #28)', () => {
 
     const { reviewers } = readReviewersMeta(ocrDir)
 
-    expect(reviewers[0].icon).toBe('blocks') // architect → blocks
-    expect(reviewers[1].icon).toBe('user') // unknown custom → user
+    expect(reviewers[0]?.icon).toBe('blocks') // architect → blocks
+    expect(reviewers[1]?.icon).toBe('user') // unknown custom → user
     expect(reviewers.every((r) => typeof r.icon === 'string' && r.icon.length > 0)).toBe(true)
   })
 
@@ -41,7 +41,7 @@ describe('readReviewersMeta — icon backfill (issue #28)', () => {
     writeMeta([
       { id: 'architect', name: 'Architect', tier: 'holistic', icon: 'crown', description: 'd', focus_areas: [], is_default: true, is_builtin: true },
     ])
-    expect(readReviewersMeta(ocrDir).reviewers[0].icon).toBe('crown')
+    expect(readReviewersMeta(ocrDir).reviewers[0]?.icon).toBe('crown')
   })
 
   it('returns empty result when the file is absent', () => {

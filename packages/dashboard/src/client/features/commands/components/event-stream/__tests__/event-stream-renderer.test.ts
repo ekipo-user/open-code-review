@@ -21,7 +21,10 @@ function makeEvent<T extends StreamEvent['type']>(
     agentId,
     timestamp: new Date(2026, 0, 1).toISOString(),
     seq: ++nextSeq,
-  } as StreamEvent
+    // The object is assembled from a generic `body` (an Omit over a union
+    // extract), which the compiler can't prove overlaps StreamEvent — go via
+    // `unknown` for this deliberately-constructed test fixture.
+  } as unknown as StreamEvent
 }
 
 describe('reduceEventsToBlocks', () => {
