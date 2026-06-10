@@ -1,3 +1,16 @@
+import {
+  hostCapabilitiesFor,
+  type HostCapabilities,
+} from "@open-code-review/platform";
+
+// Re-export so consumers (the skill via `getHostCapabilities`, tests) have one
+// import surface; the canonical capability data lives in the platform kernel.
+export {
+  hostCapabilitiesFor,
+  DEFAULT_HOST_CAPABILITIES,
+  type HostCapabilities,
+} from "@open-code-review/platform";
+
 export type AIToolId =
   | "amazon-q"
   | "augment"
@@ -38,24 +51,6 @@ export type InstructionFileTarget = {
   format: InstructionFileFormat;
 };
 
-/**
- * Capabilities of a host's agent runtime that govern how the review skill runs
- * Phase 4. This is the install-time source of truth the skill consults (via
- * `ocr host capabilities`) to choose a host-neutral Phase-4 strategy. For hosts
- * that also have a dashboard runtime adapter (Claude Code, OpenCode), these
- * MUST agree with the adapter's `supportsSubagentSpawn` / `supportsPerTaskModel`.
- */
-export type HostCapabilities = {
-  /**
-   * The host's agent runtime can spawn isolated sub-agents (e.g. Claude Code's
-   * Task tool, OpenCode's sub-agents). When false, Phase 4 runs reviewers
-   * sequentially in the host's own conversation.
-   */
-  subagentSpawn: boolean;
-  /** The host can vary the model per spawned sub-agent / per task. */
-  perTaskModel: boolean;
-};
-
 export type AIToolConfig = {
   id: AIToolId;
   name: string;
@@ -75,24 +70,14 @@ export type AIToolConfig = {
    * editors that consume OCR skills but have no OCR-spawnable agentic CLI.
    */
   vendorBinary?: string;
-  /**
-   * The host runtime's Phase-4 capabilities. Omitted ⇒ treated as the
-   * conservative default (no sub-agent primitive, no per-task model) so the
-   * skill runs reviewers sequentially on a single model — never assuming a
-   * Claude-style Task tool that may not exist.
-   */
-  hostCapabilities?: HostCapabilities;
 };
 
-/**
- * Conservative default for any host that does not declare capabilities: no
- * sub-agent spawning, no per-task model. Resolves to the sequential, single-
- * model Phase-4 strategy — the safe behavior for an unknown host.
- */
-export const DEFAULT_HOST_CAPABILITIES: HostCapabilities = {
-  subagentSpawn: false,
-  perTaskModel: false,
-};
+// NOTE on splitting AIToolConfig (watch-list): the install-time fields and the
+// runtime cluster (`vendorBinary`) are not a Data Clump today. Consider splitting
+// when ANY of: (a) the runtime cluster grows a third field, (b) a function takes
+// `Pick<AIToolConfig, 'vendorBinary' | ...>`, (c) a non-CLI package imports
+// `AIToolConfig` to read a runtime field. Host capabilities are resolved by
+// binary/id from the platform kernel, so the dashboard never imports this type.
 
 export const AI_TOOLS: AIToolConfig[] = [
   {
@@ -120,7 +105,6 @@ export const AI_TOOLS: AIToolConfig[] = [
     commandStrategy: "subdirectory",
     instructionFiles: [{ path: "CLAUDE.md", format: "markdown" }],
     vendorBinary: "claude",
-    hostCapabilities: { subagentSpawn: true, perTaskModel: true },
   },
   {
     id: "cline",
@@ -139,8 +123,6 @@ export const AI_TOOLS: AIToolConfig[] = [
     commandStrategy: "subdirectory",
     // Codex reads AGENTS.md natively — no extra instruction file.
     vendorBinary: "codex",
-    // Codex has no in-agent Task primitive → sequential Phase 4.
-    hostCapabilities: { subagentSpawn: false, perTaskModel: false },
   },
   {
     id: "continue",
@@ -167,8 +149,6 @@ export const AI_TOOLS: AIToolConfig[] = [
     commandStrategy: "subdirectory",
     instructionFiles: [{ path: "GEMINI.md", format: "markdown" }],
     vendorBinary: "gemini",
-    // Gemini CLI has no in-agent Task primitive → sequential Phase 4.
-    hostCapabilities: { subagentSpawn: false, perTaskModel: false },
   },
   {
     id: "github-copilot",
@@ -198,8 +178,6 @@ export const AI_TOOLS: AIToolConfig[] = [
     commandStrategy: "subdirectory",
     // OpenCode reads AGENTS.md natively — no extra instruction file.
     vendorBinary: "opencode",
-    // OpenCode can spawn sub-agents (`--agent`) but not vary model per task.
-    hostCapabilities: { subagentSpawn: true, perTaskModel: false },
   },
   {
     id: "qoder",
@@ -233,11 +211,13 @@ export function getToolById(id: AIToolId): AIToolConfig | undefined {
 }
 
 /**
- * Resolve a host's Phase-4 capabilities, falling back to the conservative
- * default for tools that don't declare them. Never throws for a known tool id.
+ * Resolve a host's Phase-4 capabilities, derived from the single platform
+ * authority (`hostCapabilitiesFor`). Unknown/editor tools fall back to the
+ * conservative default. The tool id equals the vendor binary for the spawnable
+ * agentic CLIs, so this and the dashboard adapters resolve from the same table.
  */
 export function getHostCapabilities(id: AIToolId): HostCapabilities {
-  return getToolById(id)?.hostCapabilities ?? DEFAULT_HOST_CAPABILITIES;
+  return hostCapabilitiesFor(id);
 }
 
 export function getToolIds(): AIToolId[] {

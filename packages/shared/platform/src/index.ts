@@ -133,3 +133,55 @@ export const BUILTIN_ICON_MAP: Record<string, string> = {
 export function defaultIconFor(id: string, tier: string): string {
   return BUILTIN_ICON_MAP[id] ?? (tier === "persona" ? "brain" : "user");
 }
+
+// ── Host capabilities ──
+
+/**
+ * Capabilities of a host's agent runtime that govern how the review skill runs
+ * Phase 4. Lives here so the CLI (install-time, via `getHostCapabilities`) and
+ * the dashboard adapters (runtime, `supportsSubagentSpawn`/`supportsPerTaskModel`)
+ * derive from ONE source and cannot silently diverge.
+ */
+export type HostCapabilities = {
+  /**
+   * The host's agent runtime can spawn isolated sub-agents (e.g. Claude Code's
+   * Task tool, OpenCode's sub-agents). When false, Phase 4 runs reviewers
+   * sequentially in the host's own conversation.
+   */
+  subagentSpawn: boolean;
+  /** The host can vary the model per spawned sub-agent / per task. */
+  perTaskModel: boolean;
+};
+
+/**
+ * Conservative default for any host that does not declare capabilities: no
+ * sub-agent spawning, no per-task model. Resolves to the sequential, single-
+ * model Phase-4 strategy — the safe behavior for an unknown host.
+ */
+export const DEFAULT_HOST_CAPABILITIES: HostCapabilities = {
+  subagentSpawn: false,
+  perTaskModel: false,
+};
+
+/**
+ * Canonical capability table, keyed by the host's CLI binary (which equals the
+ * tool id for the spawnable agentic CLIs). The single source of truth shared by
+ * the CLI tool registry and the dashboard adapters.
+ */
+const HOST_CAPABILITIES: Record<string, HostCapabilities> = {
+  // Claude Code: Task tool + per-subagent model frontmatter.
+  claude: { subagentSpawn: true, perTaskModel: true },
+  // OpenCode: `--agent` sub-agent primitive, but no per-task model override.
+  opencode: { subagentSpawn: true, perTaskModel: false },
+  // Gemini CLI / Codex: no in-agent Task primitive → sequential Phase 4.
+  gemini: { subagentSpawn: false, perTaskModel: false },
+  codex: { subagentSpawn: false, perTaskModel: false },
+};
+
+/**
+ * Resolve a host's Phase-4 capabilities by binary/id, falling back to the
+ * conservative default for hosts that do not declare them. Never throws.
+ */
+export function hostCapabilitiesFor(vendor: string | undefined): HostCapabilities {
+  return (vendor && HOST_CAPABILITIES[vendor]) || DEFAULT_HOST_CAPABILITIES;
+}
