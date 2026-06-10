@@ -3,7 +3,6 @@ import {
   Blocks,
   Bot,
   Layers,
-  ShieldCheck,
   Compass,
   Layout,
   Server,
@@ -24,12 +23,13 @@ import {
   type LucideIcon,
 } from 'lucide-react'
 
-const ICON_MAP: Record<string, LucideIcon> = {
+// Exported so a contract test can assert every BUILTIN_ICON_MAP value (the icon
+// strings the CLI writes) resolves to a real glyph here — see issue #28 Medium-2.
+export const ICON_MAP: Record<string, LucideIcon> = {
   activity: Activity,
   blocks: Blocks,
   bot: Bot,
   layers: Layers,
-  'shield-check': ShieldCheck,
   compass: Compass,
   layout: Layout,
   server: Server,
