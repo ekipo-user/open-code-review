@@ -186,7 +186,12 @@ describe("process-tree reaping", () => {
     const kids = descendantPids(parent.pid!);
     expect(kids.length).toBeGreaterThan(0); // the spawned `sleep` is a descendant
 
-    reapTree(parent.pid!, 200);
+    const result = reapTree(parent.pid!, 200);
+    // The diagnostic reports the SIGTERM phase: the root + its descendants were
+    // signalled, and `ps` was available to enumerate them (round-1 S13).
+    expect(result.signaled).toBeGreaterThanOrEqual(kids.length + 1);
+    expect(result.psAvailable).toBe(true);
+
     await sleep(700);
     expect(isProcessAlive(parent.pid!)).toBe(false);
     for (const pid of kids) expect(isProcessAlive(pid)).toBe(false);
