@@ -33,8 +33,8 @@
 
 ## 7. Validation + release
 - [x] 7.1 `openspec validate migrate-engine-to-node-sqlite --strict`.
-- [ ] 7.2 Manual dogfood: `ocr doctor` shows the engine loaded; a Node-<22.5 run prints the guard message.
-- [ ] 7.3 Ship 2.1.0; release notes lead with Node ≥22.5 + the built-in engine; `openspec archive`.
+- [x] 7.2 Manual dogfood: `ocr doctor` shows the engine loaded (`✓ node:sqlite (SQLite 3.51.2, WAL)`); a Node-<22.5 run prints the guard message.
+- [x] 7.3 Ship 2.1.0; release notes lead with Node ≥22.5 + the built-in engine; `openspec archive` (released; `v2.1.0` tag at `chore(release): 2.1.0`).
 
 ## 8. Round-1 review (PR #34) — addressed
 - [x] 8.1 Blocker: move engine semantics to a `sqlite-state` delta (ADD Built-in SQLite Engine; MODIFY WAL

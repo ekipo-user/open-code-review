@@ -56,7 +56,7 @@ Ordered for independently-green commits on branch `fix/incomplete-workflow-shown
 - [x] 8.1 Verify better-sqlite3 prebuild matrix vs supported platforms (incl. Windows, ref #23)
 - [x] 8.2 Full `nx run-many -t build,test` + all e2e green; manual: premature `finish` rejected; legacy fixture auto-heals on upgrade with no user action
 - [x] 8.3 READMEs/CHANGELOG: engine change, native dep, atomic API, automatic migration
-- [ ] 8.4 Cut `2.0.0` via the nx release flow
+- [x] 8.4 Cut `2.0.0` via the nx release flow (released; `v2.0.0` tag at `chore(release): 2.0.0`)
 
 ## 9. Spec archive (post-merge, separate PR)
-- [ ] 9.1 `openspec archive redesign-durable-state-lifecycle --yes`; update `specs/`; `openspec validate --strict`
+- [x] 9.1 `openspec archive redesign-durable-state-lifecycle --yes`; update `specs/`; `openspec validate --strict`

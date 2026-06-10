@@ -73,71 +73,42 @@ The system SHALL create a .gitignore to exclude session data by default.
 
 ### Requirement: Session State Tracking
 
-The system SHALL maintain explicit state in SQLite as the primary store, with `state.json` written as a backward-compatible side-effect, for reliable progress tracking with round awareness.
+The system SHALL maintain session lifecycle in SQLite, where the `orchestration_events` log is authoritative and the `sessions` row is a projection derived from it. Lifecycle facts SHALL NOT be written to `sessions` independently of the event that justifies them, and `state.json` SHALL NO LONGER be written.
 
 #### Scenario: State stored in SQLite
 
 - **GIVEN** a new review session begins
-- **WHEN** the session is initialized via `ocr state init`
-- **THEN** the system SHALL insert a row into the `sessions` table in `.ocr/data/ocr.db` with initial state
-- **AND** insert a `session_created` event into `orchestration_events`
-- **AND** write `state.json` as a backward-compatible side-effect
+- **WHEN** the session is initialized via `ocr state begin`
+- **THEN** the system SHALL insert a `session_created` event and the derived `sessions` projection row in one transaction
+- **AND** it SHALL NOT write `state.json`
 
-#### Scenario: State file format (SQLite)
+#### Scenario: Projection columns
 
 - **GIVEN** a session is in progress
-- **WHEN** the `sessions` table row is read
-- **THEN** it SHALL contain:
-  - `id` - Session identifier
-  - `branch` - Branch name
-  - `status` - active or closed
-  - `workflow_type` - review or map
-  - `current_phase` - Current workflow phase
-  - `phase_number` - Numeric phase (1-8)
-  - `current_round` - Current round number
-  - `current_map_run` - Current map run number
-  - `started_at` - ISO timestamp of session start
-  - `updated_at` - ISO timestamp of last update
-  - `session_dir` - Relative path to session directory
+- **WHEN** the `sessions` projection row is read
+- **THEN** it SHALL contain `id`, `branch`, `status`, `workflow_type`, `current_phase`, `phase_number`, `current_round`, `current_map_run`, `started_at`, `updated_at`, and `session_dir`
+- **AND** each of these values SHALL be consistent with the session's `orchestration_events`
 
-#### Scenario: Filesystem-derived state (deprecated)
+#### Scenario: Lifecycle is event-derived
 
-- **GIVEN** a session directory exists
-- **WHEN** state information is needed
-- **THEN** the system SHALL read from the `sessions` table in SQLite as the primary source
-- **AND** filesystem-derived state (round count from directory enumeration, round completion from `final.md` existence) SHALL be used only as a fallback when no SQLite row exists (legacy migration)
+- **GIVEN** lifecycle state is needed (phase, status, round)
+- **WHEN** a consumer reads it
+- **THEN** the value SHALL come from the `sessions` projection, which is maintained transactionally from the event log
+- **AND** filesystem-derived state SHALL be used only by reconciliation for legacy rows that predate the event log
 
 #### Scenario: State updates at phase transitions
 
 - **GIVEN** a review progresses through phases
 - **WHEN** transitioning to a new phase
-- **THEN** the orchestrating agent SHALL call `ocr state transition` which updates the `sessions` table and inserts an `orchestration_events` row BEFORE starting work on the phase
-- **AND** `state.json` SHALL be written as a backward-compatible side-effect
-
-#### Scenario: Phase completion display
-
-- **GIVEN** the CLI displays progress
-- **WHEN** determining phase completion checkmarks
-- **THEN** the CLI SHALL derive completion from the `phase_number` column in the `sessions` table (phases < current are complete)
+- **THEN** the orchestrating agent SHALL call `ocr state advance`, which appends a `phase_transition` event and updates the projection in one transaction BEFORE work on the phase begins
+- **AND** no `state.json` side-effect SHALL be written
 
 #### Scenario: CLI progress tracking
 
 - **GIVEN** a session exists in SQLite
-- **WHEN** `ocr progress` CLI is invoked
-- **THEN** the CLI SHALL read from the `sessions` table for accurate progress display including current round
-- **AND** fall back to `state.json` if no SQLite row exists
-
-#### Scenario: Missing state handling
-
-- **GIVEN** no SQLite row exists and `state.json` is missing or corrupt in a session
-- **WHEN** `ocr progress` CLI is invoked
-- **THEN** the CLI SHALL display "Waiting for session..." until valid state is created
-
-#### Scenario: Cross-mode compatibility
-
-- **GIVEN** OCR runs as a Claude Code plugin
-- **WHEN** sessions are stored in `.ocr/sessions/` and state is written via `ocr state` commands
-- **THEN** the standalone CLI SHALL find and track session progress identically via SQLite
+- **WHEN** `ocr progress` is invoked
+- **THEN** it SHALL read the `sessions` projection for progress display including current round
+- **AND** it SHALL display "Waiting for session..." when no session state exists
 
 ---
 
@@ -246,44 +217,34 @@ The system SHALL store discourse and synthesis outputs inside round directories,
 
 ### Requirement: State Reconciliation
 
-The system SHALL use SQLite as the authoritative source of truth for session state, with filesystem serving as the artifact delivery mechanism only.
+The system SHALL treat the SQLite event log as authoritative and SHALL reconcile legacy or drifted state by deriving truth from events and filesystem artifacts, healing the projection automatically.
 
-#### Scenario: SQLite is authoritative
+#### Scenario: Event log is authoritative
 
-- **GIVEN** a session exists in both SQLite and on the filesystem
-- **WHEN** any consumer needs session state (phase, status, round)
-- **THEN** the system SHALL read from SQLite
-- **AND** filesystem artifacts are parsed into SQLite by FilesystemSync but do NOT override orchestration state
+- **GIVEN** a session exists in SQLite
+- **WHEN** any consumer needs lifecycle state
+- **THEN** the system SHALL derive it from the event log via the `sessions` projection
+- **AND** filesystem artifacts SHALL be parsed into content tables but SHALL NOT override lifecycle
 
-#### Scenario: Missing SQLite row (legacy session)
+#### Scenario: Legacy row without events is reconciled
 
-- **GIVEN** a session directory exists on filesystem without a corresponding SQLite row
-- **WHEN** `ocr state sync` or FilesystemSync runs
-- **THEN** the system SHALL backfill a `sessions` row from `state.json` if present
-- **AND** if `state.json` is also missing, the system SHALL create a minimal row with status derived from filesystem artifacts
+- **GIVEN** a legacy `sessions` row or session directory lacking lifecycle events
+- **WHEN** reconciliation runs (during migration or via `ocr state reconcile`)
+- **THEN** it SHALL synthesize completion events from provable artifacts (e.g. a present `final.md`)
+- **AND** where completion cannot be proven, it SHALL emit a `session_legacy_import` reason event rather than fabricate completion
 
-#### Scenario: State.json disagrees with SQLite
+#### Scenario: Stale active legacy session is auto-closed
 
-- **GIVEN** `state.json` has different phase or round data than the `sessions` table
-- **WHEN** any consumer reads state
-- **THEN** the system SHALL trust SQLite as authoritative
-- **AND** `state.json` is NOT read by any first-party consumer in the new architecture (except as legacy fallback)
+- **GIVEN** a legacy session left `active` with no recent events and no in-flight dependents
+- **WHEN** reconciliation or the periodic sweep runs
+- **THEN** it SHALL close the session with a `session_auto_closed_stale` event
 
-#### Scenario: Corrupt state.json
+#### Scenario: Empty round directory does not alter lifecycle
 
-- **GIVEN** `state.json` contains invalid JSON but SQLite has valid state
-- **WHEN** CLI or dashboard reads the session
-- **THEN** the system SHALL use SQLite state without error
-- **AND** `state.json` corruption does not affect the session
-
-#### Scenario: User creates empty round directory
-
-- **GIVEN** user manually creates `rounds/round-2/` with no contents
+- **GIVEN** a user manually creates `rounds/round-2/` with no contents
 - **WHEN** FilesystemSync runs
-- **THEN** a `review_rounds` row is created in SQLite for the empty round
-- **AND** orchestration state in `sessions` table is NOT modified (only `ocr state` commands modify orchestration state)
-
----
+- **THEN** content tables MAY record the empty round
+- **AND** the `sessions` lifecycle projection SHALL NOT be modified (only `ocr state` commands change lifecycle)
 
 ### Requirement: Human Review Draft Storage
 
@@ -603,4 +564,39 @@ The `SessionCaptureService` and the underlying agent vendor adapters SHALL maint
 - **WHEN** a workflow runs against the new vendor
 - **THEN** the service SHALL capture and persist its session id without modification
 - **AND** the resume context SHALL be constructed from the new vendor's adapter-owned command builder
+
+### Requirement: Atomic Round Completion Lifecycle
+
+Completing a review round SHALL be a single atomic operation that finalizes all of its facts together, so a round can never be left partially completed.
+
+#### Scenario: All-or-nothing completion
+
+- **WHEN** a round is completed via `ocr state complete-round`
+- **THEN** the round metadata, the `round_completed` event, the `current_round` advance, and the transition to the `complete` phase SHALL commit together in one transaction
+- **AND** a failure at any step SHALL leave the session exactly as it was before the call
+
+#### Scenario: Completion requires the workflow path was walked
+
+- **GIVEN** a review session that has not reached the `synthesis` phase
+- **WHEN** `ocr state complete-round` is invoked
+- **THEN** the command SHALL refuse with the invariant-unmet code
+- **AND** because reaching `synthesis` requires legal graph transitions through analysis, reviews, aggregation, and discourse, a completed round implies the workflow path was actually walked
+
+---
+
+### Requirement: Invariant-Checked Session Finish
+
+A session SHALL NOT be marked closed-as-complete unless its current round/run is genuinely complete; abandonment SHALL be recorded as a distinct, non-success terminal state.
+
+#### Scenario: Finish blocked on incomplete round
+
+- **GIVEN** a session whose current round has no `round_completed` event
+- **WHEN** `ocr state finish` runs without `--abort`
+- **THEN** the session SHALL remain open and the command SHALL report the unmet obligation
+
+#### Scenario: Abort is a recorded, non-success terminal
+
+- **WHEN** `ocr state finish --abort` runs
+- **THEN** the session SHALL close with a `session_aborted` event
+- **AND** no consumer SHALL report the aborted session as a successful completion
 
