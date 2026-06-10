@@ -36,7 +36,7 @@ import { AiCliService } from './services/ai-cli/index.js'
 import { createSessionCaptureService } from './services/capture/session-capture-service.js'
 import { FilesystemSync } from './services/filesystem-sync.js'
 import { DbSyncWatcher } from './services/db-sync-watcher.js'
-import { registerCommandHandlers } from './socket/command-runner.js'
+import { registerCommandHandlers, clearSpawnMarker } from './socket/command-runner.js'
 import { registerChatHandlers, cleanupAllChats } from './socket/chat-handler.js'
 import { registerPostHandlers, cleanupAllPostGenerations } from './socket/post-handler.js'
 import {
@@ -164,18 +164,29 @@ export type StartServerOptions = {
  *   await startServer({ port: 4173, open: true })
  */
 /**
- * Whether `pid`'s command line looks like an OCR dashboard server — guards the
+ * Whether `pid` is positively identified as an OCR dashboard server — guards the
  * single-instance takeover so a recycled PID can't be mistaken for our server.
  * POSIX only (uses `ps`); returns false on Windows / any failure (conservative
  * — never reap something we can't positively identify).
+ *
+ * Primary: the `process.title` ('ocr-dashboard') we stamp at startup, anchored
+ * at the start of the command so an unrelated `…/server.js` cannot false-match.
+ * Fallback: the dashboard entrypoint path — kept ONLY because `process.title`
+ * does not always reach `ps` on macOS. The substring was the sole gate before
+ * and is too loose on its own (round-1 SF2).
  */
 function isOcrDashboardProcess(pid: number): boolean {
   if (process.platform === 'win32') return false
   try {
-    const cmd = execFileSync('ps', ['-p', String(pid), '-o', 'command='], {
-      encoding: 'utf-8',
-      timeout: 3000,
-    }) as string
+    const cmd = (
+      execFileSync('ps', ['-p', String(pid), '-o', 'command='], {
+        encoding: 'utf-8',
+        timeout: 3000,
+      }) as string
+    ).trim()
+    // Primary, positive identification: our stamped title at argv[0].
+    if (/^ocr-dashboard\b/.test(cmd)) return true
+    // Secondary fallback (macOS, where the title may not reach `ps`).
     return /dashboard\/server\.js|server\/index\.ts/.test(cmd)
   } catch {
     return false
@@ -184,6 +195,13 @@ function isOcrDashboardProcess(pid: number): boolean {
 
 export async function startServer(options: StartServerOptions = {}): Promise<void> {
   const port = options.port ?? parseInt(process.env.PORT ?? '4173', 10)
+
+  // Stamp a stable, positively-identifying process title so a later instance's
+  // single-instance takeover can recognize THIS server (and never mistake a
+  // recycled PID for it). `isOcrDashboardProcess` anchors on this. On Linux it
+  // rewrites argv[0] (visible in `ps`); on macOS it may not reach `ps`, which is
+  // why the identity check keeps an entrypoint-path fallback.
+  process.title = 'ocr-dashboard'
 
   // Resolve .ocr directory
   const ocrDir = resolveOcrDir()
@@ -247,9 +265,13 @@ export async function startServer(options: StartServerOptions = {}): Promise<voi
         console.log(`  Single-instance:   reaping prior dashboard server (PID ${oldPid}) and taking over`)
         reapTree(oldPid)
         // Brief wait for the port to free, then re-checkpoint the WAL the prior
-        // server may have left open.
+        // server may have left open. Polled with an async sleep — `startServer`
+        // is async, so this yields the event loop instead of hot-spinning a core
+        // (the rest of the file already treats event-loop hygiene as a rule).
         const deadline = Date.now() + 6000
-        while (isProcessAlive(oldPid) && Date.now() < deadline) { /* spin briefly */ }
+        while (isProcessAlive(oldPid) && Date.now() < deadline) {
+          await new Promise<void>((resolve) => setTimeout(resolve, 100))
+        }
         walCheckpointTruncate(dbPathForCheckpoint)
       }
     } catch {
@@ -291,7 +313,6 @@ export async function startServer(options: StartServerOptions = {}): Promise<voi
 
     for (const row of orphanRows) {
       const pid = row[colIdx['pid']!] as number
-      const isDetached = (row[colIdx['is_detached']!] as number) === 1
       const startedAt = row[colIdx['started_at']!] as string
 
       // Safety: skip PIDs from commands started beyond the reuse window
@@ -300,30 +321,20 @@ export async function startServer(options: StartServerOptions = {}): Promise<voi
 
       // Only act on genuinely-live processes (the shared liveness probe).
       if (defaultIsAlive(pid)) {
-        // Process is alive — kill it
-        if (isDetached) {
-          try { process.kill(-pid, 'SIGTERM') } catch { process.kill(pid, 'SIGTERM') }
-        } else {
-          process.kill(pid, 'SIGTERM')
-        }
+        // Reap the WHOLE descendant tree (SIGTERM → grace → SIGKILL), robust to
+        // a setsid()-escaped grandchild (e.g. a leaked MCP daemon) — the exact
+        // failure mode that produced the wedge. The pre-PR `kill(-pid)` +
+        // manual SIGKILL escalation here would miss it, recurring the bug at
+        // every restart boundary. `reapTree` walks the tree for both detached
+        // and non-detached roots, so the `is_detached` branch is gone.
+        reapTree(pid)
         killedCount++
-
-        // Escalate to SIGKILL after 2 seconds for stubborn processes
-        setTimeout(() => {
-          try {
-            process.kill(pid, 0) // still alive?
-            if (isDetached) {
-              try { process.kill(-pid, 'SIGKILL') } catch { /* ignore */ }
-            }
-            process.kill(pid, 'SIGKILL')
-          } catch { /* already dead */ }
-        }, 2000)
       }
       // else: process not running — PID is stale, cleaned up below.
     }
 
     if (killedCount > 0) {
-      console.log(`  Cleaned up ${killedCount} orphaned process(es)`)
+      console.log(`  Reaped ${killedCount} orphaned process tree(s)`)
     }
   }
 
@@ -621,8 +632,9 @@ export async function startServer(options: StartServerOptions = {}): Promise<voi
     try { unlinkSync(portFilePath) } catch { /* ignore */ }
     // Remove the dashboard spawn marker (used by CLI's `ocr state begin`
     // for durable workflow_id linkage). Cleared here so a crash-mid-spawn
-    // doesn't leave a stale marker pointing at a dead PID.
-    try { unlinkSync(join(dataDir, 'dashboard-active-spawn.json')) } catch { /* ignore */ }
+    // doesn't leave a stale marker pointing at a dead PID. Shared helper so the
+    // marker path is defined in exactly one place (round-1 S22).
+    clearSpawnMarker(ocrDir)
 
     // Kill all child processes tracked in the database.
     // This is more robust than the in-memory Maps (which are lost on hot-reload).
@@ -636,16 +648,13 @@ export async function startServer(options: StartServerOptions = {}): Promise<voi
 
         for (const row of activeRows) {
           const pid = row[colIdx['pid']!] as number
-          const isDetached = (row[colIdx['is_detached']!] as number) === 1
 
-          try {
-            if (isDetached) {
-              try { process.kill(-pid, 'SIGTERM') } catch { process.kill(pid, 'SIGTERM') }
-            } else {
-              process.kill(pid, 'SIGTERM')
-            }
-            console.log(`Sent SIGTERM to child process (PID ${pid})`)
-          } catch { /* already dead */ }
+          // Reap the whole descendant tree, not just the process group — the
+          // same setsid()-escape robustness the live-cancel path uses. A plain
+          // group kill at shutdown leaves a leaked daemon behind for the next
+          // startup to inherit.
+          reapTree(pid)
+          console.log(`Reaped child process tree (PID ${pid})`)
         }
 
         // Clear PIDs and mark as cancelled
