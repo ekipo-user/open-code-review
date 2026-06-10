@@ -263,8 +263,10 @@ export function WorkflowOutput({
             // Detect markdown headers for appropriate styling
             const headingMatch = segment.text.match(/^(#{1,6})\s+(.+)/)
             if (headingMatch) {
-              const level = headingMatch[1].length
-              const text = headingMatch[2]
+              // Both capture groups are present whenever the regex matches; the
+              // fallbacks only satisfy noUncheckedIndexedAccess.
+              const level = headingMatch[1]?.length ?? 1
+              const text = headingMatch[2] ?? ''
               const sizeClass = level <= 2 ? 'text-base font-semibold' : level <= 4 ? 'text-sm font-semibold' : 'text-sm font-medium'
               return (
                 <div key={i} className={cn(sizeClass, 'mt-3 mb-1 text-zinc-800 dark:text-zinc-200')}>

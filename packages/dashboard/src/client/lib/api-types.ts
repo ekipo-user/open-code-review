@@ -154,7 +154,10 @@ export type AgentSessionsResponse = {
 // erased by the bundler, so this never pulls server runtime into the
 // client bundle. Round-3 SF3: closes the previous client/server
 // drift risk by eliminating the hand-maintained mirror.
-export type { UnresumableReason } from '../../server/services/capture/unresumable-microcopy'
+// Import for local use in `ResumeOutcome` below AND re-export — a bare
+// `export type { … } from` re-exports without binding the name in this module.
+import type { UnresumableReason } from '../../server/services/capture/unresumable-microcopy'
+export type { UnresumableReason }
 
 export type CaptureDiagnostics = {
   vendor: string | null
