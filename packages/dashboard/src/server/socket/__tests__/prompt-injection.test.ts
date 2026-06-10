@@ -81,10 +81,33 @@ describe('escapeUserHeaders', () => {
     expect(escapeUserHeaders('\t## tab indented')).toBe('\t\\## tab indented')
   })
 
-  it('escapes fullwidth ＃ (U+FF03) that visually mimics ASCII #', () => {
+  it('folds fullwidth ＃ (U+FF03) via NFKC, then escapes it as ASCII #', () => {
+    // NFKC collapses ＃→#, so the escaped output is the ASCII form.
     expect(escapeUserHeaders('＃＃ fullwidth header')).toBe(
-      '\\＃＃ fullwidth header',
+      '\\## fullwidth header',
     )
+  })
+
+  it('escapes an NBSP-indented header (NFKC folds U+00A0 → space)', () => {
+    // A non-breaking-space indent would dodge the ASCII `[ \t]` class without
+    // NFKC. After folding it is a regular space the leading-whitespace rule covers.
+    expect(escapeUserHeaders('\u00A0## nbsp indent')).toBe(' \\## nbsp indent')
+  })
+
+  it('strips a zero-width space wedged between the indent and the #', () => {
+    expect(escapeUserHeaders('\u200B## zero-width')).toBe('\\## zero-width')
+  })
+
+  it('strips a right-to-left override (U+202E) before the #', () => {
+    expect(escapeUserHeaders('\u202E## rlo header')).toBe('\\## rlo header')
+  })
+
+  it('treats U+2028 / U+2029 as line breaks so a header after one is escaped', () => {
+    // These separate lines for the model but not for JS `/m`; folding to `\n`
+    // makes the following header line an independently-escaped line.
+    const escaped = escapeUserHeaders('intro text\u2028## injected after LS')
+    expect(escaped).toContain('\\## injected after LS')
+    expect(escaped).not.toContain('\u2028')
   })
 
   it('escapes setext-style underlines that re-type the preceding line as a heading', () => {

@@ -35,8 +35,11 @@ import {
   generateCommandUid,
   appendCommandLog,
   type CommandLogEntry,
+  CANCELLED_EXIT_CODE,
+  WATCHDOG_DEADLINE_EXIT_CODE,
 } from '@open-code-review/cli/db'
 import { reconcileWorkflowOnExit } from '@open-code-review/cli/state'
+import { getWorkflowHardDeadlineMs } from '@open-code-review/cli/runtime-config'
 
 /** Split a command string into tokens, respecting single and double quotes. */
 function shellSplit(str: string): string[] {
@@ -120,9 +123,24 @@ const AI_COMMANDS = new Set(['map', 'review', 'translate-review-to-single-human'
 export function escapeUserHeaders(value: string): string {
   return (
     value
+      // (a) NFKC fold: collapses compatibility homoglyphs an attacker could use
+      //     to dodge the ASCII patterns below — fullwidth `＃` (U+FF03) → `#`,
+      //     and NBSP (U+00A0) / figure-space (U+2007) / narrow-NBSP → an ASCII
+      //     space the leading-whitespace class then covers. Round-1 SF6.
+      .normalize('NFKC')
+      // (b) Line/paragraph separators (U+2028/U+2029) start a new line for the
+      //     model but NOT for JS's `/m` flag, so a `## h` placed after one would slip
+      //     through unescaped. Fold them to `\n` so each line is escaped on its own.
+      .replace(/[\u2028\u2029]/g, '\n')
+      // (c) Strip zero-width + bidi-control chars that NFKC leaves intact (ZWSP
+      //     U+200B–200D, word-joiner U+2060, BOM U+FEFF, bidi embeds/overrides
+      //     U+202A–202E incl. RLO). Invisible, they could sit between the indent
+      //     and the `#` to break the pattern match.
+      .replace(/[\u200B-\u200D\u2060\uFEFF\u202A-\u202E]/g, '')
       // ATX headers: 0–3 leading spaces or tabs followed by one+ `#`.
       .replace(/^([ \t]{0,3})(#+)/gm, '$1\\$2')
-      // Fullwidth hash mimics: 0–3 leading whitespace + one+ `＃`.
+      // Fullwidth hash mimics: redundant after NFKC (a) but kept as defense if
+      // normalization is ever disabled.
       .replace(/^([ \t]{0,3})(＃+)/gm, '$1\\$2')
       // Setext underlines: a line of `===` or `---` (3+) re-types the
       // line above as a heading. Escape so it renders as literal text.
@@ -403,12 +421,14 @@ type ProcessEntry = {
 // last-resort cap.
 const WATCHDOG_TICK_MS = 10_000
 const POST_RESULT_GRACE_MS = 30_000
-const HARD_DEADLINE_MS = 60 * 60 * 1000 // 60 min; generous for large reviewer fleets
+// The hard-deadline cap is no longer a constant here — it is read per-spawn from
+// runtime-config (`getWorkflowHardDeadlineMs`, default 60 min) so a large
+// reviewer fleet on cold caches can raise it without a code change (round-1 S26).
 /** Heartbeat write throttle so streaming output doesn't hammer the WAL. */
 const HEARTBEAT_THROTTLE_MS = 5_000
-/** Terminal exit code stamped when the watchdog reaps a hung-past-deadline
- *  process — distinct from -2/-4 (cancelled) and -3 (orphaned/dead-pid sweep). */
-const WATCHDOG_DEADLINE_EXIT_CODE = -5
+// WATCHDOG_DEADLINE_EXIT_CODE (-5) now lives in the CLI's exit-codes module and
+// is imported above — one definition shared by the producer (here) and the
+// dashboard's outcome derivation (round-1 SF9).
 
 /** Active commands keyed by execution_id */
 const activeCommands = new Map<number, ProcessEntry>()
@@ -450,7 +470,7 @@ function writeSpawnMarker(ocrDir: string, executionUid: string, pid: number): vo
  * Remove the spawn marker. Called from the process-close handler so
  * stale markers don't accumulate. Idempotent — already-removed is fine.
  */
-function clearSpawnMarker(ocrDir: string): void {
+export function clearSpawnMarker(ocrDir: string): void {
   try {
     unlinkSync(spawnMarkerPath(ocrDir))
   } catch {
@@ -722,8 +742,9 @@ function spawnCliCommand(
   })
 
   proc.on('close', (code) => {
-    const finalCode = code ?? (entry.cancelled ? -2 : -1)
-    finishExecution(io, db, ocrDir, executionId, finalCode, entry.outputBuffer)
+    // `finishExecution` applies the cancel-wins preference centrally, so the
+    // close handler need only translate a signal-kill (null code) to -1.
+    finishExecution(io, db, ocrDir, executionId, code ?? -1, entry.outputBuffer)
   })
 
   proc.on('error', (err) => {
@@ -961,10 +982,16 @@ function spawnAiCommand(
       console.error('[command-runner] heartbeat bump failed:', err)
     }
   }
+  const hardDeadlineMs = getWorkflowHardDeadlineMs(ocrDir)
   entry.watchdog = setInterval(() => {
     if (entry.finalized) return
     const pid = entry.process?.pid
     if (!pid) return
+    // Recycled-PID guard: if the process already exited, the OS may have reused
+    // its PID for an unrelated process. Don't reap it — let `proc.on('close')`
+    // (which fires on the real child's exit) finalize. The startup orphan-kill
+    // applies the same liveness discipline; the runtime watchdog must too.
+    if (!isProcessAlive(pid)) return
     const now = Date.now()
     // (1) Work done but process won't exit (leaked grandchild holds the pipe):
     //     reap the whole tree and finalize. This is the exact incident class.
@@ -975,14 +1002,21 @@ function spawnAiCommand(
       return
     }
     // (2) Absolute deadline regardless of state.
-    if (now - Date.parse(entry.startedAt) > HARD_DEADLINE_MS) {
-      console.warn(`[watchdog] execution ${executionId}: exceeded hard deadline — reaping tree`)
+    if (now - Date.parse(entry.startedAt) > hardDeadlineMs) {
+      const minutes = Math.round(hardDeadlineMs / 60000)
+      console.warn(`[watchdog] execution ${executionId}: exceeded hard deadline (${minutes}m) — reaping tree`)
+      io.emit('command:output', {
+        execution_id: executionId,
+        content:
+          `\n[watchdog] Reaped after exceeding the ${minutes}-minute hard deadline. ` +
+          `Raise runtime.workflow_hard_deadline_minutes in .ocr/config.yaml for large reviewer fleets.\n`,
+      })
       reapTree(pid)
       finishExecution(io, db, ocrDir, executionId, WATCHDOG_DEADLINE_EXIT_CODE, entry.outputBuffer)
       return
     }
     // (3) Healthy: keep the heartbeat fresh through silent stretches.
-    if (isProcessAlive(pid)) bumpHeartbeat()
+    bumpHeartbeat()
   }, WATCHDOG_TICK_MS)
   entry.watchdog.unref()
 
@@ -1203,8 +1237,9 @@ function spawnAiCommand(
     journal.close().catch((err) => {
       console.error('[event-journal] close failed:', err)
     })
-    const finalCode = code ?? (entry.cancelled ? -2 : -1)
-    finishExecution(io, db, ocrDir, executionId, finalCode, entry.outputBuffer)
+    // Cancel-wins is applied centrally in `finishExecution`; here we only map a
+    // signal-kill (null code) to -1.
+    finishExecution(io, db, ocrDir, executionId, code ?? -1, entry.outputBuffer)
   })
 
   proc.on('error', (err) => {
@@ -1231,11 +1266,18 @@ function finishExecution(
   db: Database,
   ocrDir: string,
   executionId: number,
-  code: number | null,
+  rawCode: number | null,
   output: string
 ): void {
   const finishedAt = new Date().toISOString()
   const entry = activeCommands.get(executionId)
+
+  // Cancel wins the exit code regardless of which trigger finalizes (round-1
+  // SF4/S11). The cancel handler reaps the tree but defers finalization to
+  // `close`; if the agent had emitted `result` first, the watchdog's
+  // result-grace branch could otherwise finalize the cancelled run with 0/1,
+  // losing the cancellation in the recorded code + `cancellation_reason`.
+  const code = entry?.cancelled ? CANCELLED_EXIT_CODE : rawCode
 
   // First-wins: finalization may be triggered by the `result` event, the
   // `close` handler, the watchdog, or cancel. Only the first runs; the rest
@@ -1298,7 +1340,7 @@ function finishExecution(
       started_at: entry.startedAt,
       finished_at: finishedAt,
       is_detached: entry.detached ? 1 : 0,
-      event: code === -2 ? 'cancel' : 'finish',
+      event: code === CANCELLED_EXIT_CODE ? 'cancel' : 'finish',
       writer: 'dashboard',
     })
   }
@@ -1327,11 +1369,24 @@ function finishExecution(
   )
   const workflowId = workflowRow[0]?.values[0]?.[0]
   if (typeof workflowId === 'string' && workflowId.length > 0) {
-    void reconcileWorkflowOnExit(ocrDir, workflowId).catch((err) => {
-      console.error(
-        `[command-runner] reconcileWorkflowOnExit(${workflowId}) failed:`,
-        err instanceof Error ? err.message : err,
-      )
-    })
+    // Reuse the dashboard's open handle (avoids a redundant ensureDatabase per
+    // finalize) and leave a debug paper trail of the outcome — a later
+    // post-mortem can see WHY a session did or didn't auto-close (round-1 S20/S21).
+    void reconcileWorkflowOnExit(ocrDir, workflowId, db)
+      .then((outcome) => {
+        if (outcome === 'closed') {
+          console.log(`[command-runner] auto-finalized workflow ${workflowId}`)
+        } else if (outcome === 'incomplete' || outcome === 'in-flight') {
+          console.debug(
+            `[command-runner] workflow ${workflowId} not finalized: ${outcome}`,
+          )
+        }
+      })
+      .catch((err) => {
+        console.error(
+          `[command-runner] reconcileWorkflowOnExit(${workflowId}) failed:`,
+          err instanceof Error ? err.message : err,
+        )
+      })
   }
 }
