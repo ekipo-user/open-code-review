@@ -400,15 +400,25 @@ export class FilesystemSync {
       [sessionId, artifactType, roundNumber ?? null, relPath],
     )
 
-    const isUpdate = existing !== null
-
+    // UPDATE the existing row by id, else INSERT. The previous `INSERT OR
+    // REPLACE` relied on the UNIQUE(...round_number...) index to replace, but
+    // SQLite treats NULL ≠ NULL, so session-level artifacts (round_number NULL)
+    // were NEVER replaced — every re-parse appended a duplicate. One context.md
+    // accumulated 775 identical rows (~177 MB of pure duplication). The id
+    // lookup above is already NULL-correct (`round_number IS ?`); use it.
+    if (existing !== null) {
+      this.db.run(
+        `UPDATE markdown_artifacts SET content = ?, parsed_at = datetime('now') WHERE id = ?`,
+        [content, existing as number],
+      )
+      return 'updated'
+    }
     this.db.run(
-      `INSERT OR REPLACE INTO markdown_artifacts (session_id, artifact_type, round_number, file_path, content, parsed_at)
+      `INSERT INTO markdown_artifacts (session_id, artifact_type, round_number, file_path, content, parsed_at)
        VALUES (?, ?, ?, ?, ?, datetime('now'))`,
       [sessionId, artifactType, roundNumber ?? null, relPath, content],
     )
-
-    return isUpdate ? 'updated' : 'created'
+    return 'created'
   }
 
   // ── 6.7: Socket.IO Emission ──
