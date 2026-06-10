@@ -37,6 +37,7 @@ import {
   getEventsForSession,
   commitReasonClose,
   cascadeTerminateExecutions,
+  hasInFlightDependents,
 } from "../db/index.js";
 import { join } from "node:path";
 import type {
@@ -452,6 +453,87 @@ export async function stateClose(params: CloseParams): Promise<void> {
     // running. Doing it here makes close authoritative.
     cascadeTerminateExecutions(db, sessionId, CASCADE_CLOSE_EXIT_CODE, note);
   });
+}
+
+/** The outcome of a reconciliation attempt — discriminates why a session was
+ *  (or was not) auto-closed, so the caller can log/observe without re-querying. */
+export type ReconcileExitOutcome =
+  | "closed" // active + complete + quiesced → driven to closed via stateClose
+  | "not-found" // no such session
+  | "already-closed" // already terminal — nothing to do
+  | "incomplete" // active but the current round/run has no terminal artifact event
+  | "in-flight"; // complete, but a sibling execution is still running
+
+/**
+ * Auto-close a workflow's session when — and only when — it has provably
+ * finished but was left `active` (the wedge signature: `current_phase` reaches
+ * `complete` while `status` stays `active` because the agent never ran
+ * `ocr state finish`).
+ *
+ * Safe to call from the dashboard's per-execution `finishExecution` as
+ * fire-and-forget: a review spawns MANY `command_executions` across its
+ * phases, so this MUST no-op unless the just-finished execution is genuinely
+ * the last one of a completed round. The guards make that hold:
+ *
+ *   - the session must still be `active` (idempotent: already-closed → no-op);
+ *   - the current round/run must satisfy {@link hasCompletionInvariant} (a
+ *     `round_completed` / `map_completed` event exists) — so an incomplete
+ *     session is never force-closed, it is left for the agent to resume;
+ *   - no sibling `command_executions` may still be in flight.
+ *
+ * When all hold, the close is driven through the guarded {@link stateClose}
+ * (`abort: false`) so the DB close-guard trigger, the completion invariant,
+ * and `cascadeTerminateExecutions` all stay in force — this never bypasses the
+ * normal close path, it just triggers it from the server instead of waiting on
+ * an explicit `ocr state finish` the wedged agent never reached.
+ *
+ * Never aborts and never closes an incomplete session; abandoned/stale
+ * sessions remain the job of {@link reconcileLegacyState}'s time-based sweep.
+ */
+export async function reconcileWorkflowOnExit(
+  ocrDir: string,
+  sessionId: string,
+): Promise<ReconcileExitOutcome> {
+  const db = await ensureDatabase(ocrDir);
+
+  const existing = getSession(db, sessionId);
+  if (!existing) return "not-found";
+  if (existing.status === "closed") return "already-closed";
+
+  // Only the success path: a provably-complete round/run. An `active` session
+  // whose round is NOT complete is mid-flight (or resumable) — leave it.
+  if (!hasCompletionInvariant(db, existing)) return "incomplete";
+
+  // A complete round can still have a sibling execution running (e.g. a
+  // concurrent utility command). Closing now would cascade-terminate it. Wait
+  // for the workflow to quiesce; the last execution to finish drives the close.
+  if (hasInFlightDependents(db, sessionId)) return "in-flight";
+
+  await stateClose({ sessionId, ocrDir, abort: false });
+  return "closed";
+}
+
+/**
+ * Sweep every `active` session and finalize the ones that are provably
+ * complete + quiesced, via {@link reconcileWorkflowOnExit}. This is the
+ * dashboard's startup/periodic backstop for {@link reconcileWorkflowOnExit}:
+ * it recovers `active`+`complete` sessions whose finishing execution fired
+ * while no server was running (so the per-execution hook never ran), surviving
+ * dashboard restarts. Idempotent; returns the ids it closed.
+ */
+export async function reconcileCompletedSessions(
+  ocrDir: string,
+): Promise<string[]> {
+  const db = await ensureDatabase(ocrDir);
+  const closed: string[] = [];
+  // Snapshot the list first — `getAllSessions` is materialized, so closing
+  // rows inside the loop cannot disturb iteration.
+  for (const s of getAllSessions(db)) {
+    if (s.status !== "active") continue;
+    const outcome = await reconcileWorkflowOnExit(ocrDir, s.id);
+    if (outcome === "closed") closed.push(s.id);
+  }
+  return closed;
 }
 
 /**

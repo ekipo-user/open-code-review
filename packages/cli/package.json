@@ -42,6 +42,12 @@
       "source": "./src/lib/vendor-resume.ts",
       "import": "./dist/lib/vendor-resume.js",
       "default": "./dist/lib/vendor-resume.js"
+    },
+    "./state": {
+      "types": "./src/lib/state/index.ts",
+      "source": "./src/lib/state/index.ts",
+      "import": "./dist/lib/state/index.js",
+      "default": "./dist/lib/state/index.js"
     }
   },
   "files": [
