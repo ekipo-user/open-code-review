@@ -168,13 +168,34 @@ export { resultToRows, resultToRow } from "./result-mapper.js";
 // `@open-code-review/cli/db` contract cannot leak the node:sqlite type.
 export type { Database, ExecResult, ExecResultRow, SqlValue, BindParams } from "./engine.js";
 export { probeEngine, isBusyError } from "./engine.js";
-export { reconcileLegacyState } from "./reconcile.js";
+export { reconcileLegacyState, hasInFlightDependents } from "./reconcile.js";
 export type {
   ReconcileResult,
   ReconcileAction,
   ReconcileKind,
   ReconcileOptions,
 } from "./reconcile.js";
+export {
+  collectDbHealth,
+  snapshotDb,
+  reapOrphanDbFiles,
+  reapStaleExecLogs,
+  fixDb,
+  vacuumDb,
+  pruneDb,
+} from "./maintenance.js";
+export type {
+  DbHealthReport,
+  FkViolationGroup,
+  OrphanTempFile,
+  BackupFile,
+  DbFixOptions,
+  DbFixResult,
+  DbVacuumResult,
+  DbPruneOptions,
+  DbPruneResult,
+  DbPruneSessionPlan,
+} from "./maintenance.js";
 export { getSchemaVersion } from "./migrations.js";
 
 export {

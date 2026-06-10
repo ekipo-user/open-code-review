@@ -12,6 +12,7 @@ import { reviewCommand } from "./commands/review";
 import { updateCommand } from "./commands/update";
 import { dashboardCommand } from "./commands/dashboard";
 import { doctorCommand } from "./commands/doctor";
+import { dbCommand } from "./commands/db";
 import { reviewersCommand } from "./commands/reviewers";
 import { hostCommand } from "./commands/host";
 import { checkForUpdate, printUpdateNotification } from "./lib/update-check.js";
@@ -42,6 +43,7 @@ program.addCommand(reviewCommand);
 program.addCommand(updateCommand);
 program.addCommand(dashboardCommand);
 program.addCommand(doctorCommand);
+program.addCommand(dbCommand);
 program.addCommand(reviewersCommand);
 program.addCommand(hostCommand);
 

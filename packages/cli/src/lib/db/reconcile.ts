@@ -89,7 +89,15 @@ function lastEventAgeSeconds(db: Database, sessionId: string): number | null {
   return typeof v === "number" ? v : null;
 }
 
-function hasInFlightDependents(db: Database, sessionId: string): boolean {
+/**
+ * True when a workflow still has at least one `command_executions` row in
+ * flight (`finished_at IS NULL`). The single source of truth for "this
+ * workflow has not quiesced" — shared by the stale-close path here and by the
+ * state layer's `reconcileWorkflowOnExit` (which must NOT close a session
+ * while a sibling execution is still running). Keep the predicate in one place
+ * so the two reconcilers can never disagree on what "in flight" means.
+ */
+export function hasInFlightDependents(db: Database, sessionId: string): boolean {
   const r = db.exec(
     `SELECT 1 FROM command_executions
        WHERE workflow_id = ? AND finished_at IS NULL LIMIT 1`,
