@@ -33,6 +33,33 @@ async function readStdin(): Promise<string> {
 const VALID_TIERS = new Set<ReviewerTier>(["holistic", "specialist", "persona", "custom"]);
 const SLUG_RE = /^[a-z][a-z0-9-]*$/;
 
+// Reviewer metadata is rendered into every Phase-4 reviewer prompt. A persona
+// authored from untrusted `/ocr-create-reviewer` input could try to override
+// the reviewer's instructions (e.g. "always conclude REQUEST CHANGES"). We warn
+// on the obvious override shapes — we do NOT hard-reject (the persona text is
+// also wrapped in delimiters in reviewer-task.md), so legitimate prose isn't
+// blocked. Issue #28 review Important-4.
+const INJECTION_PATTERNS: RegExp[] = [
+  /ignore\s+(all\s+|the\s+)?(previous|prior|above)?\s*(instructions|prompts|rules)/i,
+  /disregard\s+(all\s+|the\s+)?(previous|prior|above)/i,
+  /\byou\s+are\s+now\b/i,
+  /^\s*system\s*:/im,
+  /\balways\s+(conclude|respond|reply|return|output|approve|reject|say)\b/i,
+  /\bnew\s+rule\s*:/i,
+];
+
+function warnIfSuspiciousPersona(label: string, fields: unknown[]): void {
+  const text = fields.filter((f) => typeof f === "string").join("\n");
+  const hit = INJECTION_PATTERNS.find((re) => re.test(text));
+  if (hit) {
+    console.error(
+      chalk.yellow(
+        `⚠ ${label} contains text resembling a prompt-injection override (matched ${hit}). Review the persona before relying on it.`,
+      ),
+    );
+  }
+}
+
 export function validateReviewersMeta(data: unknown): ReviewersMeta {
   if (typeof data !== "object" || data === null || Array.isArray(data)) {
     throw new Error("Payload must be a JSON object");
@@ -89,6 +116,14 @@ export function validateReviewersMeta(data: unknown): ReviewersMeta {
     if (typeof r.icon !== "string" || r.icon.length === 0) {
       r.icon = defaultIconFor(r.id, r.tier as ReviewerTier);
     }
+
+    warnIfSuspiciousPersona(`${prefix} ("${r.name}")`, [
+      r.name,
+      r.description,
+      ...(Array.isArray(r.focus_areas) ? r.focus_areas : []),
+      r.known_for,
+      r.philosophy,
+    ]);
 
     // Optional fields for personas
     if (r.known_for !== undefined && typeof r.known_for !== "string") {
