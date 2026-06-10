@@ -31,7 +31,13 @@ Stale `ocr.db.<pid>.tmp` atomic-write orphans (from the retired sql.js engine, n
 
 ### Requirement: Operator Database Maintenance Commands
 
-OCR SHALL provide first-class, on-demand database hygiene via `ocr db doctor / vacuum / prune`, productizing the one-time corruption remediation so any operator's database can be inspected and healed without a migration. `doctor` SHALL report size, reclaimable freelist, `integrity_check`, `foreign_key_check` violations, markdown duplicates, and orphan temp/backup files; `doctor --fix` SHALL run the FK-orphan sweep, markdown dedup, orphan-temp reap, and `VACUUM`. The FK-orphan sweep SHALL toggle `PRAGMA foreign_keys` only in autocommit (never inside a transaction) and SHALL NEVER delete from the system-of-record tables (`sessions`, `orchestration_events`, `agent_sessions`, `command_executions`) — a violation there SHALL be reported for manual review, not auto-deleted. Every mutating operation SHALL snapshot the database file first, and the lock-taking operations (`vacuum`, `doctor --fix`) SHALL refuse to run while a live dashboard owns the database unless explicitly forced.
+OCR SHALL provide first-class, on-demand database hygiene via `ocr db doctor / vacuum / prune / prune-backups`, productizing the one-time corruption remediation so any operator's database can be inspected and healed without a migration. `doctor` SHALL report size, reclaimable freelist, `integrity_check`, `foreign_key_check` violations, markdown duplicates, and orphan temp/backup files; `doctor --fix` SHALL run the FK-orphan sweep, markdown dedup, orphan-temp reap, and `VACUUM`. The FK-orphan sweep SHALL toggle `PRAGMA foreign_keys` only in autocommit (never inside a transaction) and SHALL NEVER delete from the system-of-record tables (`sessions`, `orchestration_events`, `agent_sessions`, `command_executions`) — a violation there SHALL be reported for manual review, not auto-deleted. Every mutating operation SHALL snapshot the database file first, and the lock-taking operations (`vacuum`, `doctor --fix`) SHALL refuse to run while a live dashboard owns the database unless explicitly forced. `prune-backups` SHALL delete `<db>.bak.*` snapshots while retaining the N most-recent (default 1) as a safety net, supporting `--dry-run`, and SHALL never touch the live database file — the explicit, operator-driven counterpart to `doctor` merely *reporting* backups.
+
+#### Scenario: prune-backups reclaims old snapshots but keeps the newest
+
+- **GIVEN** several `ocr.db.bak.*` snapshots and `ocr db prune-backups --keep 1`
+- **THEN** all but the most-recent snapshot SHALL be deleted
+- **AND** the live `ocr.db` SHALL be untouched
 
 #### Scenario: doctor --fix heals orphans and reclaims space
 
