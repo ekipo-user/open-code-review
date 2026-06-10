@@ -13,7 +13,10 @@ import {
   detectInstalledTools,
   type InstallResult,
 } from "../lib/installer.js";
-import { injectIntoProjectFiles } from "../lib/injector.js";
+import {
+  injectIntoProjectFiles,
+  findStaleInstructionFiles,
+} from "../lib/injector.js";
 import { printBanner } from "../lib/banner.js";
 import { setConfiguredToolIds, stampCliVersion } from "../lib/cli-config.js";
 import { CLI_VERSION } from "../lib/version.js";
@@ -26,7 +29,7 @@ import {
 export const initCommand = new Command("init")
   .description("Set up OCR for AI coding environments")
   .option("-t, --tools <tools>", 'Comma-separated tool IDs or "all"')
-  .option("--no-inject", "Skip injecting instructions into AGENTS.md/CLAUDE.md")
+  .option("--no-inject", "Skip injecting instructions into project instruction files (AGENTS.md + each tool's native file)")
   .action(async (options: { tools?: string; inject: boolean }) => {
     printBanner();
 
@@ -144,17 +147,24 @@ export const initCommand = new Command("init")
         "Injecting OCR instructions into project files...",
       ).start();
 
-      const injectResults = injectIntoProjectFiles(targetDir);
+      const installedTools = successful.map((r) => r.tool);
+      const injectResults = injectIntoProjectFiles(targetDir, installedTools);
       injectSpinner.stop();
 
-      if (injectResults.agentsMd || injectResults.claudeMd) {
+      if (injectResults.written.length > 0) {
         console.log(chalk.green("✓ OCR instructions injected"));
-        if (injectResults.agentsMd) {
-          console.log(`  ${chalk.green("✓")} AGENTS.md`);
+        for (const path of injectResults.written) {
+          console.log(`  ${chalk.green("✓")} ${path}`);
         }
-        if (injectResults.claudeMd) {
-          console.log(`  ${chalk.green("✓")} CLAUDE.md`);
-        }
+      }
+
+      const stale = findStaleInstructionFiles(targetDir, injectResults.written);
+      for (const path of stale) {
+        console.log(
+          chalk.yellow(
+            `  ⚠ ${path} still has an OCR block but no installed tool uses it — remove it manually if unneeded.`,
+          ),
+        );
       }
     }
 

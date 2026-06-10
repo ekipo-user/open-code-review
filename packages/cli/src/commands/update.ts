@@ -9,7 +9,11 @@ import {
   detectInstalledTools,
   type InstallResult,
 } from "../lib/installer.js";
-import { injectIntoProjectFiles } from "../lib/injector.js";
+import {
+  injectIntoProjectFiles,
+  plannedInstructionFiles,
+  findStaleInstructionFiles,
+} from "../lib/injector.js";
 import { ensureGitignore } from "../lib/gitignore.js";
 import { requireOcrSetup } from "../lib/guards.js";
 import { getConfiguredToolIds, stampCliVersion } from "../lib/cli-config.js";
@@ -181,33 +185,44 @@ export const updateCommand = new Command("update")
       }
     }
 
-    // Update AGENTS.md injection
+    // Update instruction-file injection (AGENTS.md + each tool's native file)
     if (updateInject) {
+      const planned = plannedInstructionFiles(toolsToUpdate);
+
       if (options.dryRun) {
         console.log(chalk.dim("  Would update:"));
-        if (existsSync(join(targetDir, "AGENTS.md"))) {
-          console.log(chalk.dim("    • AGENTS.md (OCR managed block)"));
+        for (const path of planned) {
+          const verb = existsSync(join(targetDir, path)) ? "update" : "create";
+          console.log(chalk.dim(`    • ${path} (${verb} OCR managed block)`));
         }
-        if (existsSync(join(targetDir, "CLAUDE.md"))) {
-          console.log(chalk.dim("    • CLAUDE.md (OCR managed block)"));
+        for (const path of findStaleInstructionFiles(targetDir, planned)) {
+          console.log(
+            chalk.dim(`    • ${path} (stale OCR block — left untouched)`),
+          );
         }
         console.log();
       } else {
-        const spinner = ora("Updating AGENTS.md/CLAUDE.md...").start();
+        const spinner = ora("Updating instruction files...").start();
 
-        const injectResults = injectIntoProjectFiles(targetDir);
+        const injectResults = injectIntoProjectFiles(targetDir, toolsToUpdate);
         spinner.stop();
 
-        if (injectResults.agentsMd || injectResults.claudeMd) {
+        if (injectResults.written.length > 0) {
           console.log(chalk.green("  ✓ Instructions updated"));
-          if (injectResults.agentsMd) {
-            console.log(`    ${chalk.green("✓")} AGENTS.md`);
-          }
-          if (injectResults.claudeMd) {
-            console.log(`    ${chalk.green("✓")} CLAUDE.md`);
+          for (const path of injectResults.written) {
+            console.log(`    ${chalk.green("✓")} ${path}`);
           }
         } else {
           console.log(chalk.dim("  No instruction files to update"));
+        }
+
+        const stale = findStaleInstructionFiles(targetDir, injectResults.written);
+        for (const path of stale) {
+          console.log(
+            chalk.yellow(
+              `    ⚠ ${path} still has an OCR block but no configured tool uses it — remove it manually if unneeded.`,
+            ),
+          );
         }
 
         console.log();

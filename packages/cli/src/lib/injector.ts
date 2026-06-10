@@ -1,11 +1,30 @@
-import { existsSync, readFileSync, writeFileSync } from "node:fs";
-import { join } from "node:path";
+import { existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
+import { dirname, join } from "node:path";
+import {
+  AI_TOOLS,
+  type AIToolConfig,
+  type InstructionFileFormat,
+  type InstructionFileTarget,
+} from "./config.js";
 
-const START_MARKER = "<!-- OCR:START -->";
-const END_MARKER = "<!-- OCR:END -->";
+/**
+ * The universal cross-tool instruction file. Written for every `ocr init`
+ * regardless of which tools are selected — it is the convention OCR itself
+ * uses (`AGENTS.md`) and the file an increasing number of agentic CLIs read.
+ */
+const AGENTS_MD: InstructionFileTarget = { path: "AGENTS.md", format: "markdown" };
 
-const OCR_INSTRUCTION_BLOCK = `${START_MARKER}
-## Open Code Review Instructions
+/**
+ * Managed-block markers per format. The body between them is identical; only
+ * the delimiters differ so non-markdown files (.windsurfrules) don't show
+ * literal HTML comments.
+ */
+const MARKERS: Record<InstructionFileFormat, { start: string; end: string }> = {
+  markdown: { start: "<!-- OCR:START -->", end: "<!-- OCR:END -->" },
+  plaintext: { start: "# OCR:START", end: "# OCR:END" },
+};
+
+const OCR_INSTRUCTION_BODY = `## Open Code Review Instructions
 
 These instructions are for AI assistants handling code review in this project.
 
@@ -21,25 +40,45 @@ Use \`.ocr/skills/SKILL.md\` to learn:
 - Available reviewer personas and their focus areas
 - Session management and output format
 
-Keep this managed block so \`ocr init\` can refresh the instructions.
+Keep this managed block so \`ocr init\` can refresh the instructions.`;
 
-${END_MARKER}`;
+function buildBlock(format: InstructionFileFormat): string {
+  const { start, end } = MARKERS[format];
+  return `${start}\n${OCR_INSTRUCTION_BODY}\n${end}`;
+}
 
-export function injectOcrInstructions(filePath: string): boolean {
+function escapeRegex(str: string): string {
+  return str.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+}
+
+function blockRegex(format: InstructionFileFormat): RegExp {
+  const { start, end } = MARKERS[format];
+  return new RegExp(
+    `${escapeRegex(start)}[\\s\\S]*?${escapeRegex(end)}\\n?`,
+    "g",
+  );
+}
+
+/**
+ * Insert or refresh the OCR managed block in a single file, preserving any
+ * surrounding user content. Idempotent: an existing block of the same format
+ * is stripped before the current one is appended.
+ */
+export function injectOcrInstructions(
+  filePath: string,
+  format: InstructionFileFormat = "markdown",
+): boolean {
   try {
-    let content = existsSync(filePath) ? readFileSync(filePath, "utf-8") : "";
+    mkdirSync(dirname(filePath), { recursive: true });
 
-    const regex = new RegExp(
-      `${escapeRegex(START_MARKER)}[\\s\\S]*?${escapeRegex(END_MARKER)}\\n?`,
-      "g",
-    );
-    content = content.replace(regex, "");
+    let content = existsSync(filePath) ? readFileSync(filePath, "utf-8") : "";
+    content = content.replace(blockRegex(format), "");
 
     content = content.trim();
     if (content.length > 0) {
       content += "\n\n";
     }
-    content += OCR_INSTRUCTION_BLOCK + "\n";
+    content += buildBlock(format) + "\n";
 
     writeFileSync(filePath, content);
     return true;
@@ -48,21 +87,57 @@ export function injectOcrInstructions(filePath: string): boolean {
   }
 }
 
-function escapeRegex(str: string): string {
-  return str.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+export type InjectionResult = {
+  /** Repo-relative paths that got or refreshed an OCR managed block. */
+  written: string[];
+  /** Repo-relative paths that failed to write. */
+  failed: string[];
+};
+
+/**
+ * Inject OCR instructions into the instruction files for the selected tools.
+ *
+ * Always writes the universal `AGENTS.md`, plus each selected tool's native
+ * instruction file(s). Files are de-duplicated so `AGENTS.md` (and any file
+ * two tools happen to share) is written exactly once — e.g. selecting only
+ * Gemini writes `AGENTS.md` + `GEMINI.md` and never a stray `CLAUDE.md`.
+ */
+/**
+ * Resolve the de-duplicated set of instruction-file targets for a tool
+ * selection: always `AGENTS.md`, plus each selected tool's native file(s),
+ * written at most once.
+ */
+function resolveTargets(selectedTools: AIToolConfig[]): InstructionFileTarget[] {
+  const targets = new Map<string, InstructionFileTarget>();
+  targets.set(AGENTS_MD.path, AGENTS_MD);
+  for (const tool of selectedTools) {
+    for (const file of tool.instructionFiles ?? []) {
+      targets.set(file.path, file);
+    }
+  }
+  return [...targets.values()];
 }
 
-export function injectIntoProjectFiles(targetDir: string): {
-  agentsMd: boolean;
-  claudeMd: boolean;
-} {
-  const agentsMdPath = join(targetDir, "AGENTS.md");
-  const claudeMdPath = join(targetDir, "CLAUDE.md");
+/**
+ * The repo-relative paths `injectIntoProjectFiles` would write for a tool
+ * selection — used by `ocr update --dry-run` to preview without writing.
+ */
+export function plannedInstructionFiles(selectedTools: AIToolConfig[]): string[] {
+  return resolveTargets(selectedTools).map((t) => t.path);
+}
 
-  const agentsMd = injectOcrInstructions(agentsMdPath);
-  const claudeMd = injectOcrInstructions(claudeMdPath);
+export function injectIntoProjectFiles(
+  targetDir: string,
+  selectedTools: AIToolConfig[],
+): InjectionResult {
+  const written: string[] = [];
+  const failed: string[] = [];
+  for (const target of resolveTargets(selectedTools)) {
+    const ok = injectOcrInstructions(join(targetDir, target.path), target.format);
+    (ok ? written : failed).push(target.path);
+  }
 
-  return { agentsMd, claudeMd };
+  return { written, failed };
 }
 
 export function hasOcrInstructions(filePath: string): boolean {
@@ -71,5 +146,38 @@ export function hasOcrInstructions(filePath: string): boolean {
   }
 
   const content = readFileSync(filePath, "utf-8");
-  return content.includes(START_MARKER) && content.includes(END_MARKER);
+  return Object.values(MARKERS).some(
+    (m) => content.includes(m.start) && content.includes(m.end),
+  );
+}
+
+/**
+ * Find native instruction files (across all known tools) that still carry an
+ * OCR managed block but are NOT part of the files just written — e.g. a stray
+ * `CLAUDE.md` left over from an init that selected Claude, after the user
+ * switches to a non-Claude tool. `AGENTS.md` is universal and never stale.
+ *
+ * Returns repo-relative paths; the caller decides what to do (we only warn —
+ * we never delete user-owned files).
+ */
+export function findStaleInstructionFiles(
+  targetDir: string,
+  writtenPaths: string[],
+): string[] {
+  const written = new Set(writtenPaths);
+  const candidates = new Set<string>();
+  for (const tool of AI_TOOLS) {
+    for (const file of tool.instructionFiles ?? []) {
+      candidates.add(file.path);
+    }
+  }
+
+  const stale: string[] = [];
+  for (const path of candidates) {
+    if (written.has(path)) continue;
+    if (hasOcrInstructions(join(targetDir, path))) {
+      stale.push(path);
+    }
+  }
+  return stale;
 }
