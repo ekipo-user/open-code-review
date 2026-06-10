@@ -23,6 +23,7 @@
     "test": {
       "executor": "@nx/vitest:test",
       "outputs": ["{workspaceRoot}/coverage/packages/dashboard"],
+      "dependsOn": [{ "target": "build", "projects": ["cli"] }],
       "options": {
         "config": "packages/dashboard/vitest.config.ts"
       }
