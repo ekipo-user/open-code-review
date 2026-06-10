@@ -1,10 +1,10 @@
 # Reviewer Task Template
 
-Template for spawning individual reviewer sub-agents.
+Template for running an individual reviewer — whether spawned as a sub-agent (hosts with a Task tool) or run sequentially as a fresh pass in the same conversation (hosts without one).
 
 ## Task Structure
 
-When spawning a reviewer task, provide the following context:
+When running a reviewer, provide the following context:
 
 ```markdown
 # Code Review Task: {reviewer_name}

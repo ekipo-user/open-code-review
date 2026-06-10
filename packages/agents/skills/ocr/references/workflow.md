@@ -450,9 +450,10 @@ See `references/context-discovery.md` for detailed algorithm.
 
 ---
 
-## Phase 4: Spawn Reviewers
+## Phase 4: Run Reviewers
 
-**Goal**: Run each reviewer independently with configured redundancy.
+**Goal**: Run each reviewer independently with configured redundancy, using whatever
+instantiation strategy your host CLI supports (parallel sub-agents or sequential passes).
 
 **State**: Call `ocr state advance --phase "reviews" --current-round $CURRENT_ROUND`
 
@@ -494,11 +495,27 @@ See `references/context-discovery.md` for detailed algorithm.
    - `rounds/round-$CURRENT_ROUND/reviews/principal-2.md`
    - `rounds/round-$CURRENT_ROUND/reviews/quality-1.md`
 
-3. **Honor per-instance models** when your host AI CLI supports per-task model
+3. **Instantiate each reviewer using the strategy your host supports.** Do NOT
+   assume a Claude-style Task tool exists. If unsure, run
+   `ocr host capabilities --tool <your-host-id> --json` and read `subagentSpawn`:
+
+   - **Host with a sub-agent primitive** (`subagentSpawn: true` — Claude Code's
+     Task tool, OpenCode's sub-agents): spawn one sub-agent per resolved
+     instance, in parallel.
+   - **Host without a sub-agent primitive** (`subagentSpawn: false` — Gemini CLI,
+     Codex, and other environments with no Task tool): run each reviewer
+     **sequentially** as a fresh analytical pass in this same conversation — one
+     instance at a time, using `references/reviewer-task.md`.
+
+   Both strategies are first-class. The journaling in step 5 is identical for
+   both, so the dashboard cannot tell which one you used.
+
+4. **Honor per-instance models** when your host AI CLI supports per-task model
    overrides (e.g. Claude Code subagent frontmatter accepts a `model:` field):
 
    - For each instance with a non-null `model`, pass that model to your host's
-     per-task primitive when spawning the reviewer subagent.
+     per-task primitive when spawning the reviewer sub-agent, or select that
+     model when you run the reviewer sequentially.
    - For instances with `model: null`, omit the override and let the parent
      model apply.
 
@@ -509,16 +526,18 @@ See `references/context-discovery.md` for detailed algorithm.
    in `agent_sessions.notes` via `ocr session start-instance --note "..."`
    so the dashboard can surface it. Do NOT silently ignore configured models.
 
-4. **Journal each instance** through the `ocr session` command family:
+5. **Journal each instance** through the `ocr session` command family (identical
+   whether the reviewer was spawned in parallel or run sequentially):
 
    ```bash
-   # Before spawning the reviewer:
+   # Before running the reviewer ($HOST_VENDOR is your host CLI, e.g. claude,
+   # gemini, codex, opencode; <resolved-model> is the instance's resolved model):
    AGENT_ID=$(ocr session start-instance \
      --workflow $SESSION_ID \
      --persona principal --instance 1 --name principal-1 \
-     --vendor claude --model claude-opus-4-7)
+     --vendor $HOST_VENDOR --model <resolved-model>)
 
-   # When the spawned subagent emits its underlying CLI session id:
+   # When the reviewer emits its underlying CLI session id:
    ocr session bind-vendor-id $AGENT_ID <vendor-session-id>
 
    # Periodically while the reviewer runs:
@@ -533,9 +552,9 @@ See `references/context-discovery.md` for detailed algorithm.
    resume affordances. Without journal entries, the dashboard cannot tell a
    crashed reviewer from a paused one.
 
-5. **Spawn ephemeral reviewers** (if `--reviewer` was provided):
+6. **Run ephemeral reviewers** (if `--reviewer` was provided):
 
-   For each ephemeral reviewer, create a task with a synthesized persona (no `.md` file lookup). The task receives the same context as library reviewers but uses the synthesized persona instead of a file-based one. Journal them via `ocr session start-instance` exactly like library reviewers.
+   For each ephemeral reviewer, run it with a synthesized persona (no `.md` file lookup), using the same instantiation strategy as library reviewers (step 3). It receives the same context as library reviewers but uses the synthesized persona instead of a file-based one. Journal them via `ocr session start-instance` exactly like library reviewers.
 
    ```bash
    # From --reviewer "Focus on error handling"
