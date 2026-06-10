@@ -290,35 +290,40 @@ The dashboard SHALL support light, dark, and system-preference themes with an ae
 
 ### Requirement: CLI Command Execution
 
-The dashboard SHALL allow users to execute OCR CLI commands from the browser, with real-time output streaming via Socket.IO.
+The dashboard SHALL allow users to execute OCR CLI commands from the browser with real-time output streaming via Socket.IO, SHALL derive a command's reported outcome from the workflow's completeness rather than the process exit code alone, and SHALL mutate workflow lifecycle only by invoking the `ocr state` CLI (never by writing lifecycle tables directly).
 
 #### Scenario: Run a CLI command
 
-- **WHEN** user selects a command from the command palette or clicks an action button
+- **WHEN** user selects a command or clicks an action button
 - **THEN** the client emits a `command:run` Socket.IO event
 - **AND** the server spawns the CLI process and streams stdout/stderr via `command:output` events
-- **AND** the terminal output is rendered in a panel with monospace font and ANSI color support
+- **AND** the terminal output is rendered with monospace font and ANSI color support
 
-#### Scenario: Command completes
+#### Scenario: Command completes with a derived outcome
 
 - **WHEN** the spawned CLI process exits
-- **THEN** the server emits a `command:finished` event with the exit code
-- **AND** the output panel shows success (exit 0) or failure styling
+- **THEN** the server emits a `command:finished` event carrying both the exit code and a derived `outcome`
+- **AND** the `outcome` SHALL be computed from the `session_completeness` view for the linked workflow, not from `exit_code === 0` alone
+- **AND** a process that exits 0 while its workflow is not genuinely complete SHALL report `incomplete`, not `success`
+
+#### Scenario: Lifecycle mutation goes through the CLI-published commit primitive
+
+- **WHEN** the dashboard's filesystem-sync reconciler needs to change workflow lifecycle (e.g. backfill-close a session it discovered on disk)
+- **THEN** it SHALL mutate lifecycle only through the CLI-published `commitReasonClose` helper (a single transactional reason-event-then-status commit) — or, equivalently, a child-process `ocr state` invocation
+- **AND** the dashboard SHALL NOT issue ad-hoc `INSERT INTO sessions`, `INSERT INTO orchestration_events`, or `UPDATE sessions SET status` outside that helper
+- **AND** the dashboard SHALL write directly only to its owned tables (process-supervision journal and UX state)
 
 #### Scenario: Available commands
 
 - **WHEN** user opens the command palette
-- **THEN** the following commands are available: `ocr init`, `ocr update`, `ocr state sync`, `ocr state show`
+- **THEN** at least `ocr init`, `ocr update`, `ocr state sync`, `ocr state status` are available
 - **AND** commands that mutate state require a confirmation step
 
 #### Scenario: Concurrent command guard
 
 - **GIVEN** a command is already running
 - **WHEN** user attempts to start another command
-- **THEN** a warning is shown that a command is in progress
-- **AND** the user may choose to wait or cancel the running command
-
----
+- **THEN** a warning is shown and the user may wait or cancel the running command
 
 ### Requirement: Markdown Artifact Rendering
 
@@ -418,15 +423,18 @@ The dashboard server SHALL run a FilesystemSync service that parses markdown art
 
 ### Requirement: Zero Native Dependencies
 
-The dashboard SHALL NOT require native compilation. All dependencies MUST be pure JavaScript or WASM.
+The dashboard SHALL NOT require native compilation or a native-addon install
+step. Its storage engine is the runtime's **built-in SQLite (`node:sqlite`)**,
+and all other dependencies are pure JavaScript — so installation needs no
+`node-gyp`, no platform-specific prebuilt binary, no install script, and no build
+tools, on any platform. This requires **Node >= 22.5** (when `node:sqlite`
+landed).
 
 #### Scenario: Clean install on any platform
 
-- **GIVEN** a fresh macOS, Linux, or Windows environment with Node.js 20+
-- **WHEN** user runs `npm install @open-code-review/cli`
-- **THEN** installation completes without `node-gyp`, platform-specific prebuilds, or build tools
-
----
+- **GIVEN** a fresh macOS, Linux, or Windows environment with Node.js >= 22.5
+- **WHEN** the user installs `@open-code-review/cli` with any package manager (npm, pnpm including 10+, yarn)
+- **THEN** installation completes without `node-gyp`, a platform-specific prebuild, an install script, or build tools
 
 ### Requirement: Embedded Deployment
 
@@ -1406,4 +1414,91 @@ When the handoff cannot produce a resumable command pair, the panel SHALL render
 - **WHEN** the lint test executes
 - **THEN** every `UnresumableReason` variant SHALL have a corresponding microcopy entry
 - **AND** the lint test SHALL fail if a new variant is added without an entry
+
+### Requirement: Review Render Tree Degrades Gracefully on Unknown Values
+
+The dashboard review-report render tree SHALL tolerate unrecognized enum values and missing optional metadata instead of throwing a render error that blanks the page. A lookup keyed by free-form parsed content (e.g. a discourse-block type, a verdict label, a reviewer icon) SHALL resolve to a neutral fallback rather than dereferencing an undefined config.
+
+#### Scenario: Unknown discourse type renders a neutral block
+
+- **WHEN** a review report contains a discourse section whose type is not one of the recognized values
+- **THEN** the block SHALL render with a neutral style and the raw type as its label
+- **AND** the review report SHALL NOT crash
+
+#### Scenario: Missing reviewer icon renders a default glyph
+
+- **WHEN** a reviewer is rendered whose `icon` is unset or not in the icon registry
+- **THEN** a default glyph SHALL be shown rather than throwing
+
+#### Scenario: Render errors are diagnosable
+
+- **WHEN** a component within the dashboard error boundary throws during render
+- **THEN** the error boundary SHALL log the React component stack so the failing subtree can be identified
+
+### Requirement: Adapter Declares Sub-Agent Spawn Capability
+
+Each AI CLI adapter SHALL declare a `supportsSubagentSpawn` capability indicating whether the host CLI can spawn isolated reviewer sub-agents from within its own agent runtime. This is orthogonal to `supportsPerTaskModel`: a host MAY support spawning sub-agents while not supporting per-task model overrides. The capability lets the dashboard-orchestrated path select a Phase-4 strategy programmatically.
+
+#### Scenario: Claude Code declares sub-agent spawn support
+
+- **GIVEN** the Claude Code adapter
+- **WHEN** its capabilities are read
+- **THEN** `supportsSubagentSpawn` SHALL be `true`
+
+#### Scenario: Capability is independent of per-task model support
+
+- **GIVEN** an adapter that can spawn sub-agents but cannot vary model per sub-agent
+- **WHEN** its capabilities are read
+- **THEN** `supportsSubagentSpawn` SHALL be `true` and `supportsPerTaskModel` SHALL be `false`
+
+### Requirement: Process-Supervision Liveness Sweep
+
+The dashboard periodically reclaims `command_executions` rows whose supervised process is genuinely gone, stamping them `orphaned` (`exit_code = -3`). Because the supervision journal is the source of truth for a command's outcome, the sweep SHALL ground the terminal `orphaned` verdict in **actual process liveness**, never in heartbeat age alone — a terminal verdict requires positive evidence that the process is dead. `last_heartbeat_at` age is a non-terminal display hint only.
+
+#### Scenario: A live process is never orphaned
+
+- **GIVEN** an unfinished `command_executions` row whose recorded `pid` is a live process
+- **WHEN** the liveness sweep runs, even if `last_heartbeat_at` is older than the threshold
+- **THEN** the row SHALL NOT be marked `orphaned` and SHALL retain `finished_at IS NULL`
+- **AND** a stale heartbeat SHALL surface only as the non-terminal `stalled` display state
+
+#### Scenario: A dead process is reclaimed
+
+- **GIVEN** an unfinished row whose recorded `pid` is confirmed not alive (the OS reports no such process)
+- **WHEN** the liveness sweep runs and the row is within the PID-reuse safety window
+- **THEN** the row SHALL be marked `orphaned` (`exit_code = -3`, `finished_at` set, `pid` cleared, a structured note appended)
+
+#### Scenario: No positive evidence of death means no terminal verdict
+
+- **GIVEN** an unfinished row with no recorded `pid` (e.g. a self-reporting `start-instance` reviewer), OR a pid-bearing row whose `started_at` is older than the 24h PID-reuse safety window
+- **WHEN** the liveness sweep runs
+- **THEN** the row SHALL NOT be orphaned by this sweep — a self-reported stale heartbeat is a liveness hint (the non-terminal `stalled` display state), never positive evidence of death
+- **AND** such rows are reclaimed instead by their evidence-bearing owners: the agent's own `ocr session end-instance`, the parent-close cascade (`cascadeTerminateExecutions`, exit `-4`), or the coarse session-level stale sweep
+
+#### Scenario: A real completion always wins, and the sweep is idempotent
+
+- **WHEN** a command finishes normally between the sweep's read and its write
+- **THEN** the sweep's orphan stamp SHALL be a compare-and-set guarded on `finished_at IS NULL`, so the genuine exit code is never overwritten
+- **AND** a second sweep over an already-reclaimed row SHALL make no further change
+
+#### Scenario: A dead workflow process takes its in-flight dependents with it
+
+- **GIVEN** the row being orphaned is a workflow's supervising/top-level process (it has a `workflow_id` and is not itself a `session-instance` reviewer row)
+- **WHEN** the sweep confirms that process dead and orphans it
+- **THEN** in the same transaction it SHALL cascade-terminate that workflow's other in-flight `command_executions` rows with exit `-4` (cascade), since the parent's confirmed death is positive evidence its in-process children are gone — so reviewer instances do not linger as `stalled` and the session-level sweep is not wedged by them
+- **AND** orphaning a `session-instance` row SHALL NOT cascade (an instance never owns a workflow's lifecycle), so a live sibling instance is never taken down
+
+#### Scenario: The cascade reclaims processes, not the session's resumability (deliberate asymmetry)
+
+- **GIVEN** a supervisor was orphaned and its dependents cascade-closed
+- **THEN** the cascade SHALL affect only `command_executions` (process supervision); it SHALL NOT itself close the workflow's `sessions` row
+- **AND** the `sessions` row remains `active` so the in-progress round stays resumable (re-running the workflow resumes it; `ocr state finish --abort` abandons it); its lifecycle is reclaimed at the coarse 7-day session-level sweep if neither happens
+- **AND** consequently the `session_completeness` view reads `in_flight` / `open_no_artifact` (NOT a terminal state) for the workflow until that reconciliation — the user-observable surface of the deliberate asymmetry
+- **AND** the dashboard's sweep log line SHALL report how many rows were cascade-closed
+
+#### Scenario: A recycled PID that reads alive leaves the row in-flight (deliberate false-negative)
+
+- **GIVEN** a supervisor died but the OS recycled its PID onto an unrelated live process within the 24h window
+- **WHEN** the sweep probes the PID and finds it alive
+- **THEN** the sweep SHALL decline to orphan the row (it cannot prove the original process is dead) — leaning toward leaving an alive-named row in-flight rather than risk a false terminal verdict; the row is reclaimed at the coarse session-level sweep
 

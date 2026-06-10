@@ -442,3 +442,50 @@ The system SHALL NOT introduce a Phase 4 process orchestrator that spawns review
 - **THEN** it SHALL NOT fork one adapter process per reviewer instance
 - **AND** the host AI CLI SHALL spawn sub-agents using its own per-task primitive
 
+### Requirement: Reviewers Run on Hosts Without a Sub-Agent Primitive
+
+Phase 4 SHALL be expressed host-neutrally so that a review runs on any supported AI CLI. When the host CLI can spawn sub-agents (e.g. Claude Code's Task tool, OpenCode's sub-agent primitive), reviewers MAY be spawned in parallel. When the host CLI has no sub-agent primitive (e.g. Gemini CLI, Codex), the orchestrator SHALL run each reviewer sequentially as a fresh analytical pass within its own conversation. Both strategies SHALL journal each instance identically via the `ocr session` command family, so downstream consumers cannot distinguish them. The skill instructions SHALL NOT assume a Claude-style Task tool exists.
+
+#### Scenario: Host with a sub-agent primitive
+
+- **GIVEN** a host CLI that can spawn sub-agents
+- **WHEN** Phase 4 runs
+- **THEN** the orchestrator MAY spawn one sub-agent per resolved reviewer instance in parallel
+
+#### Scenario: Host without a sub-agent primitive
+
+- **GIVEN** a host CLI with no Task/sub-agent primitive (e.g. Gemini CLI, Codex)
+- **WHEN** Phase 4 runs
+- **THEN** the orchestrator SHALL run each resolved reviewer instance sequentially as a fresh pass in the same conversation
+- **AND** each instance SHALL be journaled via `ocr session start-instance` / `bind-vendor-id` / `beat` / `end-instance` exactly as a spawned reviewer would be
+
+#### Scenario: Sequential reviewers do not fork OCR processes
+
+- **WHEN** reviewers run sequentially on a host without a sub-agent primitive
+- **THEN** OCR SHALL NOT fork one adapter process per reviewer (consistent with "OCR Does Not Own Phase 4 Process Spawning")
+- **AND** the reviewers run within the host AI CLI's own process
+
+### Requirement: Atomic Completion Contract
+
+The orchestrating Tech Lead SHALL finalize rounds and close sessions exclusively through the atomic state porcelain (`ocr state complete-round` / `complete-map` / `finish`), so that completion is always invariant-checked and a workflow can never be reported complete before its work is done.
+
+#### Scenario: Round finalized via the atomic command
+
+- **GIVEN** the orchestrator has produced `final.md` and round metadata for the current round
+- **WHEN** it finalizes the round
+- **THEN** it SHALL pipe the metadata to `ocr state complete-round --stdin` (which atomically records the artifact, the `round_completed` event, the round advance, and the transition to `complete`)
+- **AND** it SHALL NOT rely on a sequence of separate `transition` + `round-complete` + `close` calls that can partially apply
+
+#### Scenario: Session closed only when complete
+
+- **WHEN** the orchestrator ends a workflow
+- **THEN** it SHALL call `ocr state finish`, which refuses to close a session whose current round is not complete
+- **AND** if the workflow is being abandoned, it SHALL call `ocr state finish --abort`, recording a non-success terminal state
+
+#### Scenario: Resume diagnoses what is missing
+
+- **GIVEN** the orchestrator resumes a session that may have ended prematurely
+- **WHEN** it inspects state
+- **THEN** it SHALL call `ocr state status --json` to obtain the `completeness_state` and the unmet obligations
+- **AND** it SHALL act on the reported `next_action` rather than inferring state from filesystem inspection
+
