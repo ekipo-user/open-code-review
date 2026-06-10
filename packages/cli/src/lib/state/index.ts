@@ -848,7 +848,11 @@ export async function stateCompleteRound(
 
   // Validate schema (any failure → SCHEMA_INVALID).
   let meta: RoundMeta;
-  let counts: SynthesisCounts;
+  // The derived counts from `computeRoundCounts` use `*Count` field names
+  // (blockerCount, …), distinct from the synthesis-meta `SynthesisCounts`
+  // shape (blockers/should_fix/suggestions). Bind to the function's actual
+  // return type so the metadata reads below type-check.
+  let counts: ReturnType<typeof computeRoundCounts>;
   try {
     const rawJsonString = readJsonFromSource(params);
     const label = params.source === "file" ? params.filePath : "stdin";
