@@ -106,30 +106,35 @@ session-level overrides. The returned array is the source of truth for which rev
 to run, what to name them, and which model each instance should run on.
 
 **Instantiating reviewers (host-neutral)**: How you run each resolved reviewer instance
-depends on your host CLI's capabilities — choose the strategy your environment supports:
-- **Host can spawn parallel sub-agents** (e.g. Claude Code's Task tool, OpenCode's
-  sub-agent primitive): spawn one sub-agent per instance, as before.
-- **Host has no sub-agent primitive** (e.g. Gemini CLI, Codex, and other environments
-  without a Task tool): run each reviewer **sequentially** as a fresh analytical pass in
-  this same conversation — one instance at a time, using the reviewer-task template.
-Both strategies are first-class; do not assume a Claude-style Task tool exists. If unsure
-of your host's capabilities, run `ocr host capabilities --tool <your-host-id>` (e.g.
-`--tool gemini`) — `subagentSpawn: false` means use the sequential strategy.
+depends on whether your host's agent runtime has an **in-agent sub-agent primitive**.
+Choose the strategy your environment supports — if unsure, run `ocr host capabilities
+--tool <your-host-id> --json` and read `subagentSpawn`:
+- **`subagentSpawn: true`** (e.g. Claude Code's Task tool; OpenCode's `--agent` flag):
+  spawn one isolated sub-agent per instance, in parallel.
+- **`subagentSpawn: false`** (e.g. Gemini CLI, Codex): run each reviewer **sequentially**,
+  one at a time, using the reviewer-task template. See `references/workflow.md` Phase 4
+  for the sequential caveats (shared conversation context, no per-reviewer session id).
+
+Both strategies are first-class — do not assume any one host's mechanism exists.
 
 **Per-instance models**: When the resolved JSON includes a non-null `model` field on an
 instance, apply it however your host allows — pass it to a per-task primitive if your
-host has one (e.g. Claude Code subagent `model:` frontmatter), or select that model when
-you run the reviewer. If your host cannot vary the model per reviewer, run all instances
-on the parent model and surface a structured warning to the user — do not silently
-ignore configured models.
+host has one, or select that model when you run the reviewer. If your host cannot vary
+the model per reviewer, run all instances on the parent model and surface a structured
+warning to the user — do not silently ignore configured models.
 
-**Journaling**: For every reviewer instance you run in Phase 4 — spawned in parallel or
-run sequentially — call `ocr session start-instance` before, `bind-vendor-id` once the
-host CLI emits its session id, `beat` periodically, and `end-instance` on completion. The
-dashboard's liveness, "Continue here," and "Pick up in terminal" affordances all read
-from this journal, and it is what makes the sequential and parallel strategies
-indistinguishable to the dashboard — without it, the dashboard cannot tell a crashed
-reviewer from a paused one.
+**Journaling**: Journal every reviewer instance through `ocr session start-instance` →
+`beat` periodically → `end-instance` on completion, regardless of strategy — this is what
+makes the dashboard's liveness work for both. **Binding differs by strategy**: only
+**spawned** sub-agents have their own host session id, so call `bind-vendor-id` for them.
+**Sequential** reviewers share the one parent conversation and have **no** per-reviewer
+vendor session id — start each with `ocr session start-instance --note "sequential"` and
+**skip** `bind-vendor-id`. Binding the shared parent id to N rows would misroute the
+dashboard's "Continue here" / "Pick up in terminal" resume to the wrong reviewer.
+
+> **Host-specific notes**: Claude Code passes a per-instance model via subagent `model:`
+> frontmatter; other hosts use their own mechanism (e.g. a `--model` flag per spawned
+> reviewer). The skill stays mechanism-agnostic — consult your host's docs.
 
 ## Reviewer Agency
 
