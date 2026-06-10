@@ -19,6 +19,10 @@ Phase 4 instantiates N reviewer personas. Today the dashboard's `command-runner.
 
 - **`adapter.spawnReviewer()` is separate from `adapter.spawn()`** so a reviewer child can carry its own prompt (assembled from `references/reviewer-task.md`), its own `--model`, a read-leaning tool set, and its own cwd/env — without disturbing orchestrator semantics. It returns the same `SpawnResult` contract so the existing stream-parse pipeline and `ocr session` journaling are reused verbatim. Both strategies therefore produce identical `agent_sessions` rows, keeping the dashboard blind to which one ran.
 
+  - **Interface shape: prefer two interfaces over an optional method or an abstract base class** (issue #28 review Watch-4). `spawnReviewer` only applies to hosts OCR fans out (`supportsSubagentSpawn = false`), so model it as a distinct capability interface (e.g. `ReviewerSpawning`) that those adapters additionally implement, rather than adding an optional `spawnReviewer?` to `AiCliAdapter` (forces every adapter + the runner to null-check) or an abstract base class (forces an inheritance hierarchy onto otherwise-independent adapters). The command-runner narrows via a type guard (`'spawnReviewer' in adapter`) at the one fan-out site.
+
+- **Important-2 carry-over (sequential journaling)**: the sequential fallback this builds on does NOT bind a per-reviewer `vendor_session_id` (reviewers share one parent conversation). Child-spawned reviewers, by contrast, DO each own a host session, so this change restores per-reviewer `bind-vendor-id` and the resume affordances that sequential reviewers lack — a concrete UX win to call out when scoping.
+
 - **The #28/#27 seam.** `add-host-capability-model` (#28) owns capability declaration, the host-neutral skill prose, and the sequential fallback. This change (absorbing #27) owns OCR-orchestrated child spawning and per-reviewer `--model` application. #27's model-resolution chain (`team resolve` → `ReviewerInstance.model`) already exists and is reused as-is.
 
 ## Risks / Trade-offs

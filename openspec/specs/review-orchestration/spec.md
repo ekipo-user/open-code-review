@@ -444,7 +444,7 @@ The system SHALL NOT introduce a Phase 4 process orchestrator that spawns review
 
 ### Requirement: Reviewers Run on Hosts Without a Sub-Agent Primitive
 
-Phase 4 SHALL be expressed host-neutrally so that a review runs on any supported AI CLI. When the host CLI can spawn sub-agents (e.g. Claude Code's Task tool, OpenCode's sub-agent primitive), reviewers MAY be spawned in parallel. When the host CLI has no sub-agent primitive (e.g. Gemini CLI, Codex), the orchestrator SHALL run each reviewer sequentially as a fresh analytical pass within its own conversation. Both strategies SHALL journal each instance identically via the `ocr session` command family, so downstream consumers cannot distinguish them. The skill instructions SHALL NOT assume a Claude-style Task tool exists.
+Phase 4 SHALL be expressed host-neutrally so that a review runs on any supported AI CLI. When the host CLI can spawn sub-agents (e.g. Claude Code's Task tool, OpenCode's sub-agent primitive), reviewers MAY be spawned in parallel. When the host CLI has no sub-agent primitive (e.g. Gemini CLI, Codex), the orchestrator SHALL run each reviewer sequentially as a fresh analytical pass within its own conversation. Both strategies SHALL journal each instance's **liveness** identically via the `ocr session` command family (`start-instance` / `beat` / `end-instance`). Binding a vendor session id (`bind-vendor-id`) is reserved for spawned sub-agents that each own a distinct host session; sequential reviewers share the one parent conversation and SHALL NOT bind a per-reviewer vendor session id. The skill instructions SHALL NOT assume a Claude-style Task tool exists.
 
 #### Scenario: Host with a sub-agent primitive
 
@@ -457,7 +457,15 @@ Phase 4 SHALL be expressed host-neutrally so that a review runs on any supported
 - **GIVEN** a host CLI with no Task/sub-agent primitive (e.g. Gemini CLI, Codex)
 - **WHEN** Phase 4 runs
 - **THEN** the orchestrator SHALL run each resolved reviewer instance sequentially as a fresh pass in the same conversation
-- **AND** each instance SHALL be journaled via `ocr session start-instance` / `bind-vendor-id` / `beat` / `end-instance` exactly as a spawned reviewer would be
+- **AND** each instance SHALL be journaled for liveness via `ocr session start-instance` / `beat` / `end-instance`
+- **AND** each instance SHALL be started with `--note "sequential strategy"` and SHALL NOT be bound to a vendor session id (no `bind-vendor-id`), because the reviewers share the one parent conversation and have no per-reviewer host session
+
+#### Scenario: Sequential reviewers render without resume affordances
+
+- **GIVEN** sequential reviewer rows journaled without a bound vendor session id
+- **WHEN** the dashboard renders the round's reviewers
+- **THEN** it SHALL show their liveness state (Running / Stalled / Orphaned / done)
+- **AND** it SHALL NOT offer "Continue here" / "Pick up in terminal" resume for them, since there is no per-reviewer host session to resume — this is expected, not an error
 
 #### Scenario: Sequential reviewers do not fork OCR processes
 

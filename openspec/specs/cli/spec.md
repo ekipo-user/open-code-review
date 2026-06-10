@@ -601,7 +601,7 @@ The dashboard code SHALL NOT be loaded unless the user runs `ocr dashboard`. Com
 
 #### Scenario: Dashboard dependencies isolated
 
-- **GIVEN** the dashboard adds significant dependencies (React, Socket.IO, Mermaid)
+- **GIVEN** the dashboard pulls in heavy client dependencies (such as its UI framework, real-time transport, and any diagramming library)
 - **WHEN** user runs `ocr init` or `ocr progress`
 - **THEN** none of these dependencies are loaded
 - **AND** CLI startup time is unaffected
