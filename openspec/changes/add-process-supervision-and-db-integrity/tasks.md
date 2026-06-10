@@ -22,8 +22,21 @@
 - [x] 4.1 Dashboard startup reaps `ocr.db.<pid>.tmp` orphans (PID + age guarded)
 - [x] 4.2 Single-instance: reap prior OCR-dashboard tree + take over (no port-increment coexistence)
 
-## 5. Follow-ups (tracked; not in this change)
+## 5. State finalization (WS-C)
 
-- [ ] 5.1 `reconcileWorkflowOnExit` — auto-close `active`+`complete` sessions via guarded `stateClose` (WS-C)
-- [ ] 5.2 `ocr db doctor/prune/vacuum` operator commands incl. FK-orphan sweep (WS-E)
-- [ ] 5.3 File-stdio redirect as belt-and-suspenders for pipe inheritance (WS-A hardening)
+- [x] 5.1 `reconcileWorkflowOnExit` + `reconcileCompletedSessions` — auto-close `active`+`complete` sessions via the guarded `stateClose` (no-op unless complete + quiesced); exported via a new `@open-code-review/cli/state` subpath
+- [x] 5.2 Wire into dashboard `finishExecution` (per-execution, fire-and-forget) + startup/periodic sweep
+- [x] 5.3 `hasInFlightDependents` promoted to the db barrel as the single "in flight" predicate; reconcile-on-exit tests
+
+## 6. Operator DB maintenance (WS-E full)
+
+- [x] 6.1 `maintenance.ts`: `collectDbHealth`, `fixDb` (FK-orphan sweep via ordered anti-joins with `PRAGMA foreign_keys` toggled in autocommit + system-of-record tables protected), `vacuumDb`, `pruneDb`, snapshot-before-mutate
+- [x] 6.2 `ocr db doctor [--fix] / vacuum / prune` command; live-dashboard exclusive-lock guard; `--dry-run` for prune
+- [x] 6.3 `reapOrphanDbFiles` extracted to the shared maintenance module (dashboard reaper now re-uses it); maintenance tests
+
+## 7. File-stdio process isolation (WS-A hardening)
+
+- [x] 7.1 Detached workflow spawns redirect stdout/stderr to a per-execution log file (`data/exec-logs/<uid>.log`) instead of OS pipes; parent closes its fd + `unref`s
+- [x] 7.2 `FileTailer` streams the log to the existing parse loop (UTF-8-boundary-safe via `StringDecoder`); drained on close; tests
+- [x] 7.3 `reapStaleExecLogs` prunes logs older than 7 days on dashboard startup
+- [x] 7.4 Fix: `finishExecution` CAS now reads `changes` via `prepare().run()` (the engine's `run()` discards it)

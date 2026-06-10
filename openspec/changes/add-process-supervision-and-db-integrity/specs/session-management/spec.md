@@ -26,6 +26,23 @@ The command-runner SHALL run a per-execution watchdog that terminates a process 
 - **GIVEN** an execution alive beyond the configured hard deadline with no result
 - **THEN** the watchdog SHALL reap the tree and finalize with a distinct terminal exit code (`-5`), separate from cancelled (`-2`/`-4`) and orphaned-dead (`-3`)
 
+### Requirement: Auto-Finalize a Completed-But-Open Session
+
+A session whose current round/run is provably complete (its `round_completed`/`map_completed` event exists) but whose `status` is still `active` — the wedge signature, left when an agent finishes its round but dies before `ocr state finish` — SHALL be driven to `closed` automatically through the guarded close path, not left open forever. Finalization SHALL be a no-op unless the session is `active`, the completion invariant holds, AND no dependent execution is still in flight, so it is safe to attempt on every execution exit. It SHALL be reachable both per-execution (when a dashboard-spawned execution finalizes) and via a startup/periodic sweep (recovering sessions whose finishing execution ran while no server was up). It SHALL never close an incomplete session and never abort.
+
+#### Scenario: A finished round left active is closed
+
+- **GIVEN** a session that is `active` with a `round_completed` event for its current round and no in-flight executions
+- **WHEN** reconciliation runs (per-execution exit or sweep)
+- **THEN** the session SHALL be closed through the guarded close path (completion invariant + cascade intact)
+- **AND** its `completeness_state` SHALL become `complete`
+
+#### Scenario: An incomplete or busy session is left alone
+
+- **GIVEN** a session that is `active` but whose current round has no terminal artifact event, OR that still has an in-flight dependent execution
+- **WHEN** reconciliation runs
+- **THEN** it SHALL make no change (no close, no abort)
+
 ### Requirement: Finalization Is First-Wins Idempotent
 
 An execution's finalization MAY be triggered by the `result` event, the process `close`, the watchdog, or cancel. Exactly one SHALL take effect; the rest SHALL be no-ops, so a row is never double-finalized or double-emitted.
