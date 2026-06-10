@@ -4,12 +4,11 @@
   "sourceRoot": "packages/cli/src",
   "projectType": "application",
   "tags": ["scope:cli", "type:app"],
-  "implicitDependencies": ["dashboard"],
   "targets": {
     "build:bundle": {
       "executor": "nx:run-commands",
       "outputs": ["{projectRoot}/dist/index.js"],
-      "dependsOn": ["^build"],
+      "dependsOn": ["^build", { "target": "build", "projects": ["dashboard"] }],
       "options": {
         "command": "node build.mjs",
         "cwd": "{projectRoot}"
