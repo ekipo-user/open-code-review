@@ -10,7 +10,7 @@
  */
 
 import { type ChildProcess } from 'node:child_process'
-import { spawnBinary } from '@open-code-review/platform'
+import { spawnBinary, reapTree, isProcessAlive } from '@open-code-review/platform'
 import { readFileSync, writeFileSync, unlinkSync, mkdirSync, existsSync } from 'node:fs'
 import { dirname, join } from 'node:path'
 import type { Server as SocketIOServer, Socket } from 'socket.io'
@@ -370,7 +370,37 @@ type ProcessEntry = {
   cancelled: boolean
   /** Workflow-id auto-link polling timer; cleared on process close. */
   linkPoll?: ReturnType<typeof setInterval>
+  /**
+   * First-wins finalization guard. Finalization can be triggered by the
+   * vendor `result` event (work done), `proc.on('close')` (EOF), the watchdog,
+   * or cancel — whichever fires first wins; the rest are no-ops. Decouples
+   * finalization from stdio EOF, which a leaked grandchild can hold open.
+   */
+  finalized?: boolean
+  /** Epoch ms when the terminal `result` event was seen (watchdog input). */
+  resultSeenAt?: number
+  /** Whether the terminal `result` reported an error (sets the watchdog exit code). */
+  resultIsError?: boolean
+  /** Per-execution supervisor/watchdog timer; cleared on finalize. */
+  watchdog?: ReturnType<typeof setInterval>
+  /** Last epoch ms a heartbeat was written for this row (throttle). */
+  lastBeatWrite?: number
 }
+
+// ── Watchdog / supervision timing ──
+// The watchdog reaps a wedged review whose work is done but whose process
+// won't exit (the leaked-grandchild-holds-the-pipe failure), and bounds the
+// "alive but hung with no result" case. The `result`-grace path is the primary
+// reaper (fires ~30s after the agent's work completes); the hard deadline is a
+// last-resort cap.
+const WATCHDOG_TICK_MS = 10_000
+const POST_RESULT_GRACE_MS = 30_000
+const HARD_DEADLINE_MS = 60 * 60 * 1000 // 60 min; generous for large reviewer fleets
+/** Heartbeat write throttle so streaming output doesn't hammer the WAL. */
+const HEARTBEAT_THROTTLE_MS = 5_000
+/** Terminal exit code stamped when the watchdog reaps a hung-past-deadline
+ *  process — distinct from -2/-4 (cancelled) and -3 (orphaned/dead-pid sweep). */
+const WATCHDOG_DEADLINE_EXIT_CODE = -5
 
 /** Active commands keyed by execution_id */
 const activeCommands = new Map<number, ProcessEntry>()
@@ -610,25 +640,19 @@ export function registerCommandHandlers(
       if (!proc) return  // Process not yet spawned
       const pid = proc.pid
 
-      // Only use process group kill (-pid) for detached processes (AI commands).
-      // Non-detached utility commands should be killed directly via proc.kill().
       if (entry.detached && pid) {
-        try { process.kill(-pid, 'SIGTERM') } catch { proc.kill('SIGTERM') }
+        // Reap the WHOLE descendant tree (SIGTERM → grace → SIGKILL), robust to
+        // children that escaped the process group via setsid() — e.g. a leaked
+        // MCP daemon. A plain `kill(-pid)` would miss them.
+        reapTree(pid)
       } else {
+        // Non-detached utility commands: direct kill, escalate after a grace.
         proc.kill('SIGTERM')
+        const killTimer = setTimeout(() => {
+          if (activeCommands.has(targetId)) proc.kill('SIGKILL')
+        }, 5000)
+        proc.once('close', () => clearTimeout(killTimer))
       }
-
-      // Escalate to SIGKILL after timeout
-      const killTimer = setTimeout(() => {
-        if (!activeCommands.has(targetId)) return
-        if (entry.detached && pid) {
-          try { process.kill(-pid, 'SIGKILL') } catch { /* already dead */ }
-        }
-        proc.kill('SIGKILL')
-      }, 5000)
-
-      // Clear timer when process exits
-      proc.once('close', () => clearTimeout(killTimer))
     } catch (err) {
       console.error('Error in command:cancel handler:', err)
       socket.emit('error', { message: 'Internal error' })
@@ -891,6 +915,50 @@ function spawnAiCommand(
   // Stash on the entry so process-close handlers can clear it.
   entry.linkPoll = linkPoll
 
+  // ── Liveness heartbeat + supervisor watchdog ──
+  // The parent execution row's heartbeat was previously seeded once at spawn
+  // and never bumped, so every long review drifted to "stalled". Bump it on
+  // output activity (throttled), and let the watchdog keep it fresh during
+  // long silent stretches and reap a wedged-but-alive process.
+  const bumpHeartbeat = (): void => {
+    if (entry.finalized) return
+    const now = Date.now()
+    if (now - (entry.lastBeatWrite ?? 0) < HEARTBEAT_THROTTLE_MS) return
+    entry.lastBeatWrite = now
+    try {
+      db.run(
+        `UPDATE command_executions SET last_heartbeat_at = datetime('now') WHERE id = ? AND finished_at IS NULL`,
+        [executionId],
+      )
+    } catch (err) {
+      console.error('[command-runner] heartbeat bump failed:', err)
+    }
+  }
+  entry.watchdog = setInterval(() => {
+    if (entry.finalized) return
+    const pid = entry.process?.pid
+    if (!pid) return
+    const now = Date.now()
+    // (1) Work done but process won't exit (leaked grandchild holds the pipe):
+    //     reap the whole tree and finalize. This is the exact incident class.
+    if (entry.resultSeenAt && now - entry.resultSeenAt > POST_RESULT_GRACE_MS) {
+      console.warn(`[watchdog] execution ${executionId}: result seen but process alive after grace — reaping tree`)
+      reapTree(pid)
+      finishExecution(io, db, ocrDir, executionId, entry.resultIsError ? 1 : 0, entry.outputBuffer)
+      return
+    }
+    // (2) Absolute deadline regardless of state.
+    if (now - Date.parse(entry.startedAt) > HARD_DEADLINE_MS) {
+      console.warn(`[watchdog] execution ${executionId}: exceeded hard deadline — reaping tree`)
+      reapTree(pid)
+      finishExecution(io, db, ocrDir, executionId, WATCHDOG_DEADLINE_EXIT_CODE, entry.outputBuffer)
+      return
+    }
+    // (3) Healthy: keep the heartbeat fresh through silent stretches.
+    if (isProcessAlive(pid)) bumpHeartbeat()
+  }, WATCHDOG_TICK_MS)
+  entry.watchdog.unref()
+
   // Emit initial status
   io.emit('command:output', {
     execution_id: executionId,
@@ -990,6 +1058,17 @@ function spawnAiCommand(
         emitStreamEvent(evt)
         break
       }
+      case 'result': {
+        // The agent's turn loop is done. Record it for the watchdog: a healthy
+        // process exits within a moment (the `close` handler finalizes
+        // normally); a wedged one (leaked grandchild holding the pipe) is reaped
+        // by the watchdog after POST_RESULT_GRACE_MS so finalization never hangs
+        // on stdio EOF.
+        entry.resultSeenAt = Date.now()
+        entry.resultIsError = evt.isError
+        emitStreamEvent(evt)
+        break
+      }
     }
   }
 
@@ -1004,6 +1083,10 @@ function spawnAiCommand(
   proc.stderr?.setEncoding('utf-8')
 
   proc.stdout?.on('data', (chunk: string) => {
+    // Output activity is the most truthful liveness signal — the agent is
+    // producing tokens. Bump the parent row's heartbeat (throttled) so a long
+    // review no longer drifts to "stalled".
+    bumpHeartbeat()
     lineBuffer += chunk
     const lines = lineBuffer.split('\n')
     lineBuffer = lines.pop() ?? ''
@@ -1108,12 +1191,30 @@ function finishExecution(
   const finishedAt = new Date().toISOString()
   const entry = activeCommands.get(executionId)
 
-  db.run(
+  // First-wins: finalization may be triggered by the `result` event, the
+  // `close` handler, the watchdog, or cancel. Only the first runs; the rest
+  // are no-ops. Without this, the same execution would be double-finalized
+  // (and double-emitted) when more than one trigger fires.
+  if (entry?.finalized) return
+  if (entry) {
+    entry.finalized = true
+    if (entry.watchdog) {
+      clearInterval(entry.watchdog)
+      entry.watchdog = undefined
+    }
+  }
+
+  // CAS write — only finalize a row still in-flight, so a late close after an
+  // already-finalized result can never clobber the recorded exit code.
+  const res = db.run(
     `UPDATE command_executions
      SET exit_code = ?, finished_at = ?, output = ?, pid = NULL
-     WHERE id = ?`,
+     WHERE id = ? AND finished_at IS NULL`,
     [code, finishedAt, output, executionId]
   )
+  // Row already finalized in the DB (e.g. by a prior trigger on a stale entry)
+  // — nothing more to emit.
+  if (res.changes === 0 && !entry) return
 
   // Cross-check workflow completeness (event-derived, via the
   // session_completeness view) so the UI distinguishes a genuinely finished

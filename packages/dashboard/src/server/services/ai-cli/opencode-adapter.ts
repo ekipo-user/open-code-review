@@ -143,6 +143,11 @@ export class OpenCodeAdapter implements AiCliAdapter {
       stdio: ['ignore', 'pipe', 'pipe'],
     })
 
+    // See claude-adapter: detached workflows are unref'd so a wedged child can
+    // never hold the dashboard's event loop open; the command-runner reaps the
+    // tree and finalizes via the `result` event + watchdog.
+    if (isWorkflow) proc.unref()
+
     return { process: proc, detached: isWorkflow }
   }
 

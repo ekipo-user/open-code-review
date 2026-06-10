@@ -122,6 +122,12 @@ export class ClaudeCodeAdapter implements AiCliAdapter {
       stdio: ['pipe', 'pipe', 'pipe'],
     })
 
+    // Detached workflows lead their own process group (so the command-runner
+    // can reap the whole tree) and are unref'd so the dashboard's event loop is
+    // never held open by a wedged child — finalization is driven by the vendor
+    // `result` event + watchdog, not by the parent waiting on the child handle.
+    if (isWorkflow) proc.unref()
+
     // Write prompt to stdin
     proc.stdin?.write(opts.prompt)
     proc.stdin?.end()
@@ -353,6 +359,19 @@ class ClaudeLineParser implements LineParser {
       const message =
         typeof parsed['message'] === 'string' ? (parsed['message'] as string) : 'Agent error'
       events.push({ type: 'error', source: 'agent', message })
+    }
+
+    // Terminal `result` line — the turn loop is done. Emitted before the
+    // process necessarily exits, so the command-runner can finalize on this
+    // instead of waiting for stdio EOF (which a leaked grandchild can hold
+    // open). `subtype` is e.g. 'success' | 'error_max_turns'; `is_error` is
+    // the vendor's own failure flag.
+    if (type === 'result') {
+      events.push({
+        type: 'result',
+        isError: parsed['is_error'] === true,
+        subtype: typeof parsed['subtype'] === 'string' ? (parsed['subtype'] as string) : undefined,
+      })
     }
 
     return events
