@@ -88,3 +88,48 @@ export function spawnBinary(
     ...(isWindows && { shell: true, windowsHide: true }),
   });
 }
+
+// ── Reviewer icons ──
+
+/**
+ * Canonical icon mapping for built-in reviewers. The string values are
+ * resolved to lucide-react glyphs by the dashboard's icon registry; the CLI
+ * writes them verbatim into `reviewers-meta.json`. This is the single source
+ * of truth shared by both packages so the two never drift.
+ */
+export const BUILTIN_ICON_MAP: Record<string, string> = {
+  architect: "blocks",
+  fullstack: "layers",
+  reliability: "activity",
+  "staff-engineer": "compass",
+  principal: "crown",
+  frontend: "layout",
+  backend: "server",
+  infrastructure: "cloud",
+  performance: "gauge",
+  accessibility: "accessibility",
+  data: "database",
+  devops: "rocket",
+  dx: "terminal",
+  mobile: "smartphone",
+  security: "shield-alert",
+  quality: "sparkles",
+  testing: "test-tubes",
+  ai: "bot",
+  "docs-writer": "file-text",
+};
+
+/**
+ * Resolve the default icon for a reviewer given its id and tier.
+ *
+ * Built-in reviewers get their mapped glyph; everything else falls back to a
+ * tier-appropriate generic (`brain` for personas, `user` otherwise). This is
+ * the authority every write/read boundary uses to guarantee a reviewer always
+ * has a non-empty icon, so the dashboard never renders an `undefined` icon.
+ *
+ * `tier` is accepted as a plain string to avoid coupling this package to the
+ * `ReviewerTier` union, which is declared separately in the CLI and dashboard.
+ */
+export function defaultIconFor(id: string, tier: string): string {
+  return BUILTIN_ICON_MAP[id] ?? (tier === "persona" ? "brain" : "user");
+}

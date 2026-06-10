@@ -13,6 +13,7 @@ import type { AIToolConfig } from "./config";
 import { ensureGitignore } from "./gitignore.js";
 import type { ReviewersMeta, ReviewerMeta, ReviewerTier } from "./state/types.js";
 import { parseTeamConfigYaml } from "./team-config.js";
+import { defaultIconFor } from "@open-code-review/platform";
 
 const require = createRequire(import.meta.url);
 
@@ -169,28 +170,9 @@ function installCommandsForTool(
 }
 
 // ── Built-in reviewer metadata for static generation ──
-
-const BUILTIN_ICON_MAP: Record<string, string> = {
-  architect: "blocks",
-  fullstack: "layers",
-  reliability: "activity",
-  "staff-engineer": "compass",
-  principal: "crown",
-  frontend: "layout",
-  backend: "server",
-  infrastructure: "cloud",
-  performance: "gauge",
-  accessibility: "accessibility",
-  data: "database",
-  devops: "rocket",
-  dx: "terminal",
-  mobile: "smartphone",
-  security: "shield-alert",
-  quality: "sparkles",
-  testing: "test-tubes",
-  ai: "bot",
-  "docs-writer": "file-text",
-};
+//
+// The reviewer→icon mapping lives in `@open-code-review/platform`
+// (`defaultIconFor`) so the CLI and dashboard share one source of truth.
 
 const HOLISTIC_IDS = new Set(["architect", "fullstack", "reliability", "staff-engineer", "principal"]);
 const SPECIALIST_IDS = new Set([
@@ -298,7 +280,7 @@ export function generateReviewersMeta(
         id,
         name: extractReviewerName(content),
         tier,
-        icon: BUILTIN_ICON_MAP[id] ?? (tier === "persona" ? "brain" : "user"),
+        icon: defaultIconFor(id, tier),
         description: extractReviewerDescription(content),
         focus_areas: extractFocusAreas(content),
         is_default: defaultTeamIds.has(id),

@@ -14,6 +14,7 @@ import { join } from "node:path";
 import { requireOcrSetup } from "../lib/guards.js";
 import { generateReviewersMeta } from "../lib/installer.js";
 import type { ReviewersMeta, ReviewerTier } from "../lib/state/types.js";
+import { defaultIconFor } from "@open-code-review/platform";
 
 // ── Helpers ──
 
@@ -32,7 +33,7 @@ async function readStdin(): Promise<string> {
 const VALID_TIERS = new Set<ReviewerTier>(["holistic", "specialist", "persona", "custom"]);
 const SLUG_RE = /^[a-z][a-z0-9-]*$/;
 
-function validateReviewersMeta(data: unknown): ReviewersMeta {
+export function validateReviewersMeta(data: unknown): ReviewersMeta {
   if (typeof data !== "object" || data === null || Array.isArray(data)) {
     throw new Error("Payload must be a JSON object");
   }
@@ -76,6 +77,17 @@ function validateReviewersMeta(data: unknown): ReviewersMeta {
     }
     if (!Array.isArray(r.focus_areas)) {
       throw new Error(`${prefix}.focus_areas must be an array`);
+    }
+
+    // Icon: a non-string is a real bug worth surfacing; a missing/empty icon
+    // is backfilled with the canonical default so the persisted JSON always
+    // carries a renderable icon (guards the dashboard against an `undefined`
+    // icon read — see issue #28).
+    if (r.icon !== undefined && typeof r.icon !== "string") {
+      throw new Error(`${prefix}.icon must be a string if provided (got ${JSON.stringify(r.icon)})`);
+    }
+    if (typeof r.icon !== "string" || r.icon.length === 0) {
+      r.icon = defaultIconFor(r.id, r.tier as ReviewerTier);
     }
 
     // Optional fields for personas

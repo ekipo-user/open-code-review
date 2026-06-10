@@ -6,6 +6,7 @@ import { Router } from 'express'
 import { readFileSync, existsSync, watch, type FSWatcher } from 'node:fs'
 import { join } from 'node:path'
 import type { Server as SocketIOServer } from 'socket.io'
+import { defaultIconFor } from '@open-code-review/platform'
 import type { ReviewerMeta } from '../../shared/types.js'
 
 type ReviewersResponse = {
@@ -13,7 +14,15 @@ type ReviewersResponse = {
   defaults: string[]
 }
 
-function readReviewersMeta(ocrDir: string): ReviewersResponse {
+/**
+ * Reviewer entry as it may exist at rest: `reviewers-meta.json` written by an
+ * older CLI, hand-edited, or produced by a non-stdin path can omit `icon`.
+ * The read boundary below backfills it so the wire type (`ReviewerMeta`, with
+ * a required `icon`) is honestly satisfied for every consumer.
+ */
+type RawReviewerMeta = Omit<ReviewerMeta, 'icon'> & { icon?: string }
+
+export function readReviewersMeta(ocrDir: string): ReviewersResponse {
   const metaPath = join(ocrDir, 'reviewers-meta.json')
   if (!existsSync(metaPath)) {
     return { reviewers: [], defaults: [] }
@@ -21,8 +30,15 @@ function readReviewersMeta(ocrDir: string): ReviewersResponse {
 
   try {
     const raw = readFileSync(metaPath, 'utf-8')
-    const meta = JSON.parse(raw) as { reviewers?: ReviewerMeta[] }
-    const reviewers = meta.reviewers ?? []
+    const meta = JSON.parse(raw) as { reviewers?: RawReviewerMeta[] }
+    // Guarantee every reviewer has a renderable icon before it reaches the
+    // client. This is the last line of defense behind issue #28's icon crash:
+    // it protects every dashboard `ReviewerIcon` call site at once, regardless
+    // of how stale or hand-edited the on-disk metadata is.
+    const reviewers: ReviewerMeta[] = (meta.reviewers ?? []).map((r) => ({
+      ...r,
+      icon: r.icon || defaultIconFor(r.id, r.tier),
+    }))
     const defaults = reviewers.filter((r) => r.is_default).map((r) => r.id)
     return { reviewers, defaults }
   } catch {

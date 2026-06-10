@@ -20,6 +20,7 @@ import {
   TestTubes,
   Brain,
   User,
+  FileText,
   type LucideIcon,
 } from 'lucide-react'
 
@@ -43,6 +44,7 @@ const ICON_MAP: Record<string, LucideIcon> = {
   sparkles: Sparkles,
   'shield-alert': ShieldAlert,
   'test-tubes': TestTubes,
+  'file-text': FileText,
   brain: Brain,
   user: User,
 }

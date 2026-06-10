@@ -1,4 +1,4 @@
-import { Component, type ReactNode } from 'react'
+import { Component, type ErrorInfo, type ReactNode } from 'react'
 import { AlertTriangle, RefreshCw } from 'lucide-react'
 
 type ErrorBoundaryProps = {
@@ -19,6 +19,13 @@ export class ErrorBoundary extends Component<ErrorBoundaryProps, ErrorBoundarySt
 
   static getDerivedStateFromError(error: Error): ErrorBoundaryState {
     return { hasError: true, error }
+  }
+
+  componentDidCatch(error: Error, errorInfo: ErrorInfo) {
+    // Log the React component stack so render crashes are diagnosable from the
+    // console. The visible "Something went wrong" card only shows the message;
+    // the component stack is what pinpoints which subtree threw.
+    console.error('ErrorBoundary caught a render error:', error, errorInfo.componentStack)
   }
 
   render() {

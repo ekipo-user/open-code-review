@@ -71,6 +71,9 @@ export function LivenessHeader({ workflowId }: LivenessHeaderProps) {
   if (status === 'idle') return null
 
   const meta = STATUS_META[status]
+  // Defensive: a future liveness status without a STATUS_META entry should not
+  // crash the header (the union is closed today, but this guards against drift).
+  if (!meta) return null
   const Icon = meta.icon
 
   return (
