@@ -58,6 +58,9 @@ export class OpenCodeAdapter implements AiCliAdapter {
   // until OpenCode adds per-task model support; OCR surfaces a warning to
   // the user when this happens.
   readonly supportsPerTaskModel = false
+  // OpenCode exposes a sub-agent primitive (`--agent`), so reviewer sub-agents
+  // can be spawned in-agent (uniform model — see supportsPerTaskModel above).
+  readonly supportsSubagentSpawn = true
 
   buildResumeArgs(vendorSessionId: string): string[] {
     return buildResumeArgsShared('opencode', vendorSessionId)

@@ -41,6 +41,7 @@ function stubAdapter(
     name: binary,
     binary,
     supportsPerTaskModel: false,
+    supportsSubagentSpawn: true,
     // The adapter contract requires both the argv form (canonical
     // for spawn) and the string form (for panel display). Tests
     // exercise `buildResumeCommand` mostly; we derive args from a

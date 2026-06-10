@@ -158,6 +158,15 @@ export interface AiCliAdapter {
    */
   readonly supportsPerTaskModel: boolean
   /**
+   * Whether the host CLI can spawn isolated reviewer sub-agents from within
+   * its own agent runtime (e.g. Claude Code's Task tool, OpenCode's subagent
+   * primitive). When `false`, Phase 4 runs reviewers sequentially in the
+   * parent conversation rather than as concurrent sub-agents. Orthogonal to
+   * `supportsPerTaskModel`: a host can spawn sub-agents yet not vary their
+   * model.
+   */
+  readonly supportsSubagentSpawn: boolean
+  /**
    * Returns the argv (binary excluded) for resuming a session with this
    * vendor's CLI. Canonical form — call this when you intend to
    * `spawn()` the vendor process. Owned by the adapter so the
