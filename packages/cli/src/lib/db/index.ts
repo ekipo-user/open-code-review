@@ -183,6 +183,7 @@ export {
   fixDb,
   vacuumDb,
   pruneDb,
+  pruneBackups,
 } from "./maintenance.js";
 export type {
   DbHealthReport,
@@ -195,6 +196,7 @@ export type {
   DbPruneOptions,
   DbPruneResult,
   DbPruneSessionPlan,
+  DbPruneBackupsResult,
 } from "./maintenance.js";
 export { getSchemaVersion } from "./migrations.js";
 

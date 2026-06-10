@@ -28,6 +28,7 @@ import {
   fixDb,
   vacuumDb,
   pruneDb,
+  pruneBackups,
   type DbHealthReport,
 } from "../lib/db/index.js";
 
@@ -385,8 +386,54 @@ const pruneSubcommand = new Command("prune")
     },
   );
 
+// ── prune-backups ──
+
+const pruneBackupsSubcommand = new Command("prune-backups")
+  .description("Delete old ocr.db.bak.* snapshots, keeping the most recent few")
+  .option(
+    "--keep <n>",
+    "retain the N most-recent backups (default 1; 0 removes all)",
+    (v) => parseInt(v, 10),
+    1,
+  )
+  .option("--dry-run", "show what would be deleted without deleting")
+  .action(async (options: { keep: number; dryRun?: boolean }) => {
+    const ocrDir = resolveOcrDir();
+    const dataDir = join(ocrDir, "data");
+    // Pure file hygiene — no DB lock, so no live-dashboard guard needed.
+    const result = pruneBackups(dataDir, dbPathFor(ocrDir), {
+      keep: options.keep,
+      dryRun: options.dryRun ?? false,
+    });
+
+    console.log();
+    if (result.deleted.length === 0) {
+      console.log(chalk.green("  ✓ No backups to remove"));
+      console.log();
+      return;
+    }
+    const verb = result.dryRun ? "Would delete" : "Deleted";
+    console.log(
+      chalk.bold(
+        `  ${verb} ${result.deleted.length} backup(s) — ${formatBytes(result.reclaimedBytes)}`,
+      ),
+    );
+    console.log();
+    for (const b of result.deleted) {
+      console.log(`    ${chalk.dim("·")} ${b.name} ${chalk.dim(`(${formatBytes(b.sizeBytes)})`)}`);
+    }
+    if (result.kept.length > 0) {
+      console.log();
+      console.log(
+        chalk.dim(`  Kept ${result.kept.length} most-recent backup(s) as a safety net.`),
+      );
+    }
+    console.log();
+  });
+
 export const dbCommand = new Command("db")
   .description("Inspect and maintain the OCR SQLite database")
   .addCommand(doctorSubcommand)
   .addCommand(vacuumSubcommand)
-  .addCommand(pruneSubcommand);
+  .addCommand(pruneSubcommand)
+  .addCommand(pruneBackupsSubcommand);

@@ -12,6 +12,7 @@ import {
   fixDb,
   vacuumDb,
   pruneDb,
+  pruneBackups,
   reapOrphanDbFiles,
   reapStaleExecLogs,
   type Database,
@@ -237,6 +238,56 @@ describe("reapStaleExecLogs", () => {
 
   it("returns [] when the exec-logs dir does not exist", () => {
     expect(reapStaleExecLogs(join(dataDir, "nope"))).toEqual([]);
+  });
+});
+
+describe("pruneBackups", () => {
+  function makeBackup(name: string, sizeBytes: number, mtimeS: number): void {
+    const full = join(dataDir, name);
+    writeFileSync(full, "x".repeat(sizeBytes));
+    utimesSync(full, mtimeS, mtimeS);
+  }
+
+  it("keeps the N most-recent backups and deletes the rest", () => {
+    const now = Date.now() / 1000;
+    makeBackup("ocr.db.bak.v11", 100, now - 300); // oldest
+    makeBackup("ocr.db.bak.preremediation.x", 200, now - 200);
+    makeBackup("ocr.db.bak.doctor.y", 50, now - 100); // newest
+
+    const result = pruneBackups(dataDir, dbPath, { keep: 1 });
+
+    // Newest (doctor.y) kept; the two older deleted.
+    expect(result.kept.map((b) => b.name)).toEqual(["ocr.db.bak.doctor.y"]);
+    expect(result.deleted.map((b) => b.name).sort()).toEqual([
+      "ocr.db.bak.preremediation.x",
+      "ocr.db.bak.v11",
+    ]);
+    expect(result.reclaimedBytes).toBe(300);
+    expect(existsSync(join(dataDir, "ocr.db.bak.v11"))).toBe(false);
+    expect(existsSync(join(dataDir, "ocr.db.bak.doctor.y"))).toBe(true);
+  });
+
+  it("keep: 0 removes every backup", () => {
+    const now = Date.now() / 1000;
+    makeBackup("ocr.db.bak.a", 10, now - 100);
+    makeBackup("ocr.db.bak.b", 20, now - 50);
+    const result = pruneBackups(dataDir, dbPath, { keep: 0 });
+    expect(result.deleted).toHaveLength(2);
+    expect(result.kept).toEqual([]);
+  });
+
+  it("dry-run reports without deleting", () => {
+    const now = Date.now() / 1000;
+    makeBackup("ocr.db.bak.a", 10, now - 100);
+    const result = pruneBackups(dataDir, dbPath, { keep: 0, dryRun: true });
+    expect(result.dryRun).toBe(true);
+    expect(result.deleted.map((b) => b.name)).toEqual(["ocr.db.bak.a"]);
+    expect(existsSync(join(dataDir, "ocr.db.bak.a"))).toBe(true); // untouched
+  });
+
+  it("never touches the live database file", () => {
+    pruneBackups(dataDir, dbPath, { keep: 0 });
+    expect(existsSync(dbPath)).toBe(true);
   });
 });
 

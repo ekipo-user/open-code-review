@@ -363,6 +363,64 @@ export function reapStaleExecLogs(
   return reaped;
 }
 
+export type DbPruneBackupsResult = {
+  dryRun: boolean;
+  deleted: BackupFile[];
+  kept: BackupFile[];
+  reclaimedBytes: number;
+};
+
+/**
+ * Prune `<db>.bak.*` snapshot files, retaining the `keep` most-recent (by mtime)
+ * as a safety net and deleting the rest. Returns what was (or would be) removed
+ * and the bytes reclaimed. `doctor` only reports backups — this is the explicit,
+ * operator-driven way to reclaim that space (e.g. the 285 MB pre-remediation
+ * snapshot once the database is confirmed healthy). `keep: 0` removes all.
+ */
+export function pruneBackups(
+  dataDir: string,
+  dbPath: string,
+  opts: { keep?: number; dryRun?: boolean } = {},
+): DbPruneBackupsResult {
+  const keep = Math.max(0, opts.keep ?? 1);
+  const dryRun = opts.dryRun ?? false;
+  const dbBase = basename(dbPath);
+
+  // Build the backup list with mtime so "keep" retains the freshest snapshots.
+  const withMtime: { file: BackupFile; mtimeMs: number }[] = [];
+  for (const file of scanBackupFiles(dataDir, dbBase)) {
+    try {
+      withMtime.push({ file, mtimeMs: statSync(join(dataDir, file.name)).mtimeMs });
+    } catch {
+      /* vanished mid-scan */
+    }
+  }
+  withMtime.sort((a, b) => b.mtimeMs - a.mtimeMs); // newest first
+
+  const kept = withMtime.slice(0, keep).map((x) => x.file);
+  const toDelete = withMtime.slice(keep).map((x) => x.file);
+
+  const deleted: BackupFile[] = [];
+  if (!dryRun) {
+    for (const b of toDelete) {
+      try {
+        unlinkSync(join(dataDir, b.name));
+        deleted.push(b);
+      } catch {
+        /* best-effort */
+      }
+    }
+  }
+
+  const reported = dryRun ? toDelete : deleted;
+  return {
+    dryRun,
+    deleted: reported,
+    kept,
+    reclaimedBytes: reported.reduce((n, b) => n + b.sizeBytes, 0),
+  };
+}
+
 // ── Fix (doctor --fix) ──
 
 export type DbFixOptions = {
