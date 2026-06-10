@@ -413,8 +413,11 @@ export function installForTool(
     if (meta) {
       writeFileSync(metaPath, JSON.stringify(meta, null, 2) + "\n");
     }
-  } catch {
-    // Non-fatal — user can run /ocr:sync-reviewers manually
+  } catch (err) {
+    // Non-fatal — user can run /ocr:sync-reviewers manually — but surface it
+    // via the warnings channel rather than swallowing it silently.
+    const msg = err instanceof Error ? err.message : "unknown error";
+    warnings.push(`Could not generate reviewers-meta.json: ${msg}`);
   }
 
   // Install commands using tool-specific strategy
