@@ -7,10 +7,12 @@
 
 import express from 'express'
 import { createServer } from 'node:http'
-import { existsSync, readFileSync, writeFileSync, unlinkSync, mkdirSync } from 'node:fs'
+import { existsSync, readFileSync, writeFileSync, unlinkSync, mkdirSync, readdirSync, statSync } from 'node:fs'
 import { join, dirname, resolve } from 'node:path'
+import { reapTree, isProcessAlive } from '@open-code-review/platform'
 import { fileURLToPath } from 'node:url'
 import { randomBytes } from 'node:crypto'
+import { execFileSync } from 'node:child_process'
 import { Server as SocketIOServer } from 'socket.io'
 
 import { resolveOcrDir } from './services/ocr-resolver.js'
@@ -158,6 +160,54 @@ export type StartServerOptions = {
  *   const { startServer } = await import('./dashboard/server.js')
  *   await startServer({ port: 4173, open: true })
  */
+/**
+ * Reap `ocr.db.<pid>.tmp` atomic-write orphans left by the retired sql.js
+ * engine. Never touches the live DB set; only deletes temps whose PID is dead
+ * and whose mtime is > 1h old (so a hypothetical live mid-write is safe).
+ */
+function reapOrphanDbFiles(dataDir: string): void {
+  let entries: string[]
+  try {
+    entries = readdirSync(dataDir)
+  } catch {
+    return
+  }
+  const hourAgo = Date.now() - 60 * 60 * 1000
+  for (const name of entries) {
+    const m = name.match(/^ocr\.db\.(\d+)\.tmp$/)
+    if (!m) continue
+    const pid = Number(m[1])
+    const full = join(dataDir, name)
+    try {
+      if (isProcessAlive(pid)) continue
+      if (statSync(full).mtimeMs > hourAgo) continue
+      unlinkSync(full)
+      console.log(`  Orphan reap:       removed stale ${name}`)
+    } catch {
+      /* best-effort */
+    }
+  }
+}
+
+/**
+ * Whether `pid`'s command line looks like an OCR dashboard server — guards the
+ * single-instance takeover so a recycled PID can't be mistaken for our server.
+ * POSIX only (uses `ps`); returns false on Windows / any failure (conservative
+ * — never reap something we can't positively identify).
+ */
+function isOcrDashboardProcess(pid: number): boolean {
+  if (process.platform === 'win32') return false
+  try {
+    const cmd = execFileSync('ps', ['-p', String(pid), '-o', 'command='], {
+      encoding: 'utf-8',
+      timeout: 3000,
+    }) as string
+    return /dashboard\/server\.js|server\/index\.ts/.test(cmd)
+  } catch {
+    return false
+  }
+}
+
 export async function startServer(options: StartServerOptions = {}): Promise<void> {
   const port = options.port ?? parseInt(process.env.PORT ?? '4173', 10)
 
@@ -173,6 +223,12 @@ export async function startServer(options: StartServerOptions = {}): Promise<voi
   if (walResult === 'checkpointed') {
     console.log('  WAL checkpoint:    truncated stale write-ahead-log file')
   }
+
+  // ── Orphan .tmp reaping (best-effort) ──
+  // Reclaim `ocr.db.<pid>.tmp` atomic-write leftovers from the retired sql.js
+  // engine era (no current code writes them). PID-guarded + age-guarded so a
+  // live mid-write temp is never touched. Reclaimed ~1 GB on a real machine.
+  reapOrphanDbFiles(join(ocrDir, 'data'))
 
   const db = await openDb(ocrDir)
 
@@ -191,22 +247,27 @@ export async function startServer(options: StartServerOptions = {}): Promise<voi
   // Write process PID so other tooling can detect an already-running server
   // and clean up orphaned processes.
 
+  // ── Single-instance guard (take over a prior live server) ──
+  // Previously this only WARNED and the listen path auto-incremented the port,
+  // so multiple servers coexisted (two leaked ones ran ~29h in a real
+  // incident). A single-user local-first tool should run exactly one dashboard:
+  // if a prior OCR-dashboard process is alive, reap its whole tree (which also
+  // cleans up any review subtree it leaked) and take over. A recycled PID that
+  // isn't an OCR dashboard is left alone.
   if (existsSync(pidFilePath)) {
     try {
       const oldPid = parseInt(readFileSync(pidFilePath, 'utf-8').trim(), 10)
-      if (!isNaN(oldPid)) {
-        try {
-          process.kill(oldPid, 0)
-          console.warn(
-            `Warning: another dashboard server (PID ${oldPid}) appears to be running. ` +
-            `If this is stale, delete ${pidFilePath} and restart.`
-          )
-        } catch {
-          // Process not running — stale PID file, safe to overwrite
-        }
+      if (!isNaN(oldPid) && oldPid !== process.pid && isProcessAlive(oldPid) && isOcrDashboardProcess(oldPid)) {
+        console.log(`  Single-instance:   reaping prior dashboard server (PID ${oldPid}) and taking over`)
+        reapTree(oldPid)
+        // Brief wait for the port to free, then re-checkpoint the WAL the prior
+        // server may have left open.
+        const deadline = Date.now() + 6000
+        while (isProcessAlive(oldPid) && Date.now() < deadline) { /* spin briefly */ }
+        walCheckpointTruncate(dbPathForCheckpoint)
       }
     } catch {
-      // Could not read PID file — overwrite it
+      // Unreadable/recycled PID file — overwrite it.
     }
   }
 
