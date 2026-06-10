@@ -7,7 +7,7 @@
 
 import express from 'express'
 import { createServer } from 'node:http'
-import { existsSync, readFileSync, writeFileSync, unlinkSync, mkdirSync, readdirSync, statSync } from 'node:fs'
+import { existsSync, readFileSync, writeFileSync, unlinkSync, mkdirSync } from 'node:fs'
 import { join, dirname, resolve } from 'node:path'
 import { reapTree, isProcessAlive } from '@open-code-review/platform'
 import { fileURLToPath } from 'node:url'
@@ -44,11 +44,14 @@ import {
   sweepStaleAgentSessions,
   sweepStaleSessions,
   walCheckpointTruncate,
+  reapOrphanDbFiles,
+  reapStaleExecLogs,
   defaultIsAlive,
   PID_REUSE_GUARD_MS,
   sqliteUtcMs,
 } from '@open-code-review/cli/db'
 import { getAgentHeartbeatSeconds } from '@open-code-review/cli/runtime-config'
+import { reconcileCompletedSessions } from '@open-code-review/cli/state'
 
 import { homedir } from 'node:os'
 
@@ -161,35 +164,6 @@ export type StartServerOptions = {
  *   await startServer({ port: 4173, open: true })
  */
 /**
- * Reap `ocr.db.<pid>.tmp` atomic-write orphans left by the retired sql.js
- * engine. Never touches the live DB set; only deletes temps whose PID is dead
- * and whose mtime is > 1h old (so a hypothetical live mid-write is safe).
- */
-function reapOrphanDbFiles(dataDir: string): void {
-  let entries: string[]
-  try {
-    entries = readdirSync(dataDir)
-  } catch {
-    return
-  }
-  const hourAgo = Date.now() - 60 * 60 * 1000
-  for (const name of entries) {
-    const m = name.match(/^ocr\.db\.(\d+)\.tmp$/)
-    if (!m) continue
-    const pid = Number(m[1])
-    const full = join(dataDir, name)
-    try {
-      if (isProcessAlive(pid)) continue
-      if (statSync(full).mtimeMs > hourAgo) continue
-      unlinkSync(full)
-      console.log(`  Orphan reap:       removed stale ${name}`)
-    } catch {
-      /* best-effort */
-    }
-  }
-}
-
-/**
  * Whether `pid`'s command line looks like an OCR dashboard server — guards the
  * single-instance takeover so a recycled PID can't be mistaken for our server.
  * POSIX only (uses `ps`); returns false on Windows / any failure (conservative
@@ -228,7 +202,19 @@ export async function startServer(options: StartServerOptions = {}): Promise<voi
   // Reclaim `ocr.db.<pid>.tmp` atomic-write leftovers from the retired sql.js
   // engine era (no current code writes them). PID-guarded + age-guarded so a
   // live mid-write temp is never touched. Reclaimed ~1 GB on a real machine.
-  reapOrphanDbFiles(join(ocrDir, 'data'))
+  // Shared with `ocr db doctor --fix` (single source: cli/db maintenance).
+  for (const reaped of reapOrphanDbFiles(join(ocrDir, 'data'))) {
+    console.log(`  Orphan reap:       removed stale ${reaped}`)
+  }
+
+  // ── Stale exec-log reaping (best-effort) ──
+  // The file-stdio sink writes one `<uid>.log` per review under data/exec-logs.
+  // They are kept for post-mortem debugging but pruned past 7 days so they
+  // can't grow without bound.
+  const staleLogs = reapStaleExecLogs(join(ocrDir, 'data', 'exec-logs'))
+  if (staleLogs.length > 0) {
+    console.log(`  Exec-log reap:     removed ${staleLogs.length} stale agent log(s)`)
+  }
 
   const db = await openDb(ocrDir)
 
@@ -399,6 +385,29 @@ export async function startServer(options: StartServerOptions = {}): Promise<voi
     )
   }
 
+  // ── Completed-but-open session reconciliation ──
+  // Recover the wedge's lasting symptom: a session whose round is provably
+  // complete (`round_completed`/`map_completed` event) but whose status stayed
+  // `active` because the agent died before `ocr state finish`. Runs AFTER the
+  // liveness sweep above so any dead-PID executions are already finalized —
+  // only then is the session quiesced and eligible to close. The per-execution
+  // hook (finishExecution → reconcileWorkflowOnExit) handles the live path;
+  // this startup pass handles sessions whose finishing execution fired while no
+  // dashboard was running. Drives close through the guarded `stateClose`.
+  const reconcileCompleted = async (): Promise<void> => {
+    try {
+      const closed = await reconcileCompletedSessions(ocrDir)
+      if (closed.length > 0) {
+        console.log(
+          `  Auto-finalized ${closed.length} completed-but-open session(s)`
+        )
+      }
+    } catch (err) {
+      console.error('[reconcile] completed-session reconciliation failed:', err)
+    }
+  }
+  await reconcileCompleted()
+
   // ── Periodic sweep timer ──
   // Runs every 5 minutes inside the running dashboard so liveness and
   // stale-session cleanup keep happening without a restart. Each sweep
@@ -409,6 +418,9 @@ export async function startServer(options: StartServerOptions = {}): Promise<voi
     try {
       logAgentSweep(sweepStaleAgentSessions(db, heartbeatSeconds, defaultIsAlive))
       sweepStaleSessions(db, STALE_SESSION_THRESHOLD_SECONDS)
+      // Fire-and-forget: liveness sweep (sync, above) may have just finalized a
+      // dead workflow's last execution, making its completed session eligible.
+      void reconcileCompleted()
     } catch (err) {
       console.error('[sweep] periodic sweep failed:', err)
     }

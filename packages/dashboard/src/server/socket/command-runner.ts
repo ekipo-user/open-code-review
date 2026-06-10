@@ -28,6 +28,7 @@ import {
   type NormalizedEvent,
   type StreamEvent,
 } from '../services/ai-cli/index.js'
+import { FileTailer } from '../services/ai-cli/file-tailer.js'
 import { resolveLocalCli } from './cli-resolver.js'
 import { cleanEnv } from './env.js'
 import {
@@ -35,6 +36,7 @@ import {
   appendCommandLog,
   type CommandLogEntry,
 } from '@open-code-review/cli/db'
+import { reconcileWorkflowOnExit } from '@open-code-review/cli/state'
 
 /** Split a command string into tokens, respecting single and double quotes. */
 function shellSplit(str: string): string[] {
@@ -385,6 +387,12 @@ type ProcessEntry = {
   watchdog?: ReturnType<typeof setInterval>
   /** Last epoch ms a heartbeat was written for this row (throttle). */
   lastBeatWrite?: number
+  /**
+   * File tailer for file-stdio workflows — reads the per-execution log the
+   * detached agent writes its stdout/stderr to (in place of an OS pipe a
+   * leaked grandchild could hold open). Drained + closed on finalize.
+   */
+  tailer?: FileTailer
 }
 
 // ── Watchdog / supervision timing ──
@@ -832,12 +840,28 @@ function spawnAiCommand(
   // the captured `vendor_session_id` for resume because it queries by
   // `workflow_id`.
   const repoRoot = dirname(ocrDir)
+  // Per-execution log file for file-stdio (the root-cause wedge fix). The
+  // adapter redirects the detached agent's stdout+stderr here instead of OS
+  // pipes, and we tail it below — so a leaked grandchild can never hold a pipe
+  // whose EOF blocks finalization. Best-effort: if the dir can't be made we
+  // omit logFile and the adapter falls back to pipe stdio.
+  let logFile: string | undefined
+  if (entry.uid) {
+    try {
+      const logDir = join(ocrDir, 'data', 'exec-logs')
+      mkdirSync(logDir, { recursive: true })
+      logFile = join(logDir, `${entry.uid}.log`)
+    } catch (err) {
+      console.error('[command-runner] could not prepare exec-log dir:', err)
+    }
+  }
   const spawnOpts: {
     mode: 'workflow'
     prompt: string
     cwd: string
     resumeSessionId?: string
     env?: Record<string, string>
+    logFile?: string
   } = {
     mode: 'workflow',
     prompt,
@@ -847,7 +871,10 @@ function spawnAiCommand(
   if (resumeSessionId) {
     spawnOpts.resumeSessionId = resumeSessionId
   }
-  const { process: proc, detached } = adapter.spawn(spawnOpts)
+  if (logFile) {
+    spawnOpts.logFile = logFile
+  }
+  const { process: proc, detached, logPath } = adapter.spawn(spawnOpts)
   entry.process = proc
   entry.detached = detached
 
@@ -1072,17 +1099,10 @@ function spawnAiCommand(
     }
   }
 
-  // UTF-8 boundary safety — see Blocker 3. Without `setEncoding`,
-  // chunk.toString() can produce `�` replacement chars when a multi-
-  // byte codepoint straddles an OS pipe boundary, breaking JSON.parse
-  // on any vendor line carrying emoji, non-ASCII output, or tool
-  // results with non-Latin content. The broken line is silently
-  // dropped by the parsers — including the line that may carry
-  // `session_id` for capture.
-  proc.stdout?.setEncoding('utf-8')
-  proc.stderr?.setEncoding('utf-8')
-
-  proc.stdout?.on('data', (chunk: string) => {
+  // The single sink for output chunks, fed by EITHER the file tailer (file-stdio
+  // workflows) or the stdout pipe (fallback). Identical logic in both cases so
+  // the proven line-buffer + parseLine loop never forks.
+  function onOutputChunk(chunk: string): void {
     // Output activity is the most truthful liveness signal — the agent is
     // producing tokens. Bump the parent row's heartbeat (throttled) so a long
     // review no longer drifts to "stalled".
@@ -1106,13 +1126,31 @@ function spawnAiCommand(
         handleEvent(evt)
       }
     }
-  })
+  }
 
-  // Capture stderr
   let stderrBuffer = ''
-  proc.stderr?.on('data', (chunk: string) => {
-    stderrBuffer += chunk
-  })
+  if (logPath) {
+    // File-stdio: stdout+stderr are interleaved in the log file (no parent-held
+    // pipe). Tail the file for the live stream. The decoder inside FileTailer
+    // preserves multi-byte UTF-8 boundaries — the role setEncoding played for
+    // the pipe. stderr diagnostics ride the same path and surface inline via the
+    // unparseable-line fallback above.
+    const tailer = new FileTailer(logPath, onOutputChunk)
+    tailer.start()
+    entry.tailer = tailer
+  } else {
+    // Pipe fallback (non-detached / no log file). UTF-8 boundary safety — see
+    // Blocker 3. Without `setEncoding`, a multi-byte codepoint straddling a pipe
+    // boundary yields `�`, breaking JSON.parse on any vendor line carrying
+    // emoji/non-ASCII — including a line that may carry `session_id` for capture.
+    proc.stdout?.setEncoding('utf-8')
+    proc.stderr?.setEncoding('utf-8')
+    proc.stdout?.on('data', onOutputChunk)
+    // Capture stderr separately so a non-zero exit can append it as a verdict.
+    proc.stderr?.on('data', (chunk: string) => {
+      stderrBuffer += chunk
+    })
+  }
 
   proc.on('close', (code) => {
     // Stop the workflow-id auto-link polling — the process is done,
@@ -1126,6 +1164,14 @@ function spawnAiCommand(
     // from a CLI-only invocation outside the dashboard) doesn't
     // mistakenly link to this finished execution.
     clearSpawnMarker(ocrDir)
+
+    // File-stdio: final synchronous drain of the log tail before we process the
+    // remaining buffer, so bytes the agent wrote just before exiting (between
+    // the last poll and exit) are not lost.
+    if (entry.tailer) {
+      entry.tailer.stop()
+      entry.tailer = undefined
+    }
 
     // Process remaining buffered data
     if (lineBuffer.trim()) {
@@ -1202,19 +1248,32 @@ function finishExecution(
       clearInterval(entry.watchdog)
       entry.watchdog = undefined
     }
+    // Backstop: release the file-stdio tailer's fd/timer on ANY finalize path
+    // (watchdog/cancel may finalize before `proc.on('close')` fires). Idempotent
+    // — the close handler's own stop() becomes a no-op. The close handler still
+    // owns the ordered final drain in the normal path.
+    if (entry.tailer) {
+      entry.tailer.stop()
+      entry.tailer = undefined
+    }
   }
 
   // CAS write — only finalize a row still in-flight, so a late close after an
-  // already-finalized result can never clobber the recorded exit code.
-  const res = db.run(
-    `UPDATE command_executions
-     SET exit_code = ?, finished_at = ?, output = ?, pid = NULL
-     WHERE id = ? AND finished_at IS NULL`,
-    [code, finishedAt, output, executionId]
-  )
+  // already-finalized result can never clobber the recorded exit code. Use the
+  // native prepared statement: the engine's `run()` returns void (it discards
+  // node:sqlite's StatementResultingChanges), whereas `prepare().run()` hands
+  // back `{ changes }` — which the CAS check below depends on.
+  const res = db
+    .prepare(
+      `UPDATE command_executions
+       SET exit_code = ?, finished_at = ?, output = ?, pid = NULL
+       WHERE id = ? AND finished_at IS NULL`
+    )
+    .run(code, finishedAt, output, executionId)
   // Row already finalized in the DB (e.g. by a prior trigger on a stale entry)
-  // — nothing more to emit.
-  if (res.changes === 0 && !entry) return
+  // — nothing more to emit. `changes` is typed number|bigint; coerce so the
+  // zero-check is robust regardless of the binding's numeric representation.
+  if (Number(res.changes) === 0 && !entry) return
 
   // Cross-check workflow completeness (event-derived, via the
   // session_completeness view) so the UI distinguishes a genuinely finished
@@ -1253,4 +1312,26 @@ function finishExecution(
   })
 
   activeCommands.delete(executionId)
+
+  // Auto-finalize the linked workflow's session if this was the last execution
+  // of a provably-complete round. This closes the wedge's lasting symptom: an
+  // agent that finished its round but died before `ocr state finish` would
+  // otherwise leave the session `active`+`complete` forever. reconcileWorkflowOnExit
+  // no-ops unless the session is active, the round is complete, and nothing
+  // else is in flight — so it is safe to fire on every execution. Fire-and-
+  // forget: finalization of the execution row must not block on it, and a
+  // reconcile failure must never surface as a command error.
+  const workflowRow = db.exec(
+    'SELECT workflow_id FROM command_executions WHERE id = ?',
+    [executionId],
+  )
+  const workflowId = workflowRow[0]?.values[0]?.[0]
+  if (typeof workflowId === 'string' && workflowId.length > 0) {
+    void reconcileWorkflowOnExit(ocrDir, workflowId).catch((err) => {
+      console.error(
+        `[command-runner] reconcileWorkflowOnExit(${workflowId}) failed:`,
+        err instanceof Error ? err.message : err,
+      )
+    })
+  }
 }
