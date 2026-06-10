@@ -160,3 +160,35 @@ describe("defaultIconFor", () => {
     }
   });
 });
+
+describe("process-tree reaping", () => {
+  const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
+
+  it("isProcessAlive reflects a real process's liveness", async () => {
+    const { isProcessAlive, spawnBinary } = await import("../index.js");
+    const proc = spawnBinary("sleep", ["30"], { stdio: "ignore" });
+    await sleep(100);
+    expect(isProcessAlive(proc.pid!)).toBe(true);
+    process.kill(proc.pid!, "SIGKILL");
+    await sleep(200);
+    expect(isProcessAlive(proc.pid!)).toBe(false);
+  });
+
+  it("descendantPids finds a child and reapTree kills the whole tree", async () => {
+    const { descendantPids, reapTree, isProcessAlive, spawnBinary } = await import("../index.js");
+    // A node parent that spawns a `sleep` grandchild and stays alive.
+    const parent = spawnBinary(
+      "node",
+      ["-e", "require('child_process').spawn('sleep',['30']); setInterval(()=>{},1e9)"],
+      { stdio: "ignore", detached: true },
+    );
+    await sleep(400);
+    const kids = descendantPids(parent.pid!);
+    expect(kids.length).toBeGreaterThan(0); // the spawned `sleep` is a descendant
+
+    reapTree(parent.pid!, 200);
+    await sleep(700);
+    expect(isProcessAlive(parent.pid!)).toBe(false);
+    for (const pid of kids) expect(isProcessAlive(pid)).toBe(false);
+  });
+});

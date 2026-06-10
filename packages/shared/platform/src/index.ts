@@ -89,6 +89,107 @@ export function spawnBinary(
   });
 }
 
+// ── Process-tree reaping ──
+
+/**
+ * Whether a PID is currently signalable (alive). `process.kill(pid, 0)` sends
+ * no signal; only an `ESRCH` error is positive evidence of death. Mirrors the
+ * CLI's `defaultIsAlive` so callers across packages share one liveness probe.
+ */
+export function isProcessAlive(pid: number): boolean {
+  try {
+    process.kill(pid, 0);
+    return true;
+  } catch (err) {
+    return !(err instanceof Error && "code" in err && err.code === "ESRCH");
+  }
+}
+
+/**
+ * Enumerate all descendant PIDs of `rootPid` (children, grandchildren, …).
+ *
+ * On POSIX, builds the full ppid→children map from one `ps -A` call and BFSs
+ * from the root — this catches descendants that `setsid()`'d into their own
+ * process group (which `kill(-pgid)` would miss). Returns [] on Windows (use
+ * `reapTree`, which shells out to `taskkill /T`) or if `ps` is unavailable.
+ */
+export function descendantPids(rootPid: number): number[] {
+  if (isWindows) return [];
+  let out: string;
+  try {
+    out = execFileSync("ps", ["-A", "-o", "pid=,ppid="], {
+      encoding: "utf-8",
+      timeout: 5000,
+    }) as string;
+  } catch {
+    return [];
+  }
+  const children = new Map<number, number[]>();
+  for (const line of out.split("\n")) {
+    const m = line.trim().match(/^(\d+)\s+(\d+)$/);
+    if (!m) continue;
+    const pid = Number(m[1]);
+    const ppid = Number(m[2]);
+    if (!children.has(ppid)) children.set(ppid, []);
+    children.get(ppid)!.push(pid);
+  }
+  const acc: number[] = [];
+  const queue = [rootPid];
+  const seen = new Set<number>([rootPid]);
+  while (queue.length) {
+    const p = queue.shift()!;
+    for (const c of children.get(p) ?? []) {
+      if (seen.has(c)) continue;
+      seen.add(c);
+      acc.push(c);
+      queue.push(c);
+    }
+  }
+  return acc;
+}
+
+/**
+ * Terminate an entire process tree (root + all descendants), robust to children
+ * that escaped the root's process group via `setsid()` — the failure mode that
+ * lets a leaked MCP daemon hold a parent's stdio pipe open forever.
+ *
+ * POSIX: SIGTERM every descendant (leaves first, root last), then after
+ * `graceMs` re-walk and SIGKILL whatever is still alive. Windows: `taskkill /T
+ * /F` from the root. Best-effort and never throws — reaping is hygiene.
+ */
+export function reapTree(rootPid: number, graceMs = 5000): void {
+  if (isWindows) {
+    try {
+      execFileSync("taskkill", ["/PID", String(rootPid), "/T", "/F"], {
+        timeout: 5000,
+      });
+    } catch {
+      /* already gone / not found */
+    }
+    return;
+  }
+  const term = [...descendantPids(rootPid), rootPid];
+  for (const pid of term) {
+    try {
+      process.kill(pid, "SIGTERM");
+    } catch {
+      /* already gone */
+    }
+  }
+  setTimeout(() => {
+    // Re-walk: a child may have forked again between SIGTERM and now.
+    const kill = [...descendantPids(rootPid), rootPid];
+    for (const pid of kill) {
+      if (!isProcessAlive(pid)) continue;
+      try {
+        process.kill(pid, "SIGKILL");
+      } catch {
+        /* already gone */
+      }
+    }
+  }, graceMs).unref();
+}
+
 // ── Reviewer icons ──
 
 /**
