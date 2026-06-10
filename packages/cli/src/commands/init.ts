@@ -16,6 +16,7 @@ import {
 import {
   injectIntoProjectFiles,
   findStaleInstructionFiles,
+  formatStaleWarnings,
 } from "../lib/injector.js";
 import { printBanner } from "../lib/banner.js";
 import { setConfiguredToolIds, stampCliVersion } from "../lib/cli-config.js";
@@ -159,12 +160,8 @@ export const initCommand = new Command("init")
       }
 
       const stale = findStaleInstructionFiles(targetDir, injectResults.written);
-      for (const path of stale) {
-        console.log(
-          chalk.yellow(
-            `  ⚠ ${path} still has an OCR block but no installed tool uses it — remove it manually if unneeded.`,
-          ),
-        );
+      for (const warning of formatStaleWarnings(stale, "init")) {
+        console.log(chalk.yellow(`  ⚠ ${warning}`));
       }
     }
 

@@ -38,7 +38,7 @@ describe("injector", () => {
     writeFileSync(join(projectDir, name), content);
   }
 
-  describe("OCR_INSTRUCTION_BLOCK content", () => {
+  describe("OCR managed-block content", () => {
     it("uses h2 (##) for the heading, not h1 (#)", () => {
       const path = join(projectDir, "CLAUDE.md");
       injectOcrInstructions(path);

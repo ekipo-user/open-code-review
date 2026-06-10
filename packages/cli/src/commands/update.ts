@@ -13,6 +13,7 @@ import {
   injectIntoProjectFiles,
   plannedInstructionFiles,
   findStaleInstructionFiles,
+  formatStaleWarnings,
 } from "../lib/injector.js";
 import { ensureGitignore } from "../lib/gitignore.js";
 import { requireOcrSetup } from "../lib/guards.js";
@@ -50,7 +51,7 @@ export const updateCommand = new Command("update")
     "--skills",
     "Update only skills (includes templates, references, assets)",
   )
-  .option("--inject", "Update only AGENTS.md/CLAUDE.md injection")
+  .option("--inject", "Update only instruction-file injection (AGENTS.md + each tool's native file)")
   .option("--dry-run", "Preview changes without modifying files")
   .action(async (options: UpdateOptions) => {
     const targetDir = process.cwd();
@@ -195,10 +196,9 @@ export const updateCommand = new Command("update")
           const verb = existsSync(join(targetDir, path)) ? "update" : "create";
           console.log(chalk.dim(`    • ${path} (${verb} OCR managed block)`));
         }
-        for (const path of findStaleInstructionFiles(targetDir, planned)) {
-          console.log(
-            chalk.dim(`    • ${path} (stale OCR block — left untouched)`),
-          );
+        const staleDry = findStaleInstructionFiles(targetDir, planned);
+        for (const warning of formatStaleWarnings(staleDry, "dry-run")) {
+          console.log(chalk.dim(`    • ${warning}`));
         }
         console.log();
       } else {
@@ -217,12 +217,8 @@ export const updateCommand = new Command("update")
         }
 
         const stale = findStaleInstructionFiles(targetDir, injectResults.written);
-        for (const path of stale) {
-          console.log(
-            chalk.yellow(
-              `    ⚠ ${path} still has an OCR block but no configured tool uses it — remove it manually if unneeded.`,
-            ),
-          );
+        for (const warning of formatStaleWarnings(stale, "update")) {
+          console.log(chalk.yellow(`    ⚠ ${warning}`));
         }
 
         console.log();

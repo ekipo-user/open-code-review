@@ -95,14 +95,6 @@ export type InjectionResult = {
 };
 
 /**
- * Inject OCR instructions into the instruction files for the selected tools.
- *
- * Always writes the universal `AGENTS.md`, plus each selected tool's native
- * instruction file(s). Files are de-duplicated so `AGENTS.md` (and any file
- * two tools happen to share) is written exactly once — e.g. selecting only
- * Gemini writes `AGENTS.md` + `GEMINI.md` and never a stray `CLAUDE.md`.
- */
-/**
  * Resolve the de-duplicated set of instruction-file targets for a tool
  * selection: always `AGENTS.md`, plus each selected tool's native file(s),
  * written at most once.
@@ -126,6 +118,14 @@ export function plannedInstructionFiles(selectedTools: AIToolConfig[]): string[]
   return resolveTargets(selectedTools).map((t) => t.path);
 }
 
+/**
+ * Inject OCR instructions into the instruction files for the selected tools.
+ *
+ * Always writes the universal `AGENTS.md`, plus each selected tool's native
+ * instruction file(s). Files are de-duplicated so `AGENTS.md` (and any file
+ * two tools happen to share) is written exactly once — e.g. selecting only
+ * Gemini writes `AGENTS.md` + `GEMINI.md` and never a stray `CLAUDE.md`.
+ */
 export function injectIntoProjectFiles(
   targetDir: string,
   selectedTools: AIToolConfig[],
@@ -180,4 +180,24 @@ export function findStaleInstructionFiles(
     }
   }
   return stale;
+}
+
+/**
+ * Format the human-facing warning lines for stale instruction files, so the
+ * copy lives in one place instead of being re-typed at each `init`/`update`
+ * call site. `dry-run` frames them as "left untouched"; the live paths frame
+ * them as a manual-cleanup nudge (OCR never deletes user-owned files).
+ */
+export function formatStaleWarnings(
+  stale: string[],
+  mode: "init" | "update" | "dry-run",
+): string[] {
+  if (mode === "dry-run") {
+    return stale.map((path) => `${path} (stale OCR block — left untouched)`);
+  }
+  const owner = mode === "init" ? "installed" : "configured";
+  return stale.map(
+    (path) =>
+      `${path} still has an OCR block but no ${owner} tool uses it — remove it manually if unneeded.`,
+  );
 }
