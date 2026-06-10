@@ -59,6 +59,13 @@
       "options": {
         "config": "packages/cli/vitest.config.ts"
       }
+    },
+    "typecheck": {
+      "executor": "nx:run-commands",
+      "options": {
+        "command": "tsc -p tsconfig.typecheck.json",
+        "cwd": "{projectRoot}"
+      }
     }
   }
 }
