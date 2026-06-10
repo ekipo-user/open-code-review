@@ -63,3 +63,10 @@ export const ORPHAN_EXIT_CODE = -3;
  *  (cascade close). Distinct from -2 (user cancel) and -3 (orphaned by the
  *  liveness sweep) so triage can tell the cause apart. */
 export const CASCADE_CLOSE_EXIT_CODE = -4;
+
+/** A row the dashboard watchdog reaped after the execution blew past the hard
+ *  deadline with no terminal `result`. Distinct from -2 (cancel), -3 (orphaned),
+ *  and -4 (cascade) so the dashboard renders "timed out" rather than a generic
+ *  failure. Lives here (not inline in command-runner) so producers AND the
+ *  outcome derivation share one definition. */
+export const WATCHDOG_DEADLINE_EXIT_CODE = -5;

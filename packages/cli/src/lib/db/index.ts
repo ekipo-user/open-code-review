@@ -158,6 +158,7 @@ export {
   CANCELLED_EXIT_CODE,
   ORPHAN_EXIT_CODE,
   CASCADE_CLOSE_EXIT_CODE,
+  WATCHDOG_DEADLINE_EXIT_CODE,
 } from "../state/exit-codes.js";
 
 export { runMigrations, MIGRATIONS } from "./migrations.js";
@@ -184,6 +185,7 @@ export {
   vacuumDb,
   pruneDb,
   pruneBackups,
+  withForeignKeysDisabled,
 } from "./maintenance.js";
 export type {
   DbHealthReport,

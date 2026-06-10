@@ -392,14 +392,26 @@ const pruneBackupsSubcommand = new Command("prune-backups")
   .description("Delete old ocr.db.bak.* snapshots, keeping the most recent few")
   .option(
     "--keep <n>",
-    "retain the N most-recent backups (default 1; 0 removes all)",
+    "retain the N most-recent backups (default 1; 0 removes all, requires --force)",
     (v) => parseInt(v, 10),
     1,
   )
+  .option("--force", "permit --keep 0 (removing the last backup / safety net)")
   .option("--dry-run", "show what would be deleted without deleting")
-  .action(async (options: { keep: number; dryRun?: boolean }) => {
+  .action(async (options: { keep: number; force?: boolean; dryRun?: boolean }) => {
     const ocrDir = resolveOcrDir();
     const dataDir = join(ocrDir, "data");
+
+    // `--keep 0` removes ALL snapshots — including a fresh `doctor --fix` /
+    // `vacuum` safety net. Require an explicit --force for that (a dry-run is
+    // always allowed, so an operator can preview first). Round-1 S12.
+    if (options.keep <= 0 && !options.force && !options.dryRun) {
+      fail(
+        "--keep 0 removes every backup (including any just-written snapshot). " +
+          "Re-run with --dry-run to preview, or --force to confirm.",
+      );
+    }
+
     // Pure file hygiene — no DB lock, so no live-dashboard guard needed.
     const result = pruneBackups(dataDir, dbPathFor(ocrDir), {
       keep: options.keep,

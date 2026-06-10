@@ -110,9 +110,18 @@ const ORPHAN_SWEEPS: ReadonlyArray<{ table: string; sql: string }> = [
   },
 ];
 
-/** The dedup the migration also performs — collapse markdown rows to the newest
- *  per logical key. NULL-safe via IFNULL(round_number,-1), matching the unique
- *  index. Idempotent: a no-op once the index is enforcing uniqueness. */
+/**
+ * Collapse markdown rows to the newest per logical key. NULL-safe via
+ * IFNULL(round_number,-1), matching the unique index. Idempotent: a no-op once
+ * the index is enforcing uniqueness.
+ *
+ * NOTE: migration v14 performs a byte-identical DELETE. The two are
+ * DELIBERATELY independent copies — a migration is frozen history (its effect
+ * on a not-yet-upgraded database must never change), whereas this is the live
+ * operational tool. Coupling them to one constant would let an edit here
+ * retroactively alter what v14 does on un-migrated machines (round-1 SF16 was
+ * declined for exactly this immutability reason).
+ */
 const MARKDOWN_DEDUP_SQL = `
   DELETE FROM markdown_artifacts
    WHERE rowid NOT IN (
@@ -121,6 +130,21 @@ const MARKDOWN_DEDUP_SQL = `
    )`;
 
 const ONE_HOUR_MS = 60 * 60 * 1000;
+
+/**
+ * Run `fn` with FK enforcement disabled, restoring it afterward. `PRAGMA
+ * foreign_keys` is honored only in autocommit, so this must NOT be called from
+ * inside an open transaction. The single home for the toggle pattern — shared
+ * by {@link fixDb}'s orphan sweep and the maintenance test fixture (round-1 SF17).
+ */
+export function withForeignKeysDisabled<T>(db: Database, fn: () => T): T {
+  db.pragma("foreign_keys = OFF");
+  try {
+    return fn();
+  } finally {
+    db.pragma("foreign_keys = ON");
+  }
+}
 
 // ── Health report ──
 
@@ -465,12 +489,11 @@ export function fixDb(
     opts.snapshot === false ? null : snapshotDb(db, dbPath, "doctor");
 
   // ── FK-orphan sweep ──
-  // PRAGMA foreign_keys is honored only in autocommit, so toggle it OUTSIDE the
-  // delete transaction. With enforcement off, the ordered anti-join deletes
-  // can remove orphans (and transitive orphans) without tripping RESTRICT.
-  db.pragma("foreign_keys = OFF");
+  // With enforcement off (autocommit toggle via the shared helper), the ordered
+  // anti-join deletes can remove orphans (and transitive orphans) without
+  // tripping RESTRICT.
   const fkOrphansDeleted: FkViolationGroup[] = [];
-  try {
+  withForeignKeysDisabled(db, () => {
     db.transaction(() => {
       for (const sweep of ORPHAN_SWEEPS) {
         const info = db.prepare(sweep.sql).run();
@@ -478,9 +501,7 @@ export function fixDb(
         if (count > 0) fkOrphansDeleted.push({ table: sweep.table, count });
       }
     });
-  } finally {
-    db.pragma("foreign_keys = ON");
-  }
+  });
 
   // ── Markdown dedup (idempotent safety net) ──
   let markdownDupsDeleted = 0;

@@ -108,6 +108,7 @@ export {
   CANCELLED_EXIT_CODE,
   ORPHAN_EXIT_CODE,
   CASCADE_CLOSE_EXIT_CODE,
+  WATCHDOG_DEADLINE_EXIT_CODE,
 } from "./exit-codes.js";
 
 // Phase-graph state machine.
@@ -493,8 +494,14 @@ export type ReconcileExitOutcome =
 export async function reconcileWorkflowOnExit(
   ocrDir: string,
   sessionId: string,
+  db?: Database,
 ): Promise<ReconcileExitOutcome> {
-  const db = await ensureDatabase(ocrDir);
+  // Accept an already-open handle (mirrors {@link stateTransition}). The
+  // dashboard calls this on EVERY execution finalize — the vast majority being
+  // early-return no-ops — so reusing its open connection avoids a redundant
+  // `ensureDatabase` (which re-checks the migration version) per call. Only the
+  // rare close path re-enters via `stateClose(ocrDir)`.
+  db ??= await ensureDatabase(ocrDir);
 
   const existing = getSession(db, sessionId);
   if (!existing) return "not-found";
@@ -530,7 +537,7 @@ export async function reconcileCompletedSessions(
   // rows inside the loop cannot disturb iteration.
   for (const s of getAllSessions(db)) {
     if (s.status !== "active") continue;
-    const outcome = await reconcileWorkflowOnExit(ocrDir, s.id);
+    const outcome = await reconcileWorkflowOnExit(ocrDir, s.id, db);
     if (outcome === "closed") closed.push(s.id);
   }
   return closed;

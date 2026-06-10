@@ -15,6 +15,7 @@ import {
   pruneBackups,
   reapOrphanDbFiles,
   reapStaleExecLogs,
+  withForeignKeysDisabled,
   type Database,
 } from "../index.js";
 
@@ -57,14 +58,11 @@ function seedSession(id: string, status: "active" | "closed" = "closed"): void {
 }
 
 /** Insert child rows that reference non-existent parents — the sql.js-era
- *  pathology — by toggling FK enforcement off around the writes. */
+ *  pathology — by toggling FK enforcement off around the writes. Uses the same
+ *  production helper `fixDb` relies on, so the fixture and the real sweep can
+ *  never disagree on the toggle semantics. */
 function withForeignKeysOff(fn: () => void): void {
-  db.pragma("foreign_keys = OFF");
-  try {
-    fn();
-  } finally {
-    db.pragma("foreign_keys = ON");
-  }
+  withForeignKeysDisabled(db, fn);
 }
 
 describe("collectDbHealth", () => {
