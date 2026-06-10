@@ -15,8 +15,8 @@
  * - Tool names are lowercase (bash, read, write) — normalized to PascalCase for formatToolDetail
  */
 
-import { openSync, closeSync } from 'node:fs'
 import { execBinary, spawnBinary } from '@open-code-review/platform'
+import { buildFileStdio, closeFileStdio } from './helpers.js'
 import type {
   AiCliAdapter,
   DetectionResult,
@@ -133,12 +133,13 @@ export class OpenCodeAdapter implements AiCliAdapter {
     }
 
     // File-stdio (root-cause wedge fix — see claude-adapter): in workflow mode
-    // with a per-execution log file, redirect stdout+stderr to the FILE so a
-    // leaked grandchild can't hold a pipe whose EOF blocks `proc.on('close')`.
-    // The caller tails the file for the live stream. stdin stays 'ignore' (the
-    // prompt is a positional arg). Falls back to pipe stdio otherwise.
-    const useFileStdio = isWorkflow && !!opts.logFile
-    const logFd = useFileStdio ? openSync(opts.logFile!, 'a') : null
+    // with a per-execution log file, stdout+stderr go to the FILE so a leaked
+    // grandchild can't hold a pipe whose EOF blocks `proc.on('close')`. stdin is
+    // 'ignore' (the prompt is a positional arg). Shared helper, same as Claude.
+    const { stdio, logFd, logPath } = buildFileStdio(
+      'ignore',
+      isWorkflow ? opts.logFile : undefined,
+    )
 
     // OpenCode does not support --max-turns; agents run to completion.
     // stdin is not needed — the prompt is passed as a positional argument.
@@ -149,17 +150,11 @@ export class OpenCodeAdapter implements AiCliAdapter {
       cwd: opts.cwd,
       env: { ...cleanEnv(), ...(opts.env ?? {}) },
       detached: isWorkflow,
-      stdio: logFd !== null ? ['ignore', logFd, logFd] : ['ignore', 'pipe', 'pipe'],
+      stdio,
     })
 
     // The child has its own dup of the log fd; close the parent's copy.
-    if (logFd !== null) {
-      try {
-        closeSync(logFd)
-      } catch {
-        /* best-effort */
-      }
-    }
+    closeFileStdio(logFd)
 
     // See claude-adapter: detached workflows are unref'd so a wedged child can
     // never hold the dashboard's event loop open; the command-runner reaps the
@@ -169,7 +164,7 @@ export class OpenCodeAdapter implements AiCliAdapter {
     return {
       process: proc,
       detached: isWorkflow,
-      ...(useFileStdio ? { logPath: opts.logFile! } : {}),
+      ...(logPath ? { logPath } : {}),
     }
   }
 
@@ -319,6 +314,15 @@ export class OpenCodeAdapter implements AiCliAdapter {
     // step_start / step_finish are intra-process phase markers — they're
     // not sub-agent boundaries (OCR sub-agents come from `ocr session`
     // calls, journaled separately). Intentionally ignored.
+    //
+    // No `result` NormalizedEvent (round-1 SF5): unlike Claude's stream-json,
+    // OpenCode emits no single terminal sentinel — `step_finish` fires per step,
+    // so mapping it to `result` would set `resultSeenAt` mid-run and let the
+    // watchdog's result-grace branch reap a still-working agent. We deliberately
+    // do NOT synthesize one. Finalization for OpenCode is the file-stdio'd
+    // `proc.on('close')` (reliable now that no leaked grandchild can hold the
+    // output pipe) plus the hard-deadline backstop. The watchdog's result-grace
+    // optimization is therefore Claude-only by design, not by oversight.
 
     return events
   }

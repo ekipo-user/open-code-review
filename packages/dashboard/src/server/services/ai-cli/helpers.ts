@@ -5,10 +5,44 @@
  * command-runner.ts, chat-handler.ts, and post-handler.ts.
  */
 
-import { mkdirSync, writeFileSync, unlinkSync } from 'node:fs'
+import { mkdirSync, writeFileSync, unlinkSync, openSync, closeSync } from 'node:fs'
+import type { StdioOptions } from 'node:child_process'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { randomUUID } from 'node:crypto'
+
+// ── File-stdio plumbing (shared by the Claude + OpenCode adapters) ──
+
+/**
+ * Build the `stdio` triple for a workflow spawn. When `logFile` is set, stdout
+ * AND stderr are redirected to that FILE (the file-stdio wedge fix — a leaked
+ * grandchild inheriting fd 1/2 holds no pipe whose EOF the dashboard waits on);
+ * the caller tails it. Otherwise both are pipes. `stdin` differs per vendor
+ * (Claude pipes the prompt; OpenCode passes it as argv), so it is a parameter.
+ *
+ * Returns the open `logFd` (the caller MUST `closeFileStdio` it after spawn —
+ * the child has dup'd it) and `logPath` for the SpawnResult.
+ */
+export function buildFileStdio(
+  stdin: 'pipe' | 'ignore',
+  logFile: string | undefined,
+): { stdio: StdioOptions; logFd: number | null; logPath: string | undefined } {
+  if (!logFile) {
+    return { stdio: [stdin, 'pipe', 'pipe'], logFd: null, logPath: undefined }
+  }
+  const logFd = openSync(logFile, 'a')
+  return { stdio: [stdin, logFd, logFd], logFd, logPath: logFile }
+}
+
+/** Close the parent's copy of the log fd after spawn (best-effort). */
+export function closeFileStdio(logFd: number | null): void {
+  if (logFd === null) return
+  try {
+    closeSync(logFd)
+  } catch {
+    /* best-effort */
+  }
+}
 
 // ── Tool Detail Formatting ──
 // Converts tool_use blocks into human-readable terminal lines.

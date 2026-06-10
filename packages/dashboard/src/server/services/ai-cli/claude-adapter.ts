@@ -9,7 +9,6 @@
  * Output: NDJSON with stream_event / content_block_delta / assistant message types.
  */
 
-import { openSync, closeSync } from 'node:fs'
 import { execBinary, spawnBinary } from '@open-code-review/platform'
 import type {
   AiCliAdapter,
@@ -20,7 +19,7 @@ import type {
   SpawnOptions,
   SpawnResult,
 } from './types.js'
-import { extractAssistantText } from './helpers.js'
+import { extractAssistantText, buildFileStdio, closeFileStdio } from './helpers.js'
 import { cleanEnv } from '../../socket/env.js'
 import {
   buildResumeArgs as buildResumeArgsShared,
@@ -112,15 +111,15 @@ export class ClaudeCodeAdapter implements AiCliAdapter {
       flags.push('--model', opts.model)
     }
 
-    // File-stdio (root-cause wedge fix): when a per-execution log file is
-    // provided (workflow mode), redirect stdout+stderr to that FILE rather than
-    // OS pipes. A leaked grandchild that inherits fd 1/2 then holds no pipe whose
-    // EOF the dashboard waits on, so `proc.on('close')` fires on the direct
-    // child's exit. The caller tails the file for the live stream. stdin stays a
-    // pipe so we can still deliver the prompt. Falls back to pipe stdio when no
-    // log file is given (non-workflow queries).
-    const useFileStdio = isWorkflow && !!opts.logFile
-    const logFd = useFileStdio ? openSync(opts.logFile!, 'a') : null
+    // File-stdio (root-cause wedge fix): in workflow mode with a per-execution
+    // log file, stdout+stderr go to that FILE rather than OS pipes, so a leaked
+    // grandchild inheriting fd 1/2 holds no pipe whose EOF the dashboard waits
+    // on — `proc.on('close')` fires on the direct child's exit. stdin stays a
+    // pipe to deliver the prompt. Shared helper keeps both adapters in lockstep.
+    const { stdio, logFd, logPath } = buildFileStdio(
+      'pipe',
+      isWorkflow ? opts.logFile : undefined,
+    )
 
     // Spawn claude directly with stdin pipe (no shell needed). Merge any
     // caller-supplied env vars (e.g. OCR_DASHBOARD_EXECUTION_UID for the
@@ -130,18 +129,11 @@ export class ClaudeCodeAdapter implements AiCliAdapter {
       cwd: opts.cwd,
       env: { ...cleanEnv(), ...(opts.env ?? {}) },
       detached: isWorkflow,
-      stdio: logFd !== null ? ['pipe', logFd, logFd] : ['pipe', 'pipe', 'pipe'],
+      stdio,
     })
 
-    // The child has its own dup of the log fd; close the parent's copy so only
-    // the child (and any grandchild) keeps it open.
-    if (logFd !== null) {
-      try {
-        closeSync(logFd)
-      } catch {
-        /* best-effort */
-      }
-    }
+    // The child has its own dup of the log fd; close the parent's copy.
+    closeFileStdio(logFd)
 
     // Detached workflows lead their own process group (so the command-runner
     // can reap the whole tree) and are unref'd so the dashboard's event loop is
@@ -156,7 +148,7 @@ export class ClaudeCodeAdapter implements AiCliAdapter {
     return {
       process: proc,
       detached: isWorkflow,
-      ...(useFileStdio ? { logPath: opts.logFile! } : {}),
+      ...(logPath ? { logPath } : {}),
     }
   }
 
