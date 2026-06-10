@@ -43,6 +43,6 @@
 
 ## 8. Type-safety gate + backup hygiene (post-review)
 
-- [x] 8.1 Per-package `tsconfig.typecheck.json` (`noEmit`) + `typecheck` nx targets + `nx.json` default + CI job gating e2e — closes the gap that let the CAS bug ship (no build/test step typechecks)
-- [x] 8.2 Fix all pre-existing type errors the gate surfaces: `db/types.ts` + `progress/types.ts` re-export-without-local-binding (`SessionStatus`/`WorkflowType`); `state/index.ts` `computeRoundCounts` return type (was mis-annotated `SynthesisCounts`); dashboard `api-types.ts` `UnresumableReason` re-export; `workflow-output.tsx` noUncheckedIndexedAccess
+- [x] 8.1 Per-package `tsconfig.typecheck.json` (`noEmit`) covering BOTH source and test files (vitest types added) + `typecheck` nx targets + `nx.json` default + CI job gating e2e — closes the gap that let the CAS bug ship (no build/test step typechecks)
+- [x] 8.2 Fix all pre-existing type errors the gate surfaces — source: `db/types.ts` + `progress/types.ts` re-export-without-local-binding (`SessionStatus`/`WorkflowType`), `state/index.ts` `computeRoundCounts` return type (was mis-annotated `SynthesisCounts`), dashboard `api-types.ts` `UnresumableReason` re-export, `workflow-output.tsx` noUncheckedIndexedAccess; tests: `noUncheckedIndexedAccess` array-access guards (reviewers/discourse tests), an unused `@ts-expect-error`, and an unsafe `StreamEvent` cast
 - [x] 8.3 `ocr db prune-backups [--keep N] [--dry-run]` + `pruneBackups` lib (keeps N most-recent, never touches the live DB); reclaimed the live 285 MB pre-remediation snapshot
