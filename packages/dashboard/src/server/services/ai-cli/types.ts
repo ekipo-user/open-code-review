@@ -107,6 +107,15 @@ export type SpawnOptions = {
    * row (so the handoff lookup can resolve the captured vendor_session_id).
    */
   env?: Record<string, string>
+  /**
+   * When set (workflow mode), the adapter redirects the spawned process's
+   * stdout+stderr to THIS file instead of OS pipes, and the caller tails the
+   * file for the live stream. This is the root-cause half of the wedge fix: a
+   * leaked grandchild can inherit fd 1/2 without holding a pipe whose EOF the
+   * dashboard waits on, so `proc.on('close')` fires on the direct child's exit.
+   * Ignored for non-workflow spawns (which keep pipe stdio).
+   */
+  logFile?: string
 }
 
 // ── Model Discovery ──
@@ -127,6 +136,12 @@ export type SpawnResult = {
   process: ChildProcess
   /** Whether the process was spawned detached (enables process group kill) */
   detached: boolean
+  /**
+   * Set when the adapter redirected stdout/stderr to a log file (per
+   * {@link SpawnOptions.logFile}). The caller tails this path for the live
+   * stream instead of reading `process.stdout` (which is null in that case).
+   */
+  logPath?: string
 }
 
 // ── Detection ──

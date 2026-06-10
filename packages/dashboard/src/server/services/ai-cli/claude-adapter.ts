@@ -9,6 +9,7 @@
  * Output: NDJSON with stream_event / content_block_delta / assistant message types.
  */
 
+import { openSync, closeSync } from 'node:fs'
 import { execBinary, spawnBinary } from '@open-code-review/platform'
 import type {
   AiCliAdapter,
@@ -111,6 +112,16 @@ export class ClaudeCodeAdapter implements AiCliAdapter {
       flags.push('--model', opts.model)
     }
 
+    // File-stdio (root-cause wedge fix): when a per-execution log file is
+    // provided (workflow mode), redirect stdout+stderr to that FILE rather than
+    // OS pipes. A leaked grandchild that inherits fd 1/2 then holds no pipe whose
+    // EOF the dashboard waits on, so `proc.on('close')` fires on the direct
+    // child's exit. The caller tails the file for the live stream. stdin stays a
+    // pipe so we can still deliver the prompt. Falls back to pipe stdio when no
+    // log file is given (non-workflow queries).
+    const useFileStdio = isWorkflow && !!opts.logFile
+    const logFd = useFileStdio ? openSync(opts.logFile!, 'a') : null
+
     // Spawn claude directly with stdin pipe (no shell needed). Merge any
     // caller-supplied env vars (e.g. OCR_DASHBOARD_EXECUTION_UID for the
     // late-linking workflow_id flow) on top of the cleaned baseline so
@@ -119,8 +130,18 @@ export class ClaudeCodeAdapter implements AiCliAdapter {
       cwd: opts.cwd,
       env: { ...cleanEnv(), ...(opts.env ?? {}) },
       detached: isWorkflow,
-      stdio: ['pipe', 'pipe', 'pipe'],
+      stdio: logFd !== null ? ['pipe', logFd, logFd] : ['pipe', 'pipe', 'pipe'],
     })
+
+    // The child has its own dup of the log fd; close the parent's copy so only
+    // the child (and any grandchild) keeps it open.
+    if (logFd !== null) {
+      try {
+        closeSync(logFd)
+      } catch {
+        /* best-effort */
+      }
+    }
 
     // Detached workflows lead their own process group (so the command-runner
     // can reap the whole tree) and are unref'd so the dashboard's event loop is
@@ -132,7 +153,11 @@ export class ClaudeCodeAdapter implements AiCliAdapter {
     proc.stdin?.write(opts.prompt)
     proc.stdin?.end()
 
-    return { process: proc, detached: isWorkflow }
+    return {
+      process: proc,
+      detached: isWorkflow,
+      ...(useFileStdio ? { logPath: opts.logFile! } : {}),
+    }
   }
 
   async listModels(): Promise<ModelDescriptor[]> {

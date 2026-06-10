@@ -15,6 +15,7 @@
  * - Tool names are lowercase (bash, read, write) — normalized to PascalCase for formatToolDetail
  */
 
+import { openSync, closeSync } from 'node:fs'
 import { execBinary, spawnBinary } from '@open-code-review/platform'
 import type {
   AiCliAdapter,
@@ -131,6 +132,14 @@ export class OpenCodeAdapter implements AiCliAdapter {
       args.push('--model', opts.model)
     }
 
+    // File-stdio (root-cause wedge fix — see claude-adapter): in workflow mode
+    // with a per-execution log file, redirect stdout+stderr to the FILE so a
+    // leaked grandchild can't hold a pipe whose EOF blocks `proc.on('close')`.
+    // The caller tails the file for the live stream. stdin stays 'ignore' (the
+    // prompt is a positional arg). Falls back to pipe stdio otherwise.
+    const useFileStdio = isWorkflow && !!opts.logFile
+    const logFd = useFileStdio ? openSync(opts.logFile!, 'a') : null
+
     // OpenCode does not support --max-turns; agents run to completion.
     // stdin is not needed — the prompt is passed as a positional argument.
     // Merge caller-supplied env vars (e.g. OCR_DASHBOARD_EXECUTION_UID for
@@ -140,15 +149,28 @@ export class OpenCodeAdapter implements AiCliAdapter {
       cwd: opts.cwd,
       env: { ...cleanEnv(), ...(opts.env ?? {}) },
       detached: isWorkflow,
-      stdio: ['ignore', 'pipe', 'pipe'],
+      stdio: logFd !== null ? ['ignore', logFd, logFd] : ['ignore', 'pipe', 'pipe'],
     })
+
+    // The child has its own dup of the log fd; close the parent's copy.
+    if (logFd !== null) {
+      try {
+        closeSync(logFd)
+      } catch {
+        /* best-effort */
+      }
+    }
 
     // See claude-adapter: detached workflows are unref'd so a wedged child can
     // never hold the dashboard's event loop open; the command-runner reaps the
     // tree and finalizes via the `result` event + watchdog.
     if (isWorkflow) proc.unref()
 
-    return { process: proc, detached: isWorkflow }
+    return {
+      process: proc,
+      detached: isWorkflow,
+      ...(useFileStdio ? { logPath: opts.logFile! } : {}),
+    }
   }
 
   async listModels(): Promise<ModelDescriptor[]> {
