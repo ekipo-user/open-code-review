@@ -49,6 +49,7 @@ import {
   defaultIsAlive,
   PID_REUSE_GUARD_MS,
   sqliteUtcMs,
+  CANCELLED_EXIT_CODE,
 } from '@open-code-review/cli/db'
 import { getAgentHeartbeatSeconds } from '@open-code-review/cli/runtime-config'
 import { reconcileCompletedSessions } from '@open-code-review/cli/state'
@@ -300,7 +301,7 @@ export async function startServer(options: StartServerOptions = {}): Promise<voi
   // Note: migrations have already been applied by openDb() above,
   // so the pid column is guaranteed to exist.
   const orphanResult = db.exec(
-    `SELECT id, pid, is_detached, started_at FROM command_executions
+    `SELECT id, pid, started_at FROM command_executions
      WHERE pid IS NOT NULL AND finished_at IS NULL`
   )
   if (orphanResult.length > 0 && orphanResult[0]) {
@@ -321,12 +322,15 @@ export async function startServer(options: StartServerOptions = {}): Promise<voi
 
       // Only act on genuinely-live processes (the shared liveness probe).
       if (defaultIsAlive(pid)) {
-        // Reap the WHOLE descendant tree (SIGTERM → grace → SIGKILL), robust to
-        // a setsid()-escaped grandchild (e.g. a leaked MCP daemon) — the exact
-        // failure mode that produced the wedge. The pre-PR `kill(-pid)` +
-        // manual SIGKILL escalation here would miss it, recurring the bug at
-        // every restart boundary. `reapTree` walks the tree for both detached
-        // and non-detached roots, so the `is_detached` branch is gone.
+        // Reap the WHOLE descendant tree, robust to a setsid()-escaped
+        // grandchild (e.g. a leaked MCP daemon) — the exact failure mode that
+        // produced the wedge. The pre-PR `kill(-pid)` + manual SIGKILL
+        // escalation here would miss it, recurring the bug at every restart
+        // boundary. `reapTree` walks the tree for both detached and
+        // non-detached roots, so the `is_detached` branch is gone. Note the
+        // SIGKILL escalation rides an unref'd timer inside reapTree — it fires
+        // here because the server stays alive past the grace (unlike the
+        // shutdown boundary, which must await it explicitly).
         reapTree(pid)
         killedCount++
       }
@@ -352,9 +356,10 @@ export async function startServer(options: StartServerOptions = {}): Promise<voi
   if (legacyCount > 0) {
     db.run(
       `UPDATE command_executions
-       SET exit_code = -2,
+       SET exit_code = ?,
            output = COALESCE(output, '') || '\n[Cancelled]'
-       WHERE finished_at IS NOT NULL AND exit_code IS NULL`
+       WHERE finished_at IS NOT NULL AND exit_code IS NULL`,
+      [CANCELLED_EXIT_CODE]
     )
     console.log(`  Backfilled ${legacyCount} finished command(s) missing an exit code`)
   }
@@ -622,7 +627,10 @@ export async function startServer(options: StartServerOptions = {}): Promise<voi
 
   // ── Graceful shutdown ──
 
-  const shutdown = (signal?: NodeJS.Signals): void => {
+  // Async so the child-reap path can hold the process open just past the
+  // SIGKILL-escalation grace (see below) — signal handlers tolerate a
+  // promise-returning callback fine.
+  const shutdown = async (signal?: NodeJS.Signals): Promise<void> => {
     console.log(
       `Shutting down dashboard server${signal ? ` (received ${signal})` : ''}...`,
     )
@@ -640,7 +648,7 @@ export async function startServer(options: StartServerOptions = {}): Promise<voi
     // This is more robust than the in-memory Maps (which are lost on hot-reload).
     try {
       const activeResult = db.exec(
-        'SELECT id, pid, is_detached FROM command_executions WHERE pid IS NOT NULL AND finished_at IS NULL'
+        'SELECT id, pid FROM command_executions WHERE pid IS NOT NULL AND finished_at IS NULL'
       )
       if (activeResult.length > 0 && activeResult[0]) {
         const { columns, values: activeRows } = activeResult[0]
@@ -649,21 +657,32 @@ export async function startServer(options: StartServerOptions = {}): Promise<voi
         for (const row of activeRows) {
           const pid = row[colIdx['pid']!] as number
 
-          // Reap the whole descendant tree, not just the process group — the
-          // same setsid()-escape robustness the live-cancel path uses. A plain
-          // group kill at shutdown leaves a leaked daemon behind for the next
-          // startup to inherit.
-          reapTree(pid)
-          console.log(`Reaped child process tree (PID ${pid})`)
+          // Reap the whole descendant tree with a SHORT grace (vs the 5s
+          // default): reapTree's SIGKILL escalation rides an unref'd timer, and
+          // this process force-exits within ~2s — a 5s grace would never fire
+          // here, leaving shutdown SIGTERM-only (round-2 SF3). 750ms fits the
+          // budget; the await below keeps the process alive long enough for the
+          // escalation (and its straggler WARN) to actually run.
+          reapTree(pid, 750)
+          console.log(`Reaping child process tree (PID ${pid})`)
         }
+
+        // Hold the process open just past the escalation grace so SIGKILL +
+        // the straggler diagnostic fire BEFORE the pid-nulling UPDATE below
+        // makes any survivor invisible to the next startup's orphan sweep.
+        // (Keeping pids populated instead would not help: once the root dies,
+        // a setsid()-escaped survivor reparents to PID 1 and no post-hoc tree
+        // walk can find it — the only effective window is right now.)
+        await new Promise<void>((resolve) => setTimeout(resolve, 1000))
 
         // Clear PIDs and mark as cancelled
         db.run(
           `UPDATE command_executions
-           SET exit_code = -2, finished_at = datetime('now'),
+           SET exit_code = ?, finished_at = datetime('now'),
                output = COALESCE(output, '') || '\n[Cancelled — server shutdown]',
                pid = NULL
-           WHERE pid IS NOT NULL AND finished_at IS NULL`
+           WHERE pid IS NOT NULL AND finished_at IS NULL`,
+          [CANCELLED_EXIT_CODE]
         )
       }
     } catch (err) {
@@ -697,9 +716,9 @@ export async function startServer(options: StartServerOptions = {}): Promise<voi
     }, 2000).unref()
   }
 
-  process.on('SIGINT', () => shutdown('SIGINT'))
-  process.on('SIGTERM', () => shutdown('SIGTERM'))
-  process.on('SIGHUP', () => shutdown('SIGHUP'))
+  process.on('SIGINT', () => void shutdown('SIGINT'))
+  process.on('SIGTERM', () => void shutdown('SIGTERM'))
+  process.on('SIGHUP', () => void shutdown('SIGHUP'))
   // Surface the proximate cause of unexpected shutdowns. Diagnostic only —
   // these don't trigger graceful shutdown themselves; node will already
   // either crash or carry on depending on its config.
