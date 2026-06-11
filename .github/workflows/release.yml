@@ -14,7 +14,9 @@
 # configured on npmjs.com with this repo + workflow filename `release.yml`
 # (no environment) as a GitHub Actions trusted publisher. The publish job
 # mints a short-lived OIDC credential at run time (`id-token: write`) — see
-# the publish step for the pnpm-version requirement that makes this work.
+# the publish step for the pnpm-version requirement that makes this work
+# (pnpm >= 11; pnpm 10 has no OIDC support — that wrong assumption broke the
+# first v2.2.1 publish attempt with a misleading ENEEDAUTH).
 
 name: Release
 
@@ -193,20 +195,25 @@ jobs:
       - run: pnpm install --frozen-lockfile
       - run: pnpm nx run-many -t build
       # ── npm auth: OIDC trusted publishing (no NPM_TOKEN secret) ──
-      # The publish client must support the OIDC exchange: pnpm >= 10.13 (or
-      # npm >= 11.5.1). The repo pins pnpm 9 for builds, so activate pnpm 10
-      # for THIS step only — COREPACK_ENABLE_PROJECT_SPEC=0 stops the project's
-      # packageManager pin from re-routing the corepack shim back to 9, and the
-      # version assertion fails loudly if PATH precedence ever changes. The
-      # install above deliberately stays on the repo's pnpm 9.
-      - name: nx release publish (OIDC trusted publishing via pnpm 10)
+      # The publish client must support the OIDC exchange: pnpm >= 11 (or
+      # npm >= 11.5.1). NOT pnpm 10: the v2.2.1 release failed exactly here
+      # with ENEEDAUTH because pnpm 10's bundle contains NO trusted-publishing
+      # code at all (verified empirically — zero "oidc" occurrences in the
+      # pnpm@10.34.2 tarball; the support shipped in pnpm 11, and 11.0.8's
+      # OIDC 404 regression was fixed by pnpm#11526, so pin >= 11.5.x). The
+      # repo pins pnpm 9 for builds, so activate pnpm 11 for THIS step only —
+      # COREPACK_ENABLE_PROJECT_SPEC=0 stops the project's packageManager pin
+      # from re-routing the corepack shim back to 9, and the version assertion
+      # fails loudly if PATH precedence ever changes. The install above
+      # deliberately stays on the repo's pnpm 9.
+      - name: nx release publish (OIDC trusted publishing via pnpm 11)
         env:
           COREPACK_ENABLE_PROJECT_SPEC: '0'
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           corepack enable
-          corepack prepare pnpm@10.34.2 --activate
-          pnpm --version | grep -q '^10\.' || { echo "expected pnpm 10 for OIDC publish, got $(pnpm --version)" >&2; exit 1; }
+          corepack prepare pnpm@11.5.3 --activate
+          pnpm --version | grep -q '^11\.' || { echo "expected pnpm 11 for OIDC publish, got $(pnpm --version)" >&2; exit 1; }
           pnpm nx release publish --tag "${{ needs.setup.outputs.dist-tag }}"
       - name: Registry drift guard
         shell: bash
