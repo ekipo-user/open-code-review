@@ -21,6 +21,19 @@ The command-runner SHALL run a per-execution watchdog that terminates a process 
 - **AND** the process is still alive after a grace window
 - **THEN** the watchdog SHALL reap the whole process tree and finalize the execution
 
+#### Scenario: Work done but the process already exited (close withheld)
+
+- **GIVEN** the vendor emitted its terminal `result` event and the child process has exited, but `close` is withheld (e.g. a leaked grandchild holds an inherited pipe in pipe-fallback mode)
+- **WHEN** the grace window passes
+- **THEN** the watchdog SHALL finalize the execution with the result's true verdict WITHOUT reaping (the PID may be recycled; escaped descendants have reparented and are unreachable)
+- **AND** the watchdog SHALL NOT refresh the heartbeat of an exited child, so a no-result dead child remains claimable by the liveness sweep
+
+#### Scenario: OpenCode exemption from result-driven finalization
+
+- **GIVEN** an OpenCode-hosted workflow
+- **THEN** finalization is driven by the file-stdio'd process `close` and the hard deadline, NOT a `result` event — OpenCode emits no terminal sentinel (its `step_finish` is per-step; mapping it to `result` would arm the grace reap against healthy agents)
+- **AND** this exemption SHALL be revisited if OpenCode adds an end-of-run event (tracked at the adapter parser, `opencode-adapter.ts`)
+
 #### Scenario: Alive past the hard deadline
 
 - **GIVEN** an execution alive beyond the configured hard deadline with no result
