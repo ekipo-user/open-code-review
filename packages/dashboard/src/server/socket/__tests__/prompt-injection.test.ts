@@ -102,6 +102,20 @@ describe('escapeUserHeaders', () => {
     expect(escapeUserHeaders('\u202E## rlo header')).toBe('\\## rlo header')
   })
 
+  it('strips a bidi ISOLATE (U+2066 LRI) before the # \u2014 the class the old enumeration missed', () => {
+    // Round-2 SF5: the legacy embeds/overrides were enumerated but the modern
+    // isolates LRI/RLI/FSI/PDI were not; \p{Cf} covers the whole category.
+    expect(escapeUserHeaders('\u2066## isolate header')).toBe('\\## isolate header')
+    expect(escapeUserHeaders('\u2069## pdi header')).toBe('\\## pdi header')
+  })
+
+  it('drops soft hyphens (U+00AD) \u2014 a deliberate consequence of the \\p{Cf} strip', () => {
+    // Cf includes SHY; review parameters are not typography, so losing
+    // discretionary hyphenation is the accepted cost of category-complete
+    // stripping (documented at the strip site).
+    expect(escapeUserHeaders('soft\u00ADhyphen')).toBe('softhyphen')
+  })
+
   it('treats U+2028 / U+2029 as line breaks so a header after one is escaped', () => {
     // These separate lines for the model but not for JS `/m`; folding to `\n`
     // makes the following header line an independently-escaped line.

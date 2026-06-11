@@ -10,7 +10,7 @@
  */
 
 import { type ChildProcess } from 'node:child_process'
-import { spawnBinary, reapTree, isProcessAlive } from '@open-code-review/platform'
+import { spawnBinary, reapTree } from '@open-code-review/platform'
 import { readFileSync, writeFileSync, unlinkSync, mkdirSync, existsSync } from 'node:fs'
 import { dirname, join } from 'node:path'
 import type { Server as SocketIOServer, Socket } from 'socket.io'
@@ -128,15 +128,23 @@ export function escapeUserHeaders(value: string): string {
       //     and NBSP (U+00A0) / figure-space (U+2007) / narrow-NBSP → an ASCII
       //     space the leading-whitespace class then covers. Round-1 SF6.
       .normalize('NFKC')
-      // (b) Line/paragraph separators (U+2028/U+2029) start a new line for the
-      //     model but NOT for JS's `/m` flag, so a `## h` placed after one would slip
-      //     through unescaped. Fold them to `\n` so each line is escaped on its own.
+      // (b) Fold line/paragraph separators (U+2028/U+2029) to `\n`. ECMA-262
+      //     DOES treat them as LineTerminators (so `^`+`/m` below would match
+      //     after them) \u2014 this is pure normalization, not a regex gap fix: one
+      //     canonical line-break form for everything downstream of the escapes
+      //     (the ```text fence wrapping, journaling, renderers), so no
+      //     consumer needs its own LS/PS handling.
       .replace(/[\u2028\u2029]/g, '\n')
-      // (c) Strip zero-width + bidi-control chars that NFKC leaves intact (ZWSP
-      //     U+200B–200D, word-joiner U+2060, BOM U+FEFF, bidi embeds/overrides
-      //     U+202A–202E incl. RLO). Invisible, they could sit between the indent
-      //     and the `#` to break the pattern match.
-      .replace(/[\u200B-\u200D\u2060\uFEFF\u202A-\u202E]/g, '')
+      // (c) Strip ALL Unicode format characters (category Cf) that NFKC leaves
+      //     intact — zero-widths, word-joiner, BOM, soft hyphen, the legacy
+      //     bidi embeds/overrides AND the modern isolates LRI/RLI/FSI/PDI
+      //     (U+2066-2069). Invisible, any of them could sit between the indent
+      //     and the `#` to break the pattern match; the property class can't
+      //     lose to the next Unicode revision the way an enumeration does
+      //     (round-2 SF5). Known tradeoff, accepted: stripping ZWJ (already in
+      //     the old enumeration) mangles ZWJ emoji sequences, and soft hyphens
+      //     are dropped — user content here is review parameters, not typography.
+      .replace(/\p{Cf}/gu, '')
       // ATX headers: 0–3 leading spaces or tabs followed by one+ `#`.
       .replace(/^([ \t]{0,3})(#+)/gm, '$1\\$2')
       // Fullwidth hash mimics: redundant after NFKC (a) but kept as defense if
@@ -386,7 +394,10 @@ type ProcessEntry = {
   startedAt: string
   /** Whether the process was spawned with detached: true (supports process group kill). */
   detached: boolean
-  /** Set to true by the cancel handler so the close handler can use exit code -2. */
+  /** Set by the cancel handler. `finishExecution` applies cancel-wins
+   *  centrally off this flag (round-1 SF4): whichever trigger finalizes — the
+   *  close handler, the watchdog, or a result — the recorded exit code becomes
+   *  CANCELLED_EXIT_CODE when this is true. */
   cancelled: boolean
   /** Workflow-id auto-link polling timer; cleared on process close. */
   linkPoll?: ReturnType<typeof setInterval>
@@ -414,11 +425,12 @@ type ProcessEntry = {
 }
 
 // ── Watchdog / supervision timing ──
-// The watchdog reaps a wedged review whose work is done but whose process
-// won't exit (the leaked-grandchild-holds-the-pipe failure), and bounds the
-// "alive but hung with no result" case. The `result`-grace path is the primary
-// reaper (fires ~30s after the agent's work completes); the hard deadline is a
-// last-resort cap.
+// The watchdog finalizes a wedged review whose work is done but whose `close`
+// is withheld (the leaked-grandchild-holds-the-pipe failure), and bounds the
+// "hung with no result" case. The `result`-grace path fires ~30s after the
+// agent's work completes — Claude-only, since OpenCode emits no terminal
+// `result` sentinel (see opencode-adapter); for OpenCode the file-stdio'd
+// `close` is primary and the hard deadline is the cap.
 const WATCHDOG_TICK_MS = 10_000
 const POST_RESULT_GRACE_MS = 30_000
 // The hard-deadline cap is no longer a constant here — it is read per-spawn from
@@ -429,6 +441,75 @@ const HEARTBEAT_THROTTLE_MS = 5_000
 // WATCHDOG_DEADLINE_EXIT_CODE (-5) now lives in the CLI's exit-codes module and
 // is imported above — one definition shared by the producer (here) and the
 // dashboard's outcome derivation (round-1 SF9).
+
+// ── Watchdog tick decision (pure) ──
+
+export type WatchdogTickInput = {
+  /** Positive evidence OUR child exited, read off the ChildProcess handle
+   *  (`exitCode`/`signalCode`). Strictly stronger than a PID liveness probe,
+   *  which can detect death but not recycling. */
+  exited: boolean
+  /** Epoch ms the terminal `result` event was seen, if any. */
+  resultSeenAt: number | undefined
+  /** Whether that `result` reported an error (selects the finalize code). */
+  resultIsError: boolean | undefined
+  /** Epoch ms the execution started. */
+  startedAtMs: number
+  nowMs: number
+  postResultGraceMs: number
+  hardDeadlineMs: number
+}
+
+export type WatchdogTickDecision =
+  | { action: 'wait' }
+  | { action: 'beat' }
+  | {
+      action: 'finalize'
+      /** Reap the tree only for a live child — reaping a dead child's PID
+       *  risks killing an unrelated recycled-PID process, and its escaped
+       *  descendants have reparented to PID 1 (unreachable) anyway. */
+      reap: boolean
+      exitCode: number
+      reason: 'result-grace' | 'hard-deadline'
+    }
+
+/**
+ * One watchdog tick, as a pure decision (round-2 SF1). The round-1 S14 guard
+ * (`if (!isProcessAlive(pid)) return`) gated the ENTIRE tick — including both
+ * finalize branches — so in pipe-fallback mode the original incident topology
+ * (child exited, grandchild holds the inherited pipe, `close` withheld) fell
+ * to the lossy 5-minute liveness sweep instead of the designed ~30s finalize.
+ * The guard now gates the SIGNAL (reaping), never the finalize:
+ *
+ *   - result-grace / hard-deadline FINALIZE regardless of child liveness;
+ *   - reaping happens only when the child is provably still ours (`!exited`);
+ *   - an exited child outside both deadlines gets `wait`, NOT `beat` — bumping
+ *     a dead child's heartbeat would disarm the liveness sweep's orphan-stamp
+ *     backstop for the no-result case.
+ */
+export function decideWatchdogTick(i: WatchdogTickInput): WatchdogTickDecision {
+  // Work provably done but `close` withheld past the grace: finalize with the
+  // TRUE verdict from the result event. Checked before the hard deadline so a
+  // run that is both past-grace and past-deadline records its real outcome.
+  if (i.resultSeenAt !== undefined && i.nowMs - i.resultSeenAt > i.postResultGraceMs) {
+    return {
+      action: 'finalize',
+      reap: !i.exited,
+      exitCode: i.resultIsError ? 1 : 0,
+      reason: 'result-grace',
+    }
+  }
+  // Absolute cap regardless of state.
+  if (i.nowMs - i.startedAtMs > i.hardDeadlineMs) {
+    return {
+      action: 'finalize',
+      reap: !i.exited,
+      exitCode: WATCHDOG_DEADLINE_EXIT_CODE,
+      reason: 'hard-deadline',
+    }
+  }
+  return i.exited ? { action: 'wait' } : { action: 'beat' }
+}
 
 /** Active commands keyed by execution_id */
 const activeCommands = new Map<number, ProcessEntry>()
@@ -864,8 +945,15 @@ function spawnAiCommand(
   // Per-execution log file for file-stdio (the root-cause wedge fix). The
   // adapter redirects the detached agent's stdout+stderr here instead of OS
   // pipes, and we tail it below — so a leaked grandchild can never hold a pipe
-  // whose EOF blocks finalization. Best-effort: if the dir can't be made we
-  // omit logFile and the adapter falls back to pipe stdio.
+  // whose EOF blocks finalization.
+  //
+  // Pipe fallback is a SUPPORTED DEGRADED MODE, by decision (round-2 S7):
+  // failing the spawn because a log dir couldn't be created would trade a
+  // weaker-but-correct run for no run at all. Degraded means only that `close`
+  // can again be withheld by a leaked grandchild — finalization still cannot
+  // hang: the watchdog's result-grace and hard-deadline branches finalize
+  // regardless of stdio mode (round-2 SF1), so the fallback differs in
+  // promptness, never in outcome.
   let logFile: string | undefined
   if (entry.uid) {
     try {
@@ -873,7 +961,10 @@ function spawnAiCommand(
       mkdirSync(logDir, { recursive: true })
       logFile = join(logDir, `${entry.uid}.log`)
     } catch (err) {
-      console.error('[command-runner] could not prepare exec-log dir:', err)
+      console.error(
+        '[command-runner] could not prepare exec-log dir — falling back to pipe stdio (degraded: close may be withheld by a leaked grandchild; watchdog deadlines still finalize):',
+        err,
+      )
     }
   }
   const spawnOpts: {
@@ -985,38 +1076,51 @@ function spawnAiCommand(
   const hardDeadlineMs = getWorkflowHardDeadlineMs(ocrDir)
   entry.watchdog = setInterval(() => {
     if (entry.finalized) return
-    const pid = entry.process?.pid
-    if (!pid) return
-    // Recycled-PID guard: if the process already exited, the OS may have reused
-    // its PID for an unrelated process. Don't reap it — let `proc.on('close')`
-    // (which fires on the real child's exit) finalize. The startup orphan-kill
-    // applies the same liveness discipline; the runtime watchdog must too.
-    if (!isProcessAlive(pid)) return
-    const now = Date.now()
-    // (1) Work done but process won't exit (leaked grandchild holds the pipe):
-    //     reap the whole tree and finalize. This is the exact incident class.
-    if (entry.resultSeenAt && now - entry.resultSeenAt > POST_RESULT_GRACE_MS) {
-      console.warn(`[watchdog] execution ${executionId}: result seen but process alive after grace — reaping tree`)
-      reapTree(pid)
-      finishExecution(io, db, ocrDir, executionId, entry.resultIsError ? 1 : 0, entry.outputBuffer)
-      return
+    const child = entry.process
+    const pid = child?.pid
+    if (!child || !pid) return
+    // Positive exit evidence from OUR child's handle. Gates the SIGNAL only —
+    // finalization runs regardless of liveness (round-2 SF1); see
+    // decideWatchdogTick for the full invariant set.
+    const exited = child.exitCode !== null || child.signalCode !== null
+    const decision = decideWatchdogTick({
+      exited,
+      resultSeenAt: entry.resultSeenAt,
+      resultIsError: entry.resultIsError,
+      startedAtMs: Date.parse(entry.startedAt),
+      nowMs: Date.now(),
+      postResultGraceMs: POST_RESULT_GRACE_MS,
+      hardDeadlineMs,
+    })
+    switch (decision.action) {
+      case 'beat':
+        // Healthy live child: keep the heartbeat fresh through silent stretches.
+        bumpHeartbeat()
+        return
+      case 'wait':
+        // Exited child, no deadline tripped: do NOT bump — a no-result dead
+        // child must stay claimable by the liveness sweep's orphan backstop.
+        return
+      case 'finalize': {
+        if (decision.reason === 'hard-deadline') {
+          const minutes = Math.round(hardDeadlineMs / 60000)
+          console.warn(`[watchdog] execution ${executionId}: exceeded hard deadline (${minutes}m) — finalizing${decision.reap ? ' + reaping tree' : ''}`)
+          // Persist the remediation breadcrumb: append to the buffer BEFORE
+          // finalizing so the -5 row (and its JSONL backup) carries it — the
+          // live socket emit alone vanishes from history (round-2 SF4).
+          const notice =
+            `\n[watchdog] Reaped after exceeding the ${minutes}-minute hard deadline. ` +
+            `Raise runtime.workflow_hard_deadline_minutes in .ocr/config.yaml for large reviewer fleets.\n`
+          entry.outputBuffer += notice
+          io.emit('command:output', { execution_id: executionId, content: notice })
+        } else {
+          console.warn(`[watchdog] execution ${executionId}: result seen but no close after grace — finalizing${decision.reap ? ' + reaping tree' : ''}`)
+        }
+        if (decision.reap) reapTree(pid)
+        finishExecution(io, db, ocrDir, executionId, decision.exitCode, entry.outputBuffer)
+        return
+      }
     }
-    // (2) Absolute deadline regardless of state.
-    if (now - Date.parse(entry.startedAt) > hardDeadlineMs) {
-      const minutes = Math.round(hardDeadlineMs / 60000)
-      console.warn(`[watchdog] execution ${executionId}: exceeded hard deadline (${minutes}m) — reaping tree`)
-      io.emit('command:output', {
-        execution_id: executionId,
-        content:
-          `\n[watchdog] Reaped after exceeding the ${minutes}-minute hard deadline. ` +
-          `Raise runtime.workflow_hard_deadline_minutes in .ocr/config.yaml for large reviewer fleets.\n`,
-      })
-      reapTree(pid)
-      finishExecution(io, db, ocrDir, executionId, WATCHDOG_DEADLINE_EXIT_CODE, entry.outputBuffer)
-      return
-    }
-    // (3) Healthy: keep the heartbeat fresh through silent stretches.
-    bumpHeartbeat()
   }, WATCHDOG_TICK_MS)
   entry.watchdog.unref()
 
