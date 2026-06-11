@@ -9,6 +9,15 @@
       "executor": "nx:run-commands",
       "outputs": ["{projectRoot}/dist/index.js"],
       "dependsOn": ["^build", { "target": "build", "projects": ["dashboard"] }],
+      "inputs": [
+        "production",
+        "^production",
+        "{workspaceRoot}/packages/dashboard/src/**/*",
+        "{workspaceRoot}/packages/dashboard/package.json"
+      ],
+      "metadata": {
+        "description": "Bundles the CLI and embeds dashboard/dist (build.mjs copies it). The dashboard dependency is a TARGET-level edge, not a project-graph edge (no implicitDependencies — that inverted the dashboard→cli layering), so ^production does NOT cover dashboard sources; the explicit dashboard inputs above keep the embedded dist fresh if this target is ever cached. Without them, enabling caching would silently ship stale-dashboard release bundles."
+      },
       "options": {
         "command": "node build.mjs",
         "cwd": "{projectRoot}"

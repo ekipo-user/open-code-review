@@ -1,25 +1,27 @@
-import { resolve } from 'node:path'
 import { defineConfig } from 'vitest/config'
 
+// ── Cross-package resolution model (round-2 S3) ──
+//
+// Dashboard tests import two workspace packages, resolved two different ways —
+// deliberately, and matching how each package publishes itself:
+//
+//  - `@open-code-review/platform` resolves to SOURCE: its package.json
+//    `exports.default` points at `src/index.ts`, so vitest's externalized
+//    (Node-driven) resolution lands on TypeScript that vite-node transforms.
+//    No alias needed.
+//
+//  - `@open-code-review/cli/*` resolves to DIST: cli's `exports` point at
+//    `dist/`, and vitest EXTERNALIZES the symlinked workspace package — Node's
+//    resolver follows `exports` before vite's `resolve.alias`/`conditions`
+//    ever participate. Source aliases for these subpaths were tried and are
+//    provably dead (object-form, regex-form, `resolve.conditions: ['source']`,
+//    and `server.deps.inline` all fail when `cli/dist` is absent — even for
+//    subpaths that were aliased). The reliable mechanism is the task graph:
+//    `dashboard:test` declares `dependsOn: cli:build` in project.json, so the
+//    dist these tests resolve is always freshly built. Do NOT re-add source
+//    aliases here — they cannot take effect and only mask the real dependency.
 export default defineConfig({
   root: import.meta.dirname,
-  resolve: {
-    alias: {
-      // Workspace: resolve cross-package imports to source TypeScript files.
-      // The published packages use dist/ via conditional exports, but in the
-      // monorepo vitest needs the source files directly.
-      '@open-code-review/cli/db': resolve(__dirname, '../cli/src/lib/db/index.ts'),
-      '@open-code-review/cli/state': resolve(
-        __dirname,
-        '../cli/src/lib/state/index.ts',
-      ),
-      '@open-code-review/cli/vendor-resume': resolve(
-        __dirname,
-        '../cli/src/lib/vendor-resume.ts',
-      ),
-      '@open-code-review/platform': resolve(__dirname, '../shared/platform/src/index.ts'),
-    },
-  },
   test: {
     include: ['src/**/__tests__/**/*.test.ts'],
     environment: 'node',

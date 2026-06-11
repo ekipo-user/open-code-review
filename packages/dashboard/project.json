@@ -8,6 +8,9 @@
     "build": {
       "executor": "nx:run-commands",
       "dependsOn": [],
+      "metadata": {
+        "description": "dependsOn: [] is LOAD-BEARING, not cleanup-bait: it overrides targetDefaults' ^build. The task chain dashboard:test -> cli:build -> cli:build:bundle -> dashboard:build is acyclic ONLY because this target does not in turn depend on cli:build (dashboard imports @open-code-review/cli, so ^build would add that edge and create a task cycle). The dashboard build consumes cli SOURCE via vite aliases / --conditions=source, so it genuinely does not need cli's dist."
+      },
       "options": {
         "command": "pnpm build",
         "cwd": "packages/dashboard"
