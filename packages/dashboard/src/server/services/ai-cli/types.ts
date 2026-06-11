@@ -118,20 +118,6 @@ export type SpawnOptions = {
   logFile?: string
 }
 
-// ── Model Discovery ──
-
-/**
- * Describes a single model that an adapter is willing to surface to users.
- * `id` is the literal string passed to `--model`. Other fields are optional
- * vendor-supplied hints — OCR does NOT invent tags like "fast" or "strong".
- */
-export type ModelDescriptor = {
-  id: string
-  displayName?: string
-  provider?: string
-  tags?: string[]
-}
-
 export type SpawnResult = {
   process: ChildProcess
   /** Whether the process was spawned detached (enables process group kill) */
@@ -217,16 +203,6 @@ export interface AiCliAdapter {
    * partial events (e.g. tool input deltas) across line boundaries.
    */
   parseLine(line: string): NormalizedEvent[]
-  /**
-   * Surfaces models the underlying CLI is willing to accept. Must never
-   * throw — implementations should fall back through:
-   *
-   *   1. Native CLI enumeration (`<binary> models --json`, etc.) when available
-   *   2. A small bundled known-good list (best-effort, may go stale)
-   *   3. An empty list — callers are expected to allow free-text input as
-   *      the final escape hatch, never gatekeep against the CLI's own validation
-   */
-  listModels(): Promise<ModelDescriptor[]>
 }
 
 // ── Service Status ──

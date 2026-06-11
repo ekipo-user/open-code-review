@@ -20,6 +20,7 @@ import { ReviewerIcon } from "./reviewer-icon";
 import { useAvailableModels } from "../hooks/use-team";
 import { useAiCli } from "../../../hooks/use-ai-cli";
 import { ModelSelect, type ModelSelectOption } from "../../../components/ui/model-select";
+import { ModelSourceHint } from "../../../components/ui/model-source-hint";
 import type { ReviewerMeta, ReviewerTier } from "../hooks/use-reviewers";
 import type { ReviewerSelection } from "./reviewer-defaults";
 
@@ -699,10 +700,13 @@ export function ReviewerDialog({
         </div>
 
         {/* Footer */}
-        <div className="flex items-center justify-between border-t border-zinc-200 px-5 py-3 dark:border-zinc-700">
-          <span className="text-xs text-zinc-400 dark:text-zinc-500">
-            {selectedCount} reviewer{selectedCount !== 1 ? "s" : ""} selected
-          </span>
+        <div className="flex items-center justify-between gap-3 border-t border-zinc-200 px-5 py-3 dark:border-zinc-700">
+          <div className="min-w-0">
+            <span className="text-xs text-zinc-400 dark:text-zinc-500">
+              {selectedCount} reviewer{selectedCount !== 1 ? "s" : ""} selected
+            </span>
+            <ModelSourceHint modelList={modelList} />
+          </div>
           <div className="flex gap-2">
             <button
               type="button"
@@ -813,6 +817,7 @@ function AdvancedModelSection({
           value={sharedModel ?? ""}
           options={modelOptions}
           freeText={freeText}
+          allowCustom
           ariaLabel={`Model for ${personaName}`}
           onChange={(v) => onUniformChange(v || null)}
         />
@@ -827,6 +832,7 @@ function AdvancedModelSection({
                 value={models[i] ?? ""}
                 options={modelOptions}
                 freeText={freeText}
+                allowCustom
                 ariaLabel={`Model for ${personaName}-${i + 1}`}
                 onChange={(v) => onInstanceChange(i, v || null)}
               />

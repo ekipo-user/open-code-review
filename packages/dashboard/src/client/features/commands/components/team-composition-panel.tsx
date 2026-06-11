@@ -10,6 +10,11 @@ import {
 } from 'lucide-react'
 import { cn } from '../../../lib/utils'
 import { useAiCli } from '../../../hooks/use-ai-cli'
+import {
+  ModelSelect,
+  type ModelSelectOption,
+} from '../../../components/ui/model-select'
+import { ModelSourceHint } from '../../../components/ui/model-source-hint'
 import { ReviewerIcon } from './reviewer-icon'
 import {
   useAvailableModels,
@@ -78,11 +83,16 @@ export function TeamCompositionPanel({
   const hasEdits = override !== null
 
   // Effective model list — `(default)` is the synthetic "omit --model flag" entry
-  const modelOptions: ModelOption[] = useMemo(() => {
-    const base: ModelOption[] = [{ id: '', label: DEFAULT_LABEL, isDefault: true }]
+  const modelOptions: ModelSelectOption[] = useMemo(() => {
+    const base: ModelSelectOption[] = [{ id: '', label: DEFAULT_LABEL }]
     if (modelList?.models) {
       for (const m of modelList.models) {
-        base.push({ id: m.id, label: m.displayName ? `${m.id} — ${m.displayName}` : m.id })
+        base.push({
+          id: m.id,
+          // Friendly name primary; raw id as the mono detail line.
+          label: m.displayName ?? m.id,
+          detail: m.displayName ? m.id : undefined,
+        })
       }
     }
     return base
@@ -233,6 +243,8 @@ export function TeamCompositionPanel({
         )}
       </div>
 
+      <ModelSourceHint modelList={modelList} />
+
       {hasEdits && (
         <p className="rounded-md border border-zinc-200 bg-zinc-50 px-3 py-2 text-[11px] text-zinc-600 dark:border-zinc-800 dark:bg-zinc-900/50 dark:text-zinc-400">
           {summarizeOverride(grouped, resolvedFromDisk?.team ?? [])}
@@ -249,17 +261,11 @@ type PersonaGroup = {
   instances: ReviewerInstance[]
 }
 
-type ModelOption = {
-  id: string
-  label: string
-  isDefault?: boolean
-}
-
 type PersonaRowProps = {
   group: PersonaGroup
   expanded: boolean
   onToggleExpand: () => void
-  modelOptions: ModelOption[]
+  modelOptions: ModelSelectOption[]
   modelListEmpty: boolean
   icon?: string
   displayName: string
@@ -382,12 +388,14 @@ function PersonaRow({
       {count > 0 && (
         <div className="mt-2 ml-7 space-y-1">
           {(mode === 'uniform' && isUniform) || count === 1 ? (
-            <ModelPicker
+            <ModelSelect
               value={sharedModel ?? ''}
               options={modelOptions}
               freeText={modelListEmpty}
+              allowCustom
               onChange={(value) => onUniformModelChange(value || null)}
-              compact
+              className="max-w-md"
+              ariaLabel={`Model for ${group.persona}`}
             />
           ) : (
             (expanded ? group.instances : []).map((inst) => (
@@ -398,14 +406,16 @@ function PersonaRow({
                 <span className="w-32 shrink-0 truncate text-xs text-zinc-500 dark:text-zinc-500">
                   {inst.name}
                 </span>
-                <ModelPicker
+                <ModelSelect
                   value={inst.model ?? ''}
                   options={modelOptions}
                   freeText={modelListEmpty}
+                  allowCustom
                   onChange={(value) =>
                     onInstanceModelChange(inst.instance_index, value || null)
                   }
-                  compact
+                  className="max-w-md"
+                  ariaLabel={`Model for ${inst.name}`}
                 />
               </div>
             ))
@@ -448,49 +458,6 @@ function ModeChip({
     >
       {label}
     </button>
-  )
-}
-
-// ── Model picker (dropdown OR free text fallback) ──
-
-type ModelPickerProps = {
-  value: string
-  options: ModelOption[]
-  onChange: (next: string) => void
-  freeText: boolean
-  compact?: boolean
-}
-
-function ModelPicker({ value, options, onChange, freeText, compact }: ModelPickerProps) {
-  if (freeText) {
-    return (
-      <input
-        type="text"
-        value={value}
-        placeholder="Type model id…"
-        onChange={(e) => onChange(e.target.value)}
-        className={cn(
-          'w-full rounded-md border border-zinc-200 bg-white px-2 py-1 font-mono text-xs text-zinc-700 dark:border-zinc-800 dark:bg-zinc-900 dark:text-zinc-300',
-          compact ? 'max-w-md' : '',
-        )}
-      />
-    )
-  }
-  return (
-    <select
-      value={value}
-      onChange={(e) => onChange(e.target.value)}
-      className={cn(
-        'w-full rounded-md border border-zinc-200 bg-white px-2 py-1 text-xs text-zinc-700 dark:border-zinc-800 dark:bg-zinc-900 dark:text-zinc-300',
-        compact ? 'max-w-md' : '',
-      )}
-    >
-      {options.map((opt) => (
-        <option key={opt.id} value={opt.id}>
-          {opt.label}
-        </option>
-      ))}
-    </select>
   )
 }
 

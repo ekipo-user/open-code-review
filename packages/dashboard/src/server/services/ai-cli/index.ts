@@ -42,6 +42,16 @@ type AdapterEntry = {
 }
 
 /**
+ * The canonical runtime adapter registry. `AiCliService` and the agreement
+ * tests (host capabilities, model-listing strategy) all consume THIS list —
+ * a hand-copied adapter list in a test polices drift with a copy that can
+ * itself drift, the exact failure class issue #39 was about.
+ */
+export function createRegisteredAdapters(): AiCliAdapter[] {
+  return [new ClaudeCodeAdapter(), new OpenCodeAdapter()]
+}
+
+/**
  * Read `dashboard.ai_cli` from `.ocr/config.yaml`.
  * Falls back to 'auto' if the field is missing or the file doesn't exist.
  */
@@ -68,10 +78,7 @@ export class AiCliService {
     this.preference = readAiCliPreference(ocrDir)
 
     // Register all known adapters and run detection
-    const adapters: AiCliAdapter[] = [
-      new ClaudeCodeAdapter(),
-      new OpenCodeAdapter(),
-    ]
+    const adapters = createRegisteredAdapters()
 
     this.entries = adapters.map((adapter) => ({
       adapter,

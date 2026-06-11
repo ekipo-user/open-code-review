@@ -220,6 +220,8 @@ export type ModelListResponse = {
   vendor: 'claude' | 'opencode' | null
   source: 'native' | 'bundled' | null
   models: ModelDescriptor[]
+  /** Why the bundled list is being served. Present iff source is "bundled". */
+  nativeUnavailableReason?: string
 }
 
 export type ReviewerOutputDetail = ReviewerOutput & {

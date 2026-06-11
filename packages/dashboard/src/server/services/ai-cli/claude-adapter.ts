@@ -14,7 +14,6 @@ import type {
   AiCliAdapter,
   DetectionResult,
   LineParser,
-  ModelDescriptor,
   NormalizedEvent,
   SpawnOptions,
   SpawnResult,
@@ -30,17 +29,6 @@ import {
 
 const WORKFLOW_TOOLS = ['Read', 'Write', 'Edit', 'Bash', 'Glob', 'Grep', 'TodoWrite', 'TodoRead', 'Task']
 const QUERY_TOOLS = ['Read', 'Grep', 'Glob']
-
-// ── Bundled known-good model list ──
-//
-// Best-effort fallback when Claude Code does not expose its own enumeration
-// command. May go stale; the user can always type any model id Claude Code
-// itself accepts (free-text input is the canonical bypass).
-const BUNDLED_CLAUDE_MODELS: ModelDescriptor[] = [
-  { id: 'claude-opus-4-7', displayName: 'Claude Opus 4.7' },
-  { id: 'claude-sonnet-4-6', displayName: 'Claude Sonnet 4.6' },
-  { id: 'claude-haiku-4-5-20251001', displayName: 'Claude Haiku 4.5' },
-]
 
 export class ClaudeCodeAdapter implements AiCliAdapter {
   readonly name = 'Claude Code'
@@ -150,49 +138,6 @@ export class ClaudeCodeAdapter implements AiCliAdapter {
       detached: isWorkflow,
       ...(logPath ? { logPath } : {}),
     }
-  }
-
-  async listModels(): Promise<ModelDescriptor[]> {
-    // Claude Code does not currently expose a `--list-models --json` command.
-    // Probe defensively in case a future version adds it; otherwise fall back
-    // to the bundled known-good list. Free-text input remains the final
-    // escape hatch — this method only seeds the dashboard's dropdown.
-    try {
-      const output = execBinary('claude', ['models', '--json'], {
-        encoding: 'utf-8',
-        timeout: 5000,
-        stdio: ['ignore', 'pipe', 'ignore'],
-      })
-      const parsed: unknown = JSON.parse(output)
-      if (Array.isArray(parsed)) {
-        const models: ModelDescriptor[] = []
-        for (const item of parsed) {
-          if (typeof item === 'string') {
-            models.push({ id: item })
-          } else if (
-            typeof item === 'object' &&
-            item !== null &&
-            'id' in (item as Record<string, unknown>) &&
-            typeof (item as Record<string, unknown>).id === 'string'
-          ) {
-            const obj = item as Record<string, unknown>
-            const desc: ModelDescriptor = { id: obj.id as string }
-            if (typeof obj.displayName === 'string') desc.displayName = obj.displayName
-            if (typeof obj.provider === 'string') desc.provider = obj.provider
-            if (Array.isArray(obj.tags)) {
-              desc.tags = obj.tags.filter((t): t is string => typeof t === 'string')
-            }
-            models.push(desc)
-          }
-        }
-        if (models.length > 0) {
-          return models
-        }
-      }
-    } catch {
-      // Native enumeration unavailable — fall through to bundled list
-    }
-    return BUNDLED_CLAUDE_MODELS
   }
 
   createParser(): LineParser {

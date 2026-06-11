@@ -19,7 +19,9 @@ import {
 } from '@open-code-review/cli/team-config'
 import {
   detectActiveVendor,
+  isModelVendor,
   listModelsForVendor,
+  SUPPORTED_VENDORS,
   type ModelVendor,
 } from '@open-code-review/cli/models'
 
@@ -116,33 +118,55 @@ export function createTeamRouter(ocrDir: string): Router {
     }
   })
 
+  // Vendor support derives from the CLI strategy table — the single source
+  // of truth for model enumeration. Enumeration is async so a slow vendor
+  // probe never blocks the dashboard's event loop (the lib caches
+  // enumeration results; `vendor=auto` detection probes fresh each call).
+  //
+  // The async body is wrapped in a SINGLE try/catch covering everything —
+  // including query parsing. Express 4 does not catch async throws, so any
+  // statement outside the try would become a swallowed unhandled rejection
+  // and a permanently hung request. This is the template for async routes.
   router.get('/models', (req, res) => {
-    let vendor: ModelVendor | null
-    const requested = (req.query['vendor'] as string | undefined)?.toLowerCase()
-    if (requested === 'claude' || requested === 'opencode') {
-      vendor = requested
-    } else if (!requested || requested === 'auto') {
-      vendor = detectActiveVendor()
-    } else {
-      res.status(400).json({ error: `Unknown vendor: ${requested}` })
-      return
-    }
+    void (async () => {
+      try {
+        const raw = req.query['vendor']
+        if (raw !== undefined && typeof raw !== 'string') {
+          // Array/object query forms (?vendor=a&vendor=b) are malformed input.
+          res.status(400).json({ error: 'vendor must be a single string' })
+          return
+        }
+        const requested = raw?.toLowerCase()
 
-    if (!vendor) {
-      res.json({ vendor: null, source: null, models: [] })
-      return
-    }
+        let vendor: ModelVendor | null
+        if (requested && isModelVendor(requested)) {
+          vendor = requested
+        } else if (!requested || requested === 'auto') {
+          vendor = await detectActiveVendor()
+        } else {
+          res.status(400).json({
+            error: `Unknown vendor: ${requested}. Supported: ${SUPPORTED_VENDORS.join(', ')}`,
+          })
+          return
+        }
 
-    try {
-      const result = listModelsForVendor(vendor)
-      res.json(result)
-    } catch (err) {
-      console.error('Failed to list models:', err)
-      res.status(500).json({
-        error: 'Failed to list models',
-        detail: err instanceof Error ? err.message : String(err),
-      })
-    }
+        if (!vendor) {
+          res.json({ vendor: null, source: null, models: [] })
+          return
+        }
+
+        const result = await listModelsForVendor(vendor)
+        res.json(result)
+      } catch (err) {
+        console.error('Failed to list models:', err)
+        if (!res.headersSent) {
+          res.status(500).json({
+            error: 'Failed to list models',
+            detail: err instanceof Error ? err.message : String(err),
+          })
+        }
+      }
+    })()
   })
 
   return router

@@ -2,44 +2,52 @@
  * OCR Models Command
  *
  * Surfaces the model identifiers the user's host AI CLI is willing to
- * accept. Strings are vendor-native — OCR does not coin its own logical
- * names. When the underlying CLI lacks a `models` subcommand, the output
- * is sourced from a small bundled known-good list (best-effort, may go
- * stale). Free-text input remains the canonical bypass.
+ * accept, resolved through the per-vendor strategy table in
+ * `lib/models.ts` (the single source of truth shared with the dashboard).
+ * Strings are vendor-native — OCR does not coin its own logical names.
+ * When native enumeration is unavailable the output is sourced from the
+ * vendor's bundled list and the reason is disclosed. Free-text input
+ * remains the canonical bypass.
  */
 
 import { Command } from "commander";
 import chalk from "chalk";
 import {
   detectActiveVendor,
+  isModelVendor,
   listModelsForVendor,
+  SUPPORTED_VENDORS,
   type ModelVendor,
 } from "../lib/models.js";
 
+const vendorList = SUPPORTED_VENDORS.join(" | ");
+
 const listSubcommand = new Command("list")
   .description("List models the active AI CLI is willing to accept")
-  .option(
-    "--vendor <vendor>",
-    "Override autodetection (claude | opencode)",
-  )
+  .option("--vendor <vendor>", `Override autodetection (${vendorList})`)
   .option("--json", "Emit JSON for programmatic consumption")
   .action(async (options: { vendor?: string; json?: boolean }) => {
     let vendor: ModelVendor | null;
     if (options.vendor) {
-      if (options.vendor !== "claude" && options.vendor !== "opencode") {
+      // Case-insensitive, matching the dashboard route's behavior.
+      const requested = options.vendor.toLowerCase();
+      if (!isModelVendor(requested)) {
         console.error(
           chalk.red(
-            `Invalid --vendor: "${options.vendor}". Must be "claude" or "opencode".`,
+            `Invalid --vendor: "${options.vendor}". Must be one of: ${vendorList}.`,
           ),
         );
         process.exit(1);
       }
-      vendor = options.vendor;
+      vendor = requested;
     } else {
-      vendor = detectActiveVendor();
+      vendor = await detectActiveVendor();
       if (!vendor) {
         if (options.json) {
-          console.log("[]");
+          // Mirrors the dashboard route's no-vendor envelope.
+          console.log(
+            JSON.stringify({ vendor: null, source: null, models: [] }, null, 2),
+          );
           return;
         }
         console.error(
@@ -51,18 +59,22 @@ const listSubcommand = new Command("list")
       }
     }
 
-    const { source, models } = listModelsForVendor(vendor);
+    const result = await listModelsForVendor(vendor);
 
     if (options.json) {
-      console.log(JSON.stringify(models, null, 2));
+      console.log(JSON.stringify(result, null, 2));
       return;
     }
 
+    const { source, models, nativeUnavailableReason } = result;
     console.log(chalk.bold(`Models for ${vendor} (${source})`));
     if (source === "bundled") {
+      const reason = nativeUnavailableReason
+        ? ` — ${nativeUnavailableReason}`
+        : "";
       console.log(
         chalk.dim(
-          "  Note: bundled fallback list — may be stale. Free-text input is always accepted.",
+          `  Note: bundled fallback list${reason}. Free-text input is always accepted.`,
         ),
       );
     }

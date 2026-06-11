@@ -55,7 +55,6 @@ function stubAdapter(
     },
     createParser: () => ({ parseLine: () => [] }),
     parseLine: () => [],
-    listModels: async () => [],
   }
 }
 

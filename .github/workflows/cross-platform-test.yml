@@ -11,6 +11,17 @@ on:
           - macos-latest
           - ubuntu-latest
         default: windows-latest
+      targets:
+        # e2e-only exists so a branch can validate its e2e suites on an OS
+        # whose unit tests fail for unrelated, pre-existing reasons (e.g.
+        # the Windows unit-test breakage tracked separately) without the
+        # unit step masking the e2e signal.
+        description: "Which targets to run"
+        type: choice
+        options:
+          - all
+          - e2e-only
+        default: all
       debug:
         description: "Open SSH debug session after tests"
         type: boolean
@@ -35,7 +46,11 @@ jobs:
           cache: pnpm
 
       - run: pnpm install --frozen-lockfile
-      - run: pnpm nx run-many -t test
+      - name: Unit tests
+        if: ${{ inputs.targets != 'e2e-only' }}
+        # --output-style=stream so a failing task's vitest output is not
+        # swallowed by nx's grouped terminal output (it was, on Windows).
+        run: pnpm nx run-many -t test --output-style=stream
       - run: pnpm nx e2e cli-e2e
       - run: pnpm nx e2e dashboard-api-e2e
 

@@ -4,6 +4,7 @@ import { cn } from '../../../lib/utils'
 import { useAiCli } from '../../../hooks/use-ai-cli'
 import { ReviewerIcon } from '../../commands/components/reviewer-icon'
 import { ModelSelect, type ModelSelectOption } from '../../../components/ui/model-select'
+import { ModelSourceHint } from '../../../components/ui/model-source-hint'
 import {
   useAvailableModels,
   useResolvedTeam,
@@ -302,6 +303,8 @@ export function DefaultTeamSection({ className }: DefaultTeamSectionProps) {
           />
         </div>
       )}
+
+      <ModelSourceHint modelList={modelList} className="mt-3" />
 
       {editingGroup && (
         <EditTeamReviewerDialog
@@ -810,6 +813,7 @@ function EditTeamReviewerDialog({
                   value={sharedModel ?? ''}
                   options={modelOptions}
                   freeText={modelListEmpty}
+                  allowCustom
                   ariaLabel="Model"
                   onChange={(value) => onUniformModelChange(value || null)}
                 />
@@ -826,6 +830,7 @@ function EditTeamReviewerDialog({
                       value={inst.model ?? ''}
                       options={modelOptions}
                       freeText={modelListEmpty}
+                      allowCustom
                       ariaLabel={`Model for ${inst.name}`}
                       onChange={(value) =>
                         onInstanceModelChange(inst.instance_index, value || null)
