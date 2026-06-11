@@ -797,57 +797,6 @@ describe("ocr team set --stdin", () => {
   });
 });
 
-describe("ocr models list", () => {
-  it("emits a JSON array with --json", async () => {
-    const project = tracked(createInitializedProject());
-
-    // --vendor flag bypasses PATH detection so the test runs without
-    // requiring claude/opencode binaries on the CI runner.
-    const result = await spawnCli(
-      ["models", "list", "--vendor", "claude", "--json"],
-      { cwd: project.dir },
-    );
-
-    expect(result.exitCode).toBe(0);
-    const parsed = JSON.parse(result.stdout);
-    expect(Array.isArray(parsed)).toBe(true);
-    expect(parsed.length).toBeGreaterThan(0);
-    // Every entry has at minimum an id string
-    for (const model of parsed) {
-      expect(typeof model.id).toBe("string");
-      expect(model.id.length).toBeGreaterThan(0);
-    }
-  });
-
-  it("opencode bundled fallback uses provider-prefixed ids", async () => {
-    const project = tracked(createInitializedProject());
-
-    const result = await spawnCli(
-      ["models", "list", "--vendor", "opencode", "--json"],
-      { cwd: project.dir },
-    );
-    const parsed = JSON.parse(result.stdout);
-
-    // Bundled OpenCode ids include a `provider/` prefix; native enumeration
-    // (when available) returns whatever opencode emits — we don't assert
-    // shape there. Either way, ids must be non-empty strings.
-    for (const model of parsed) {
-      expect(typeof model.id).toBe("string");
-      expect(model.id.length).toBeGreaterThan(0);
-    }
-  });
-
-  it("rejects an unknown vendor", async () => {
-    const project = tracked(createInitializedProject());
-
-    const result = await spawnCli(
-      ["models", "list", "--vendor", "nonexistent-vendor"],
-      { cwd: project.dir },
-    );
-    expect(result.exitCode).not.toBe(0);
-  });
-});
-
 describe("ocr review --resume", () => {
   it("rejects a non-existent workflow id", async () => {
     const project = tracked(createInitializedProject());

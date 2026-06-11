@@ -36,6 +36,11 @@ let portCounter = 14_000 + Math.floor(Math.random() * 1000);
 export interface StartOptions {
   /** Write a stale port file before starting the server (for testing port file cleanup). */
   stalePort?: number;
+  /**
+   * Extra env vars merged over `process.env` for the server child — e.g. a
+   * PATH that puts stub vendor binaries first (model-enumeration tests).
+   */
+  env?: Record<string, string>;
 }
 
 export async function startTestServer(opts?: StartOptions): Promise<ServerInstance> {
@@ -68,6 +73,7 @@ export async function startTestServer(opts?: StartOptions): Promise<ServerInstan
     cwd: tmpDir,
     env: {
       ...process.env,
+      ...opts?.env,
       PORT: String(port),
       NODE_ENV: "test",
       NO_COLOR: "1",
