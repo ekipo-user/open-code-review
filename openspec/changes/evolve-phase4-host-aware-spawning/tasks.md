@@ -15,8 +15,8 @@
 
 ## 3. New runtime adapters (require real CLI integration)
 
-- [ ] 3.1 `gemini-adapter.ts` — `spawn`, `createParser`/`parseLine`, `listModels`, resume helpers; golden NDJSON fixtures recorded from real Gemini CLI output
-- [ ] 3.2 `codex-adapter.ts` — same, with Codex fixtures
+- [ ] 3.1 `gemini-adapter.ts` — `spawn`, `createParser`/`parseLine`, resume helpers; golden NDJSON fixtures recorded from real Gemini CLI output. Model listing is NOT an adapter concern: register a vendor entry in `VENDOR_MODEL_STRATEGIES` (`packages/cli/src/lib/models.ts`) instead — the `model-strategy-agreement` contract test fails until it exists (see update-vendor-model-enumeration)
+- [ ] 3.2 `codex-adapter.ts` — same, with Codex fixtures (and its own strategy-table entry)
 - [ ] 3.3 Register both in the adapter registry; `doctor` cross-check that a `vendorBinary` with no adapter is informational, not an error
 
 ## 4. Tests
