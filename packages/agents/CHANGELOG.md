@@ -1,3 +1,15 @@
+## 2.2.0 (2026-06-11)
+
+### 🩹 Fixes
+
+- **agents:** harden and clarify the host-neutral Phase 4 skill prose ([#35](https://github.com/spencermarx/open-code-review/issues/35))
+- **agents:** run review Phase 4 host-neutrally instead of assuming Claude Code ([#28](https://github.com/spencermarx/open-code-review/issues/28))
+
+### ❤️ Thank You
+
+- claude-flow @agentic-org
+- Spencer Marx
+
 ## 2.1.0 (2026-06-09)
 
 ### 🚀 Features

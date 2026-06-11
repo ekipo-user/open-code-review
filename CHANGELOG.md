@@ -1,3 +1,45 @@
+## 2.2.0 (2026-06-11)
+
+### 🚀 Features
+
+- **cli:** per-tool instruction-file injection and host capability model ([#28](https://github.com/spencermarx/open-code-review/issues/28))
+- **cli:** operator database maintenance — ocr db doctor/prune/vacuum (WS-E) ([06560a7](https://github.com/spencermarx/open-code-review/commit/06560a7))
+- **cli:** auto-finalize completed-but-open sessions via guarded close (WS-C) ([4b19641](https://github.com/spencermarx/open-code-review/commit/4b19641))
+- **cli:** ocr db prune-backups to reclaim old snapshots (WS-E) ([bc9d351](https://github.com/spencermarx/open-code-review/commit/bc9d351))
+- **dashboard:** declare adapter sub-agent spawn capability ([#28](https://github.com/spencermarx/open-code-review/issues/28))
+- **dashboard:** file-stdio isolation for detached agents (WS-A hardening) ([78b6ee5](https://github.com/spencermarx/open-code-review/commit/78b6ee5))
+- **dashboard:** integrate reconciliation, file-stdio tailer + maintenance reapers ([677f05c](https://github.com/spencermarx/open-code-review/commit/677f05c))
+- **platform:** add a cross-platform process-tree reaper ([25b5a3c](https://github.com/spencermarx/open-code-review/commit/25b5a3c))
+
+### 🩹 Fixes
+
+- **agents:** run review Phase 4 host-neutrally instead of assuming Claude Code ([#28](https://github.com/spencermarx/open-code-review/issues/28))
+- **agents:** harden and clarify the host-neutral Phase 4 skill prose ([#35](https://github.com/spencermarx/open-code-review/issues/35))
+- **cli:** surface silent reviewers-meta.json write failure ([#35](https://github.com/spencermarx/open-code-review/issues/35))
+- **cli:** warn on prompt-injection patterns in reviewer personas ([#35](https://github.com/spencermarx/open-code-review/issues/35))
+- **cli:** correct type errors masked by the missing typecheck gate ([bfb7b37](https://github.com/spencermarx/open-code-review/commit/bfb7b37))
+- **cli:** type-clean the test suite for the typecheck gate ([b4bc78d](https://github.com/spencermarx/open-code-review/commit/b4bc78d))
+- **cli:** supervision + maintenance plumbing from the round-1 review ([65b3a09](https://github.com/spencermarx/open-code-review/commit/65b3a09))
+- **cli:** close the prune-backups NaN guard bypass (round-2 SF2) ([a89b599](https://github.com/spencermarx/open-code-review/commit/a89b599))
+- **dashboard:** harden review render against missing or unknown reviewer metadata ([#28](https://github.com/spencermarx/open-code-review/issues/28))
+- **dashboard:** contract-test the icon map; drop dead shield-check glyph ([#35](https://github.com/spencermarx/open-code-review/issues/35))
+- **dashboard:** supervise spawned reviews so a leaked daemon can't wedge them ([dfb0999](https://github.com/spencermarx/open-code-review/commit/dfb0999))
+- **dashboard:** reap orphan .tmp files and enforce a single instance ([a986b33](https://github.com/spencermarx/open-code-review/commit/a986b33))
+- **dashboard:** correct type errors masked by the missing typecheck gate ([2946d42](https://github.com/spencermarx/open-code-review/commit/2946d42))
+- **dashboard:** type-clean the test suite for the typecheck gate ([33c4c54](https://github.com/spencermarx/open-code-review/commit/33c4c54))
+- **dashboard:** supervision correctness from the round-1 review ([78cb2f6](https://github.com/spencermarx/open-code-review/commit/78cb2f6))
+- **dashboard:** reap full process trees at restart boundaries (round-1 SF1) ([96251c2](https://github.com/spencermarx/open-code-review/commit/96251c2))
+- **dashboard:** watchdog finalizes regardless of child liveness (round-2 SF1/SF4/SF5) ([7b49f1d](https://github.com/spencermarx/open-code-review/commit/7b49f1d))
+- **dashboard:** make the shutdown SIGKILL escalation actually fire (round-2 SF3) ([e650dad](https://github.com/spencermarx/open-code-review/commit/e650dad))
+- **db:** stop markdown_artifacts duplication (write-path + migration v14) ([f192eaf](https://github.com/spencermarx/open-code-review/commit/f192eaf))
+- **e2e:** retry + best-effort temp-dir teardown (Windows EBUSY) ([e32fb52](https://github.com/spencermarx/open-code-review/commit/e32fb52))
+- **platform:** reapTree returns a SIGTERM-phase diagnostic + warns on stragglers ([4b475cd](https://github.com/spencermarx/open-code-review/commit/4b475cd))
+
+### ❤️ Thank You
+
+- claude-flow @agentic-org
+- Spencer Marx
+
 ## 2.1.0 (2026-06-09)
 
 ### 🚀 Features

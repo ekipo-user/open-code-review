@@ -1,3 +1,30 @@
+## 2.2.0 (2026-06-11)
+
+### 🚀 Features
+
+- **cli:** ocr db prune-backups to reclaim old snapshots (WS-E) ([bc9d351](https://github.com/spencermarx/open-code-review/commit/bc9d351))
+- **cli:** auto-finalize completed-but-open sessions via guarded close (WS-C) ([4b19641](https://github.com/spencermarx/open-code-review/commit/4b19641))
+- **cli:** operator database maintenance — ocr db doctor/prune/vacuum (WS-E) ([06560a7](https://github.com/spencermarx/open-code-review/commit/06560a7))
+- **cli:** per-tool instruction-file injection and host capability model ([#28](https://github.com/spencermarx/open-code-review/issues/28))
+
+### 🩹 Fixes
+
+- **cli:** close the prune-backups NaN guard bypass (round-2 SF2) ([a89b599](https://github.com/spencermarx/open-code-review/commit/a89b599))
+- **cli:** supervision + maintenance plumbing from the round-1 review ([65b3a09](https://github.com/spencermarx/open-code-review/commit/65b3a09))
+- **cli:** type-clean the test suite for the typecheck gate ([b4bc78d](https://github.com/spencermarx/open-code-review/commit/b4bc78d))
+- **cli:** correct type errors masked by the missing typecheck gate ([bfb7b37](https://github.com/spencermarx/open-code-review/commit/bfb7b37))
+- **db:** stop markdown_artifacts duplication (write-path + migration v14) ([f192eaf](https://github.com/spencermarx/open-code-review/commit/f192eaf))
+- **agents:** harden and clarify the host-neutral Phase 4 skill prose ([#35](https://github.com/spencermarx/open-code-review/issues/35))
+- **cli:** warn on prompt-injection patterns in reviewer personas ([#35](https://github.com/spencermarx/open-code-review/issues/35))
+- **cli:** surface silent reviewers-meta.json write failure ([#35](https://github.com/spencermarx/open-code-review/issues/35))
+- **agents:** run review Phase 4 host-neutrally instead of assuming Claude Code ([#28](https://github.com/spencermarx/open-code-review/issues/28))
+- **dashboard:** harden review render against missing or unknown reviewer metadata ([#28](https://github.com/spencermarx/open-code-review/issues/28))
+
+### ❤️ Thank You
+
+- claude-flow @agentic-org
+- Spencer Marx
+
 ## 2.1.0 (2026-06-09)
 
 ### 🚀 Features
