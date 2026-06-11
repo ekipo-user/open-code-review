@@ -24,6 +24,29 @@ Keep this managed block so 'openspec update' can refresh the instructions.
 - **Nx-native automation**: Release process automation must use Nx extension points (e.g., `VersionActions`, `preVersionCommand`), not npm lifecycle scripts or standalone scripts.
 - **Agent assets — edit source, then sync**: Agent docs, skills, commands, references, and other agent-related files have their **source of truth in `packages/agents/`**. ALWAYS edit them there, then run `nx run cli:update` to write the changes out to the local project's `.ocr/` directory. Never hand-edit the generated `.ocr/` copies directly — they will be overwritten on the next sync and your edits will drift from source.
 
+## Release Process (GitHub + npm)
+
+Releases are cut **locally from `main` with `nx release`**; npm publishing happens **only in CI**, gated by a cross-platform install verification. Versioning is conventional-commits driven; `cli` + `agents` are a fixed release group (always bump together — `dashboard`, `shared/*`, and `*-e2e` are excluded from releasing, see `release` in `nx.json`).
+
+1. **Preconditions**: the work is merged to `main`; you are on `main`, pulled, with a clean tree; and the **push-triggered** CI run on `main` is green. (PR CI runs the e2e matrix on ubuntu only — macOS/Windows e2e run on push to `main`, so a green PR does NOT imply a green `main`.)
+2. **Preview the bump** (no writes):
+   ```bash
+   pnpm nx release --skip-publish --dry-run
+   ```
+   Conventional commits since the last `v*` tag decide the specifier (`feat` → minor, `fix` → patch, `BREAKING CHANGE` → major). Sanity-check the computed version and the changelog preview.
+3. **Cut the release**:
+   ```bash
+   GITHUB_TOKEN="$(gh auth token)" pnpm nx release --skip-publish
+   ```
+   This single command: bumps every manifest (including the synced copies in `packages/agents/.claude-plugin/plugin.json` and `packages/agents/skills/ocr/SKILL.md`), updates the lockfile, writes `CHANGELOG.md`, commits `chore(release): {version}`, tags `v{version}`, **pushes the commit + tag**, and **publishes the GitHub release**. Notes: the `GITHUB_TOKEN` env var is required for the GH-release step; `--yes` is mutually exclusive with `--skip-publish` (the latter already auto-answers the only prompt).
+4. **npm publish happens in CI, never locally**: the `v*` tag push triggers `.github/workflows/release.yml`, which packs the real tarballs and **install-verifies them on 3 OS × 2 Node versions** (pnpm 10 with scripts blocked + npm; `ocr doctor --engine-only --probe-write` + a real on-disk state command) **before** running `nx release publish`. Plain `vX.Y.Z` tags publish to dist-tag `latest`; `vX.Y.Z-rc*` tags publish to `next`. The workflow can also be run via manual dispatch (with a dry-run option that skips publishing).
+5. **Verify**: watch the Release run to completion (`gh run watch`), then confirm the registry:
+   ```bash
+   npm view @open-code-review/cli version && npm view @open-code-review/agents version
+   ```
+
+Never `npm publish` by hand, never tag without going through `nx release`, and never bypass the verify-install gate — it exists because 2.0.0 shipped an install break that only a real published-tarball install could catch.
+
 <!-- OCR:START -->
 ## Open Code Review Instructions
 
