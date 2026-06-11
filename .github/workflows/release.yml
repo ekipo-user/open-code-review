@@ -230,8 +230,18 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
+          # Retry: npm's read replicas lag publishes by a few seconds — the
+          # v2.2.1 publish SUCCEEDED but this guard false-alarmed by querying
+          # immediately (run 27351074620). Give propagation up to ~60s.
           VER="$(node -p "require('./packages/cli/package.json').version")"
           for pkg in @open-code-review/cli @open-code-review/agents; do
-            npm view "$pkg@$VER" version >/dev/null 2>&1 && echo "  ok $pkg@$VER" \
-              || { echo "  MISSING $pkg@$VER" >&2; exit 1; }
+            ok=""
+            for i in 1 2 3 4 5 6; do
+              if npm view "$pkg@$VER" version >/dev/null 2>&1; then
+                echo "  ok $pkg@$VER"; ok=1; break
+              fi
+              echo "  not yet visible: $pkg@$VER (attempt $i) — waiting 10s"
+              sleep 10
+            done
+            [ -n "$ok" ] || { echo "  MISSING $pkg@$VER" >&2; exit 1; }
           done
