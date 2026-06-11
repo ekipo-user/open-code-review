@@ -9,8 +9,10 @@ import express from 'express'
 import { createServer } from 'node:http'
 import { existsSync, readFileSync, writeFileSync, unlinkSync, mkdirSync } from 'node:fs'
 import { join, dirname, resolve } from 'node:path'
+import { reapTree, isProcessAlive } from '@open-code-review/platform'
 import { fileURLToPath } from 'node:url'
 import { randomBytes } from 'node:crypto'
+import { execFileSync } from 'node:child_process'
 import { Server as SocketIOServer } from 'socket.io'
 
 import { resolveOcrDir } from './services/ocr-resolver.js'
@@ -34,7 +36,7 @@ import { AiCliService } from './services/ai-cli/index.js'
 import { createSessionCaptureService } from './services/capture/session-capture-service.js'
 import { FilesystemSync } from './services/filesystem-sync.js'
 import { DbSyncWatcher } from './services/db-sync-watcher.js'
-import { registerCommandHandlers } from './socket/command-runner.js'
+import { registerCommandHandlers, clearSpawnMarker } from './socket/command-runner.js'
 import { registerChatHandlers, cleanupAllChats } from './socket/chat-handler.js'
 import { registerPostHandlers, cleanupAllPostGenerations } from './socket/post-handler.js'
 import {
@@ -42,11 +44,15 @@ import {
   sweepStaleAgentSessions,
   sweepStaleSessions,
   walCheckpointTruncate,
+  reapOrphanDbFiles,
+  reapStaleExecLogs,
   defaultIsAlive,
   PID_REUSE_GUARD_MS,
   sqliteUtcMs,
+  CANCELLED_EXIT_CODE,
 } from '@open-code-review/cli/db'
 import { getAgentHeartbeatSeconds } from '@open-code-review/cli/runtime-config'
+import { reconcileCompletedSessions } from '@open-code-review/cli/state'
 
 import { homedir } from 'node:os'
 
@@ -158,8 +164,45 @@ export type StartServerOptions = {
  *   const { startServer } = await import('./dashboard/server.js')
  *   await startServer({ port: 4173, open: true })
  */
+/**
+ * Whether `pid` is positively identified as an OCR dashboard server — guards the
+ * single-instance takeover so a recycled PID can't be mistaken for our server.
+ * POSIX only (uses `ps`); returns false on Windows / any failure (conservative
+ * — never reap something we can't positively identify).
+ *
+ * Primary: the `process.title` ('ocr-dashboard') we stamp at startup, anchored
+ * at the start of the command so an unrelated `…/server.js` cannot false-match.
+ * Fallback: the dashboard entrypoint path — kept ONLY because `process.title`
+ * does not always reach `ps` on macOS. The substring was the sole gate before
+ * and is too loose on its own (round-1 SF2).
+ */
+function isOcrDashboardProcess(pid: number): boolean {
+  if (process.platform === 'win32') return false
+  try {
+    const cmd = (
+      execFileSync('ps', ['-p', String(pid), '-o', 'command='], {
+        encoding: 'utf-8',
+        timeout: 3000,
+      }) as string
+    ).trim()
+    // Primary, positive identification: our stamped title at argv[0].
+    if (/^ocr-dashboard\b/.test(cmd)) return true
+    // Secondary fallback (macOS, where the title may not reach `ps`).
+    return /dashboard\/server\.js|server\/index\.ts/.test(cmd)
+  } catch {
+    return false
+  }
+}
+
 export async function startServer(options: StartServerOptions = {}): Promise<void> {
   const port = options.port ?? parseInt(process.env.PORT ?? '4173', 10)
+
+  // Stamp a stable, positively-identifying process title so a later instance's
+  // single-instance takeover can recognize THIS server (and never mistake a
+  // recycled PID for it). `isOcrDashboardProcess` anchors on this. On Linux it
+  // rewrites argv[0] (visible in `ps`); on macOS it may not reach `ps`, which is
+  // why the identity check keeps an entrypoint-path fallback.
+  process.title = 'ocr-dashboard'
 
   // Resolve .ocr directory
   const ocrDir = resolveOcrDir()
@@ -172,6 +215,24 @@ export async function startServer(options: StartServerOptions = {}): Promise<voi
   const walResult = walCheckpointTruncate(dbPathForCheckpoint)
   if (walResult === 'checkpointed') {
     console.log('  WAL checkpoint:    truncated stale write-ahead-log file')
+  }
+
+  // ── Orphan .tmp reaping (best-effort) ──
+  // Reclaim `ocr.db.<pid>.tmp` atomic-write leftovers from the retired sql.js
+  // engine era (no current code writes them). PID-guarded + age-guarded so a
+  // live mid-write temp is never touched. Reclaimed ~1 GB on a real machine.
+  // Shared with `ocr db doctor --fix` (single source: cli/db maintenance).
+  for (const reaped of reapOrphanDbFiles(join(ocrDir, 'data'))) {
+    console.log(`  Orphan reap:       removed stale ${reaped}`)
+  }
+
+  // ── Stale exec-log reaping (best-effort) ──
+  // The file-stdio sink writes one `<uid>.log` per review under data/exec-logs.
+  // They are kept for post-mortem debugging but pruned past 7 days so they
+  // can't grow without bound.
+  const staleLogs = reapStaleExecLogs(join(ocrDir, 'data', 'exec-logs'))
+  if (staleLogs.length > 0) {
+    console.log(`  Exec-log reap:     removed ${staleLogs.length} stale agent log(s)`)
   }
 
   const db = await openDb(ocrDir)
@@ -191,22 +252,31 @@ export async function startServer(options: StartServerOptions = {}): Promise<voi
   // Write process PID so other tooling can detect an already-running server
   // and clean up orphaned processes.
 
+  // ── Single-instance guard (take over a prior live server) ──
+  // Previously this only WARNED and the listen path auto-incremented the port,
+  // so multiple servers coexisted (two leaked ones ran ~29h in a real
+  // incident). A single-user local-first tool should run exactly one dashboard:
+  // if a prior OCR-dashboard process is alive, reap its whole tree (which also
+  // cleans up any review subtree it leaked) and take over. A recycled PID that
+  // isn't an OCR dashboard is left alone.
   if (existsSync(pidFilePath)) {
     try {
       const oldPid = parseInt(readFileSync(pidFilePath, 'utf-8').trim(), 10)
-      if (!isNaN(oldPid)) {
-        try {
-          process.kill(oldPid, 0)
-          console.warn(
-            `Warning: another dashboard server (PID ${oldPid}) appears to be running. ` +
-            `If this is stale, delete ${pidFilePath} and restart.`
-          )
-        } catch {
-          // Process not running — stale PID file, safe to overwrite
+      if (!isNaN(oldPid) && oldPid !== process.pid && isProcessAlive(oldPid) && isOcrDashboardProcess(oldPid)) {
+        console.log(`  Single-instance:   reaping prior dashboard server (PID ${oldPid}) and taking over`)
+        reapTree(oldPid)
+        // Brief wait for the port to free, then re-checkpoint the WAL the prior
+        // server may have left open. Polled with an async sleep — `startServer`
+        // is async, so this yields the event loop instead of hot-spinning a core
+        // (the rest of the file already treats event-loop hygiene as a rule).
+        const deadline = Date.now() + 6000
+        while (isProcessAlive(oldPid) && Date.now() < deadline) {
+          await new Promise<void>((resolve) => setTimeout(resolve, 100))
         }
+        walCheckpointTruncate(dbPathForCheckpoint)
       }
     } catch {
-      // Could not read PID file — overwrite it
+      // Unreadable/recycled PID file — overwrite it.
     }
   }
 
@@ -231,7 +301,7 @@ export async function startServer(options: StartServerOptions = {}): Promise<voi
   // Note: migrations have already been applied by openDb() above,
   // so the pid column is guaranteed to exist.
   const orphanResult = db.exec(
-    `SELECT id, pid, is_detached, started_at FROM command_executions
+    `SELECT id, pid, started_at FROM command_executions
      WHERE pid IS NOT NULL AND finished_at IS NULL`
   )
   if (orphanResult.length > 0 && orphanResult[0]) {
@@ -244,7 +314,6 @@ export async function startServer(options: StartServerOptions = {}): Promise<voi
 
     for (const row of orphanRows) {
       const pid = row[colIdx['pid']!] as number
-      const isDetached = (row[colIdx['is_detached']!] as number) === 1
       const startedAt = row[colIdx['started_at']!] as string
 
       // Safety: skip PIDs from commands started beyond the reuse window
@@ -253,30 +322,23 @@ export async function startServer(options: StartServerOptions = {}): Promise<voi
 
       // Only act on genuinely-live processes (the shared liveness probe).
       if (defaultIsAlive(pid)) {
-        // Process is alive — kill it
-        if (isDetached) {
-          try { process.kill(-pid, 'SIGTERM') } catch { process.kill(pid, 'SIGTERM') }
-        } else {
-          process.kill(pid, 'SIGTERM')
-        }
+        // Reap the WHOLE descendant tree, robust to a setsid()-escaped
+        // grandchild (e.g. a leaked MCP daemon) — the exact failure mode that
+        // produced the wedge. The pre-PR `kill(-pid)` + manual SIGKILL
+        // escalation here would miss it, recurring the bug at every restart
+        // boundary. `reapTree` walks the tree for both detached and
+        // non-detached roots, so the `is_detached` branch is gone. Note the
+        // SIGKILL escalation rides an unref'd timer inside reapTree — it fires
+        // here because the server stays alive past the grace (unlike the
+        // shutdown boundary, which must await it explicitly).
+        reapTree(pid)
         killedCount++
-
-        // Escalate to SIGKILL after 2 seconds for stubborn processes
-        setTimeout(() => {
-          try {
-            process.kill(pid, 0) // still alive?
-            if (isDetached) {
-              try { process.kill(-pid, 'SIGKILL') } catch { /* ignore */ }
-            }
-            process.kill(pid, 'SIGKILL')
-          } catch { /* already dead */ }
-        }, 2000)
       }
       // else: process not running — PID is stale, cleaned up below.
     }
 
     if (killedCount > 0) {
-      console.log(`  Cleaned up ${killedCount} orphaned process(es)`)
+      console.log(`  Reaped ${killedCount} orphaned process tree(s)`)
     }
   }
 
@@ -294,9 +356,10 @@ export async function startServer(options: StartServerOptions = {}): Promise<voi
   if (legacyCount > 0) {
     db.run(
       `UPDATE command_executions
-       SET exit_code = -2,
+       SET exit_code = ?,
            output = COALESCE(output, '') || '\n[Cancelled]'
-       WHERE finished_at IS NOT NULL AND exit_code IS NULL`
+       WHERE finished_at IS NOT NULL AND exit_code IS NULL`,
+      [CANCELLED_EXIT_CODE]
     )
     console.log(`  Backfilled ${legacyCount} finished command(s) missing an exit code`)
   }
@@ -338,6 +401,29 @@ export async function startServer(options: StartServerOptions = {}): Promise<voi
     )
   }
 
+  // ── Completed-but-open session reconciliation ──
+  // Recover the wedge's lasting symptom: a session whose round is provably
+  // complete (`round_completed`/`map_completed` event) but whose status stayed
+  // `active` because the agent died before `ocr state finish`. Runs AFTER the
+  // liveness sweep above so any dead-PID executions are already finalized —
+  // only then is the session quiesced and eligible to close. The per-execution
+  // hook (finishExecution → reconcileWorkflowOnExit) handles the live path;
+  // this startup pass handles sessions whose finishing execution fired while no
+  // dashboard was running. Drives close through the guarded `stateClose`.
+  const reconcileCompleted = async (): Promise<void> => {
+    try {
+      const closed = await reconcileCompletedSessions(ocrDir)
+      if (closed.length > 0) {
+        console.log(
+          `  Auto-finalized ${closed.length} completed-but-open session(s)`
+        )
+      }
+    } catch (err) {
+      console.error('[reconcile] completed-session reconciliation failed:', err)
+    }
+  }
+  await reconcileCompleted()
+
   // ── Periodic sweep timer ──
   // Runs every 5 minutes inside the running dashboard so liveness and
   // stale-session cleanup keep happening without a restart. Each sweep
@@ -348,6 +434,9 @@ export async function startServer(options: StartServerOptions = {}): Promise<voi
     try {
       logAgentSweep(sweepStaleAgentSessions(db, heartbeatSeconds, defaultIsAlive))
       sweepStaleSessions(db, STALE_SESSION_THRESHOLD_SECONDS)
+      // Fire-and-forget: liveness sweep (sync, above) may have just finalized a
+      // dead workflow's last execution, making its completed session eligible.
+      void reconcileCompleted()
     } catch (err) {
       console.error('[sweep] periodic sweep failed:', err)
     }
@@ -538,7 +627,10 @@ export async function startServer(options: StartServerOptions = {}): Promise<voi
 
   // ── Graceful shutdown ──
 
-  const shutdown = (signal?: NodeJS.Signals): void => {
+  // Async so the child-reap path can hold the process open just past the
+  // SIGKILL-escalation grace (see below) — signal handlers tolerate a
+  // promise-returning callback fine.
+  const shutdown = async (signal?: NodeJS.Signals): Promise<void> => {
     console.log(
       `Shutting down dashboard server${signal ? ` (received ${signal})` : ''}...`,
     )
@@ -548,14 +640,15 @@ export async function startServer(options: StartServerOptions = {}): Promise<voi
     try { unlinkSync(portFilePath) } catch { /* ignore */ }
     // Remove the dashboard spawn marker (used by CLI's `ocr state begin`
     // for durable workflow_id linkage). Cleared here so a crash-mid-spawn
-    // doesn't leave a stale marker pointing at a dead PID.
-    try { unlinkSync(join(dataDir, 'dashboard-active-spawn.json')) } catch { /* ignore */ }
+    // doesn't leave a stale marker pointing at a dead PID. Shared helper so the
+    // marker path is defined in exactly one place (round-1 S22).
+    clearSpawnMarker(ocrDir)
 
     // Kill all child processes tracked in the database.
     // This is more robust than the in-memory Maps (which are lost on hot-reload).
     try {
       const activeResult = db.exec(
-        'SELECT id, pid, is_detached FROM command_executions WHERE pid IS NOT NULL AND finished_at IS NULL'
+        'SELECT id, pid FROM command_executions WHERE pid IS NOT NULL AND finished_at IS NULL'
       )
       if (activeResult.length > 0 && activeResult[0]) {
         const { columns, values: activeRows } = activeResult[0]
@@ -563,25 +656,33 @@ export async function startServer(options: StartServerOptions = {}): Promise<voi
 
         for (const row of activeRows) {
           const pid = row[colIdx['pid']!] as number
-          const isDetached = (row[colIdx['is_detached']!] as number) === 1
 
-          try {
-            if (isDetached) {
-              try { process.kill(-pid, 'SIGTERM') } catch { process.kill(pid, 'SIGTERM') }
-            } else {
-              process.kill(pid, 'SIGTERM')
-            }
-            console.log(`Sent SIGTERM to child process (PID ${pid})`)
-          } catch { /* already dead */ }
+          // Reap the whole descendant tree with a SHORT grace (vs the 5s
+          // default): reapTree's SIGKILL escalation rides an unref'd timer, and
+          // this process force-exits within ~2s — a 5s grace would never fire
+          // here, leaving shutdown SIGTERM-only (round-2 SF3). 750ms fits the
+          // budget; the await below keeps the process alive long enough for the
+          // escalation (and its straggler WARN) to actually run.
+          reapTree(pid, 750)
+          console.log(`Reaping child process tree (PID ${pid})`)
         }
+
+        // Hold the process open just past the escalation grace so SIGKILL +
+        // the straggler diagnostic fire BEFORE the pid-nulling UPDATE below
+        // makes any survivor invisible to the next startup's orphan sweep.
+        // (Keeping pids populated instead would not help: once the root dies,
+        // a setsid()-escaped survivor reparents to PID 1 and no post-hoc tree
+        // walk can find it — the only effective window is right now.)
+        await new Promise<void>((resolve) => setTimeout(resolve, 1000))
 
         // Clear PIDs and mark as cancelled
         db.run(
           `UPDATE command_executions
-           SET exit_code = -2, finished_at = datetime('now'),
+           SET exit_code = ?, finished_at = datetime('now'),
                output = COALESCE(output, '') || '\n[Cancelled — server shutdown]',
                pid = NULL
-           WHERE pid IS NOT NULL AND finished_at IS NULL`
+           WHERE pid IS NOT NULL AND finished_at IS NULL`,
+          [CANCELLED_EXIT_CODE]
         )
       }
     } catch (err) {
@@ -615,9 +716,9 @@ export async function startServer(options: StartServerOptions = {}): Promise<voi
     }, 2000).unref()
   }
 
-  process.on('SIGINT', () => shutdown('SIGINT'))
-  process.on('SIGTERM', () => shutdown('SIGTERM'))
-  process.on('SIGHUP', () => shutdown('SIGHUP'))
+  process.on('SIGINT', () => void shutdown('SIGINT'))
+  process.on('SIGTERM', () => void shutdown('SIGTERM'))
+  process.on('SIGHUP', () => void shutdown('SIGHUP'))
   // Surface the proximate cause of unexpected shutdowns. Diagnostic only —
   // these don't trigger graceful shutdown themselves; node will already
   // either crash or carry on depending on its config.

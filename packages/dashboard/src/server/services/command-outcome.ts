@@ -23,6 +23,7 @@ import {
   type Database,
   CANCELLED_EXIT_CODE as CANCEL_EXIT_CODE,
   CASCADE_CLOSE_EXIT_CODE,
+  WATCHDOG_DEADLINE_EXIT_CODE,
 } from '@open-code-review/cli/db'
 import type { CommandOutcome } from '../../shared/types.js'
 
@@ -56,6 +57,12 @@ export function deriveCommandOutcome(
   if (exitCode === CANCEL_EXIT_CODE || exitCode === CASCADE_CLOSE_EXIT_CODE) {
     return 'cancelled'
   }
+  // Watchdog hard-deadline reap (-5) is explicitly recognized as a failure
+  // rather than falling through the generic `!== 0` branch unseen — so triage
+  // (and a future dedicated "timed out" badge; the discriminated
+  // TerminationReason is tracked as the follow-up half of round-1 SF9) can tell
+  // a deadline timeout apart from an arbitrary crash via the recorded code.
+  if (exitCode === WATCHDOG_DEADLINE_EXIT_CODE) return 'failed'
   if (exitCode !== 0) return 'failed'
   // Exit 0 — cross-check the linked workflow's completeness.
   if (completeness === null || completeness === 'complete') return 'success'

@@ -89,6 +89,165 @@ export function spawnBinary(
   });
 }
 
+// ── Process-tree reaping ──
+
+/**
+ * Whether a PID is currently signalable (alive). `process.kill(pid, 0)` sends
+ * no signal; only an `ESRCH` error is positive evidence of death. Mirrors the
+ * CLI's `defaultIsAlive` so callers across packages share one liveness probe.
+ */
+export function isProcessAlive(pid: number): boolean {
+  try {
+    process.kill(pid, 0);
+    return true;
+  } catch (err) {
+    return !(err instanceof Error && "code" in err && err.code === "ESRCH");
+  }
+}
+
+/**
+ * One descendant walk: the BFS result plus whether the enumerator (`ps`)
+ * actually ran. Derived from the SAME invocation — not a second probe — so
+ * the availability bit can never disagree with the walk it describes
+ * (round-2 S5: the previous separate probe was TOCTOU-prone and doubled the
+ * process spawns per reap).
+ */
+function walkDescendants(rootPid: number): {
+  pids: number[];
+  psAvailable: boolean;
+} {
+  if (isWindows) return { pids: [], psAvailable: false };
+  let out: string;
+  try {
+    out = execFileSync("ps", ["-A", "-o", "pid=,ppid="], {
+      encoding: "utf-8",
+      timeout: 5000,
+    }) as string;
+  } catch {
+    return { pids: [], psAvailable: false };
+  }
+  const children = new Map<number, number[]>();
+  for (const line of out.split("\n")) {
+    const m = line.trim().match(/^(\d+)\s+(\d+)$/);
+    if (!m) continue;
+    const pid = Number(m[1]);
+    const ppid = Number(m[2]);
+    if (!children.has(ppid)) children.set(ppid, []);
+    children.get(ppid)!.push(pid);
+  }
+  const acc: number[] = [];
+  const queue = [rootPid];
+  const seen = new Set<number>([rootPid]);
+  while (queue.length) {
+    const p = queue.shift()!;
+    for (const c of children.get(p) ?? []) {
+      if (seen.has(c)) continue;
+      seen.add(c);
+      acc.push(c);
+      queue.push(c);
+    }
+  }
+  return { pids: acc, psAvailable: true };
+}
+
+/**
+ * Enumerate all descendant PIDs of `rootPid` (children, grandchildren, …).
+ *
+ * On POSIX, builds the full ppid→children map from one `ps -A` call and BFSs
+ * from the root — this catches descendants that `setsid()`'d into their own
+ * process group (which `kill(-pgid)` would miss). Returns [] on Windows (use
+ * `reapTree`, which shells out to `taskkill /T`) or if `ps` is unavailable.
+ */
+export function descendantPids(rootPid: number): number[] {
+  return walkDescendants(rootPid).pids;
+}
+
+/**
+ * Diagnostic returned by {@link reapTree}. Reports only what is known
+ * SYNCHRONOUSLY (the SIGTERM phase). The SIGKILL escalation runs after
+ * `graceMs` so a straggler count cannot be in this struct — instead a WARN is
+ * logged from the grace callback when any process survives the re-walk (the
+ * exact "a leaked daemon refused to die" signal this primitive exists to catch).
+ */
+export type ReapResult = {
+  /** Descendants + root we attempted to SIGTERM (POSIX — always >= 1, the
+   *  root itself), or 1 for the Windows `taskkill /T` target. */
+  signaled: number;
+  /** Whether `ps` ran for the SIGTERM-phase walk (POSIX) — derived from that
+   *  same walk, not a separate probe, so it cannot disagree with it. When
+   *  false, only the root was signalled and a setsid()-escaped grandchild may
+   *  have been missed; reapTree logs that degradation centrally. */
+  psAvailable: boolean;
+};
+
+/**
+ * Terminate an entire process tree (root + all descendants), robust to children
+ * that escaped the root's process group via `setsid()` — the failure mode that
+ * lets a leaked MCP daemon hold a parent's stdio pipe open forever.
+ *
+ * POSIX: SIGTERM every descendant (leaves first, root last), then after
+ * `graceMs` re-walk and SIGKILL whatever is still alive. Windows: `taskkill /T
+ * /F` from the root. Best-effort and never throws — reaping is hygiene.
+ *
+ * Returns a {@link ReapResult} for the SIGTERM phase; survivors of the deferred
+ * SIGKILL grace are reported via `console.warn` (they're only knowable after
+ * `graceMs`). Existing call sites may ignore the return — no control-flow change.
+ */
+export function reapTree(rootPid: number, graceMs = 5000): ReapResult {
+  if (isWindows) {
+    try {
+      execFileSync("taskkill", ["/PID", String(rootPid), "/T", "/F"], {
+        timeout: 5000,
+      });
+    } catch {
+      /* already gone / not found */
+    }
+    return { signaled: 1, psAvailable: false };
+  }
+  const { pids: descendants, psAvailable } = walkDescendants(rootPid);
+  if (!psAvailable) {
+    // No production caller branches on the returned bit, so the degradation is
+    // surfaced HERE, once, where it happens: without `ps` only the root can be
+    // signalled and a setsid()-escaped grandchild survives the reap.
+    console.warn(
+      `[reapTree] 'ps' unavailable — signalling only the root (PID ${rootPid}); ` +
+        `escaped descendants cannot be enumerated on this system.`,
+    );
+  }
+  const term = [...descendants, rootPid];
+  for (const pid of term) {
+    try {
+      process.kill(pid, "SIGTERM");
+    } catch {
+      /* already gone */
+    }
+  }
+  setTimeout(() => {
+    // Re-walk: a child may have forked again between SIGTERM and now.
+    const kill = [...descendantPids(rootPid), rootPid];
+    let stragglers = 0;
+    for (const pid of kill) {
+      if (!isProcessAlive(pid)) continue;
+      stragglers++;
+      try {
+        process.kill(pid, "SIGKILL");
+      } catch {
+        /* already gone */
+      }
+    }
+    if (stragglers > 0) {
+      // Counted BEFORE the kill attempt — these survived SIGTERM and are now
+      // being sent SIGKILL (whether each SIGKILL landed is not re-verified).
+      console.warn(
+        `[reapTree] ${stragglers} process(es) under PID ${rootPid} survived SIGTERM ` +
+          `after ${graceMs}ms; sending SIGKILL — investigate a leaked daemon.`,
+      );
+    }
+  }, graceMs).unref();
+
+  return { signaled: term.length, psAvailable };
+}
+
 // ── Reviewer icons ──
 
 /**

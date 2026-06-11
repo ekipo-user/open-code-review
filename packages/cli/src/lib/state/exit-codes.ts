@@ -63,3 +63,13 @@ export const ORPHAN_EXIT_CODE = -3;
  *  (cascade close). Distinct from -2 (user cancel) and -3 (orphaned by the
  *  liveness sweep) so triage can tell the cause apart. */
 export const CASCADE_CLOSE_EXIT_CODE = -4;
+
+/** A row the dashboard watchdog reaped after the execution blew past the hard
+ *  deadline with no terminal `result`. Distinct from -2 (cancel), -3 (orphaned),
+ *  and -4 (cascade) so triage can tell a deadline timeout apart from an
+ *  arbitrary crash via the recorded code. Today the outcome derivation
+ *  recognizes it explicitly but still buckets it as 'failed' — a dedicated
+ *  "timed out" rendering is the deferred half of round-1 SF9 (a discriminated
+ *  TerminationReason). Lives here (not inline in command-runner) so producers
+ *  AND the outcome derivation share one definition. */
+export const WATCHDOG_DEADLINE_EXIT_CODE = -5;

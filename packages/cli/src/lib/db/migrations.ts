@@ -472,6 +472,39 @@ const MIGRATIONS: Migration[] = [
       db.run("ALTER TABLE command_executions DROP COLUMN parent_id;");
     },
   },
+  {
+    version: 14,
+    description:
+      "Self-heal markdown_artifacts duplication: collapse NULL-round duplicate rows and add a NULL-safe unique index so the dedup bug cannot recur",
+    // The table's `UNIQUE(session_id, artifact_type, round_number, file_path)`
+    // never deduped session-level artifacts because SQLite treats NULL ≠ NULL,
+    // and the writer used `INSERT OR REPLACE` — so every re-parse of a
+    // NULL-round artifact (context.md, map.md, …) appended a duplicate (one
+    // context.md reached 775 identical rows, ~177 MB). The writer is now an
+    // explicit UPDATE-or-INSERT; this migration heals existing DBs and adds a
+    // NULL-collapsing unique index as a DB-level backstop.
+    //
+    // Orphan-row sweep (FK-dangling children from the pre-FK-enforcement era)
+    // is intentionally NOT done here — it needs `PRAGMA foreign_keys = OFF`,
+    // which is a no-op inside the migration transaction. `ocr db doctor --fix`
+    // performs it outside a transaction.
+    run: (db) => {
+      // Collapse duplicates, keeping the newest row (max rowid) per logical key.
+      db.run(`
+        DELETE FROM markdown_artifacts
+        WHERE rowid NOT IN (
+          SELECT MAX(rowid) FROM markdown_artifacts
+          GROUP BY session_id, artifact_type, IFNULL(round_number, -1), file_path
+        )
+      `);
+      // NULL-safe uniqueness: IFNULL(round_number,-1) folds the NULL case so a
+      // re-parse can never insert a second row for the same logical artifact.
+      db.run(`
+        CREATE UNIQUE INDEX IF NOT EXISTS idx_markdown_artifacts_logical
+        ON markdown_artifacts(session_id, artifact_type, IFNULL(round_number, -1), file_path)
+      `);
+    },
+  },
 ];
 
 /** Whether `table` currently has a column named `column` (for idempotent DDL). */

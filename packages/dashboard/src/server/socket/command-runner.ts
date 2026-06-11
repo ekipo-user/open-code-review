@@ -10,7 +10,7 @@
  */
 
 import { type ChildProcess } from 'node:child_process'
-import { spawnBinary } from '@open-code-review/platform'
+import { spawnBinary, reapTree } from '@open-code-review/platform'
 import { readFileSync, writeFileSync, unlinkSync, mkdirSync, existsSync } from 'node:fs'
 import { dirname, join } from 'node:path'
 import type { Server as SocketIOServer, Socket } from 'socket.io'
@@ -28,13 +28,18 @@ import {
   type NormalizedEvent,
   type StreamEvent,
 } from '../services/ai-cli/index.js'
+import { FileTailer } from '../services/ai-cli/file-tailer.js'
 import { resolveLocalCli } from './cli-resolver.js'
 import { cleanEnv } from './env.js'
 import {
   generateCommandUid,
   appendCommandLog,
   type CommandLogEntry,
+  CANCELLED_EXIT_CODE,
+  WATCHDOG_DEADLINE_EXIT_CODE,
 } from '@open-code-review/cli/db'
+import { reconcileWorkflowOnExit } from '@open-code-review/cli/state'
+import { getWorkflowHardDeadlineMs } from '@open-code-review/cli/runtime-config'
 
 /** Split a command string into tokens, respecting single and double quotes. */
 function shellSplit(str: string): string[] {
@@ -118,9 +123,32 @@ const AI_COMMANDS = new Set(['map', 'review', 'translate-review-to-single-human'
 export function escapeUserHeaders(value: string): string {
   return (
     value
+      // (a) NFKC fold: collapses compatibility homoglyphs an attacker could use
+      //     to dodge the ASCII patterns below — fullwidth `＃` (U+FF03) → `#`,
+      //     and NBSP (U+00A0) / figure-space (U+2007) / narrow-NBSP → an ASCII
+      //     space the leading-whitespace class then covers. Round-1 SF6.
+      .normalize('NFKC')
+      // (b) Fold line/paragraph separators (U+2028/U+2029) to `\n`. ECMA-262
+      //     DOES treat them as LineTerminators (so `^`+`/m` below would match
+      //     after them) \u2014 this is pure normalization, not a regex gap fix: one
+      //     canonical line-break form for everything downstream of the escapes
+      //     (the ```text fence wrapping, journaling, renderers), so no
+      //     consumer needs its own LS/PS handling.
+      .replace(/[\u2028\u2029]/g, '\n')
+      // (c) Strip ALL Unicode format characters (category Cf) that NFKC leaves
+      //     intact — zero-widths, word-joiner, BOM, soft hyphen, the legacy
+      //     bidi embeds/overrides AND the modern isolates LRI/RLI/FSI/PDI
+      //     (U+2066-2069). Invisible, any of them could sit between the indent
+      //     and the `#` to break the pattern match; the property class can't
+      //     lose to the next Unicode revision the way an enumeration does
+      //     (round-2 SF5). Known tradeoff, accepted: stripping ZWJ (already in
+      //     the old enumeration) mangles ZWJ emoji sequences, and soft hyphens
+      //     are dropped — user content here is review parameters, not typography.
+      .replace(/\p{Cf}/gu, '')
       // ATX headers: 0–3 leading spaces or tabs followed by one+ `#`.
       .replace(/^([ \t]{0,3})(#+)/gm, '$1\\$2')
-      // Fullwidth hash mimics: 0–3 leading whitespace + one+ `＃`.
+      // Fullwidth hash mimics: redundant after NFKC (a) but kept as defense if
+      // normalization is ever disabled.
       .replace(/^([ \t]{0,3})(＃+)/gm, '$1\\$2')
       // Setext underlines: a line of `===` or `---` (3+) re-types the
       // line above as a heading. Escape so it renders as literal text.
@@ -366,10 +394,121 @@ type ProcessEntry = {
   startedAt: string
   /** Whether the process was spawned with detached: true (supports process group kill). */
   detached: boolean
-  /** Set to true by the cancel handler so the close handler can use exit code -2. */
+  /** Set by the cancel handler. `finishExecution` applies cancel-wins
+   *  centrally off this flag (round-1 SF4): whichever trigger finalizes — the
+   *  close handler, the watchdog, or a result — the recorded exit code becomes
+   *  CANCELLED_EXIT_CODE when this is true. */
   cancelled: boolean
   /** Workflow-id auto-link polling timer; cleared on process close. */
   linkPoll?: ReturnType<typeof setInterval>
+  /**
+   * First-wins finalization guard. Finalization can be triggered by the
+   * vendor `result` event (work done), `proc.on('close')` (EOF), the watchdog,
+   * or cancel — whichever fires first wins; the rest are no-ops. Decouples
+   * finalization from stdio EOF, which a leaked grandchild can hold open.
+   */
+  finalized?: boolean
+  /** Epoch ms when the terminal `result` event was seen (watchdog input). */
+  resultSeenAt?: number
+  /** Whether the terminal `result` reported an error (sets the watchdog exit code). */
+  resultIsError?: boolean
+  /** Per-execution supervisor/watchdog timer; cleared on finalize. */
+  watchdog?: ReturnType<typeof setInterval>
+  /** Last epoch ms a heartbeat was written for this row (throttle). */
+  lastBeatWrite?: number
+  /**
+   * File tailer for file-stdio workflows — reads the per-execution log the
+   * detached agent writes its stdout/stderr to (in place of an OS pipe a
+   * leaked grandchild could hold open). Drained + closed on finalize.
+   */
+  tailer?: FileTailer
+}
+
+// ── Watchdog / supervision timing ──
+// The watchdog finalizes a wedged review whose work is done but whose `close`
+// is withheld (the leaked-grandchild-holds-the-pipe failure), and bounds the
+// "hung with no result" case. The `result`-grace path fires ~30s after the
+// agent's work completes — Claude-only, since OpenCode emits no terminal
+// `result` sentinel (see opencode-adapter); for OpenCode the file-stdio'd
+// `close` is primary and the hard deadline is the cap.
+const WATCHDOG_TICK_MS = 10_000
+const POST_RESULT_GRACE_MS = 30_000
+// The hard-deadline cap is no longer a constant here — it is read per-spawn from
+// runtime-config (`getWorkflowHardDeadlineMs`, default 60 min) so a large
+// reviewer fleet on cold caches can raise it without a code change (round-1 S26).
+/** Heartbeat write throttle so streaming output doesn't hammer the WAL. */
+const HEARTBEAT_THROTTLE_MS = 5_000
+// WATCHDOG_DEADLINE_EXIT_CODE (-5) now lives in the CLI's exit-codes module and
+// is imported above — one definition shared by the producer (here) and the
+// dashboard's outcome derivation (round-1 SF9).
+
+// ── Watchdog tick decision (pure) ──
+
+export type WatchdogTickInput = {
+  /** Positive evidence OUR child exited, read off the ChildProcess handle
+   *  (`exitCode`/`signalCode`). Strictly stronger than a PID liveness probe,
+   *  which can detect death but not recycling. */
+  exited: boolean
+  /** Epoch ms the terminal `result` event was seen, if any. */
+  resultSeenAt: number | undefined
+  /** Whether that `result` reported an error (selects the finalize code). */
+  resultIsError: boolean | undefined
+  /** Epoch ms the execution started. */
+  startedAtMs: number
+  nowMs: number
+  postResultGraceMs: number
+  hardDeadlineMs: number
+}
+
+export type WatchdogTickDecision =
+  | { action: 'wait' }
+  | { action: 'beat' }
+  | {
+      action: 'finalize'
+      /** Reap the tree only for a live child — reaping a dead child's PID
+       *  risks killing an unrelated recycled-PID process, and its escaped
+       *  descendants have reparented to PID 1 (unreachable) anyway. */
+      reap: boolean
+      exitCode: number
+      reason: 'result-grace' | 'hard-deadline'
+    }
+
+/**
+ * One watchdog tick, as a pure decision (round-2 SF1). The round-1 S14 guard
+ * (`if (!isProcessAlive(pid)) return`) gated the ENTIRE tick — including both
+ * finalize branches — so in pipe-fallback mode the original incident topology
+ * (child exited, grandchild holds the inherited pipe, `close` withheld) fell
+ * to the lossy 5-minute liveness sweep instead of the designed ~30s finalize.
+ * The guard now gates the SIGNAL (reaping), never the finalize:
+ *
+ *   - result-grace / hard-deadline FINALIZE regardless of child liveness;
+ *   - reaping happens only when the child is provably still ours (`!exited`);
+ *   - an exited child outside both deadlines gets `wait`, NOT `beat` — bumping
+ *     a dead child's heartbeat would disarm the liveness sweep's orphan-stamp
+ *     backstop for the no-result case.
+ */
+export function decideWatchdogTick(i: WatchdogTickInput): WatchdogTickDecision {
+  // Work provably done but `close` withheld past the grace: finalize with the
+  // TRUE verdict from the result event. Checked before the hard deadline so a
+  // run that is both past-grace and past-deadline records its real outcome.
+  if (i.resultSeenAt !== undefined && i.nowMs - i.resultSeenAt > i.postResultGraceMs) {
+    return {
+      action: 'finalize',
+      reap: !i.exited,
+      exitCode: i.resultIsError ? 1 : 0,
+      reason: 'result-grace',
+    }
+  }
+  // Absolute cap regardless of state.
+  if (i.nowMs - i.startedAtMs > i.hardDeadlineMs) {
+    return {
+      action: 'finalize',
+      reap: !i.exited,
+      exitCode: WATCHDOG_DEADLINE_EXIT_CODE,
+      reason: 'hard-deadline',
+    }
+  }
+  return i.exited ? { action: 'wait' } : { action: 'beat' }
 }
 
 /** Active commands keyed by execution_id */
@@ -412,7 +551,7 @@ function writeSpawnMarker(ocrDir: string, executionUid: string, pid: number): vo
  * Remove the spawn marker. Called from the process-close handler so
  * stale markers don't accumulate. Idempotent — already-removed is fine.
  */
-function clearSpawnMarker(ocrDir: string): void {
+export function clearSpawnMarker(ocrDir: string): void {
   try {
     unlinkSync(spawnMarkerPath(ocrDir))
   } catch {
@@ -610,25 +749,19 @@ export function registerCommandHandlers(
       if (!proc) return  // Process not yet spawned
       const pid = proc.pid
 
-      // Only use process group kill (-pid) for detached processes (AI commands).
-      // Non-detached utility commands should be killed directly via proc.kill().
       if (entry.detached && pid) {
-        try { process.kill(-pid, 'SIGTERM') } catch { proc.kill('SIGTERM') }
+        // Reap the WHOLE descendant tree (SIGTERM → grace → SIGKILL), robust to
+        // children that escaped the process group via setsid() — e.g. a leaked
+        // MCP daemon. A plain `kill(-pid)` would miss them.
+        reapTree(pid)
       } else {
+        // Non-detached utility commands: direct kill, escalate after a grace.
         proc.kill('SIGTERM')
+        const killTimer = setTimeout(() => {
+          if (activeCommands.has(targetId)) proc.kill('SIGKILL')
+        }, 5000)
+        proc.once('close', () => clearTimeout(killTimer))
       }
-
-      // Escalate to SIGKILL after timeout
-      const killTimer = setTimeout(() => {
-        if (!activeCommands.has(targetId)) return
-        if (entry.detached && pid) {
-          try { process.kill(-pid, 'SIGKILL') } catch { /* already dead */ }
-        }
-        proc.kill('SIGKILL')
-      }, 5000)
-
-      // Clear timer when process exits
-      proc.once('close', () => clearTimeout(killTimer))
     } catch (err) {
       console.error('Error in command:cancel handler:', err)
       socket.emit('error', { message: 'Internal error' })
@@ -690,8 +823,9 @@ function spawnCliCommand(
   })
 
   proc.on('close', (code) => {
-    const finalCode = code ?? (entry.cancelled ? -2 : -1)
-    finishExecution(io, db, ocrDir, executionId, finalCode, entry.outputBuffer)
+    // `finishExecution` applies the cancel-wins preference centrally, so the
+    // close handler need only translate a signal-kill (null code) to -1.
+    finishExecution(io, db, ocrDir, executionId, code ?? -1, entry.outputBuffer)
   })
 
   proc.on('error', (err) => {
@@ -808,12 +942,38 @@ function spawnAiCommand(
   // the captured `vendor_session_id` for resume because it queries by
   // `workflow_id`.
   const repoRoot = dirname(ocrDir)
+  // Per-execution log file for file-stdio (the root-cause wedge fix). The
+  // adapter redirects the detached agent's stdout+stderr here instead of OS
+  // pipes, and we tail it below — so a leaked grandchild can never hold a pipe
+  // whose EOF blocks finalization.
+  //
+  // Pipe fallback is a SUPPORTED DEGRADED MODE, by decision (round-2 S7):
+  // failing the spawn because a log dir couldn't be created would trade a
+  // weaker-but-correct run for no run at all. Degraded means only that `close`
+  // can again be withheld by a leaked grandchild — finalization still cannot
+  // hang: the watchdog's result-grace and hard-deadline branches finalize
+  // regardless of stdio mode (round-2 SF1), so the fallback differs in
+  // promptness, never in outcome.
+  let logFile: string | undefined
+  if (entry.uid) {
+    try {
+      const logDir = join(ocrDir, 'data', 'exec-logs')
+      mkdirSync(logDir, { recursive: true })
+      logFile = join(logDir, `${entry.uid}.log`)
+    } catch (err) {
+      console.error(
+        '[command-runner] could not prepare exec-log dir — falling back to pipe stdio (degraded: close may be withheld by a leaked grandchild; watchdog deadlines still finalize):',
+        err,
+      )
+    }
+  }
   const spawnOpts: {
     mode: 'workflow'
     prompt: string
     cwd: string
     resumeSessionId?: string
     env?: Record<string, string>
+    logFile?: string
   } = {
     mode: 'workflow',
     prompt,
@@ -823,7 +983,10 @@ function spawnAiCommand(
   if (resumeSessionId) {
     spawnOpts.resumeSessionId = resumeSessionId
   }
-  const { process: proc, detached } = adapter.spawn(spawnOpts)
+  if (logFile) {
+    spawnOpts.logFile = logFile
+  }
+  const { process: proc, detached, logPath } = adapter.spawn(spawnOpts)
   entry.process = proc
   entry.detached = detached
 
@@ -890,6 +1053,76 @@ function spawnAiCommand(
   }, POLL_INTERVAL_MS)
   // Stash on the entry so process-close handlers can clear it.
   entry.linkPoll = linkPoll
+
+  // ── Liveness heartbeat + supervisor watchdog ──
+  // The parent execution row's heartbeat was previously seeded once at spawn
+  // and never bumped, so every long review drifted to "stalled". Bump it on
+  // output activity (throttled), and let the watchdog keep it fresh during
+  // long silent stretches and reap a wedged-but-alive process.
+  const bumpHeartbeat = (): void => {
+    if (entry.finalized) return
+    const now = Date.now()
+    if (now - (entry.lastBeatWrite ?? 0) < HEARTBEAT_THROTTLE_MS) return
+    entry.lastBeatWrite = now
+    try {
+      db.run(
+        `UPDATE command_executions SET last_heartbeat_at = datetime('now') WHERE id = ? AND finished_at IS NULL`,
+        [executionId],
+      )
+    } catch (err) {
+      console.error('[command-runner] heartbeat bump failed:', err)
+    }
+  }
+  const hardDeadlineMs = getWorkflowHardDeadlineMs(ocrDir)
+  entry.watchdog = setInterval(() => {
+    if (entry.finalized) return
+    const child = entry.process
+    const pid = child?.pid
+    if (!child || !pid) return
+    // Positive exit evidence from OUR child's handle. Gates the SIGNAL only —
+    // finalization runs regardless of liveness (round-2 SF1); see
+    // decideWatchdogTick for the full invariant set.
+    const exited = child.exitCode !== null || child.signalCode !== null
+    const decision = decideWatchdogTick({
+      exited,
+      resultSeenAt: entry.resultSeenAt,
+      resultIsError: entry.resultIsError,
+      startedAtMs: Date.parse(entry.startedAt),
+      nowMs: Date.now(),
+      postResultGraceMs: POST_RESULT_GRACE_MS,
+      hardDeadlineMs,
+    })
+    switch (decision.action) {
+      case 'beat':
+        // Healthy live child: keep the heartbeat fresh through silent stretches.
+        bumpHeartbeat()
+        return
+      case 'wait':
+        // Exited child, no deadline tripped: do NOT bump — a no-result dead
+        // child must stay claimable by the liveness sweep's orphan backstop.
+        return
+      case 'finalize': {
+        if (decision.reason === 'hard-deadline') {
+          const minutes = Math.round(hardDeadlineMs / 60000)
+          console.warn(`[watchdog] execution ${executionId}: exceeded hard deadline (${minutes}m) — finalizing${decision.reap ? ' + reaping tree' : ''}`)
+          // Persist the remediation breadcrumb: append to the buffer BEFORE
+          // finalizing so the -5 row (and its JSONL backup) carries it — the
+          // live socket emit alone vanishes from history (round-2 SF4).
+          const notice =
+            `\n[watchdog] Reaped after exceeding the ${minutes}-minute hard deadline. ` +
+            `Raise runtime.workflow_hard_deadline_minutes in .ocr/config.yaml for large reviewer fleets.\n`
+          entry.outputBuffer += notice
+          io.emit('command:output', { execution_id: executionId, content: notice })
+        } else {
+          console.warn(`[watchdog] execution ${executionId}: result seen but no close after grace — finalizing${decision.reap ? ' + reaping tree' : ''}`)
+        }
+        if (decision.reap) reapTree(pid)
+        finishExecution(io, db, ocrDir, executionId, decision.exitCode, entry.outputBuffer)
+        return
+      }
+    }
+  }, WATCHDOG_TICK_MS)
+  entry.watchdog.unref()
 
   // Emit initial status
   io.emit('command:output', {
@@ -990,20 +1223,28 @@ function spawnAiCommand(
         emitStreamEvent(evt)
         break
       }
+      case 'result': {
+        // The agent's turn loop is done. Record it for the watchdog: a healthy
+        // process exits within a moment (the `close` handler finalizes
+        // normally); a wedged one (leaked grandchild holding the pipe) is reaped
+        // by the watchdog after POST_RESULT_GRACE_MS so finalization never hangs
+        // on stdio EOF.
+        entry.resultSeenAt = Date.now()
+        entry.resultIsError = evt.isError
+        emitStreamEvent(evt)
+        break
+      }
     }
   }
 
-  // UTF-8 boundary safety — see Blocker 3. Without `setEncoding`,
-  // chunk.toString() can produce `�` replacement chars when a multi-
-  // byte codepoint straddles an OS pipe boundary, breaking JSON.parse
-  // on any vendor line carrying emoji, non-ASCII output, or tool
-  // results with non-Latin content. The broken line is silently
-  // dropped by the parsers — including the line that may carry
-  // `session_id` for capture.
-  proc.stdout?.setEncoding('utf-8')
-  proc.stderr?.setEncoding('utf-8')
-
-  proc.stdout?.on('data', (chunk: string) => {
+  // The single sink for output chunks, fed by EITHER the file tailer (file-stdio
+  // workflows) or the stdout pipe (fallback). Identical logic in both cases so
+  // the proven line-buffer + parseLine loop never forks.
+  function onOutputChunk(chunk: string): void {
+    // Output activity is the most truthful liveness signal — the agent is
+    // producing tokens. Bump the parent row's heartbeat (throttled) so a long
+    // review no longer drifts to "stalled".
+    bumpHeartbeat()
     lineBuffer += chunk
     const lines = lineBuffer.split('\n')
     lineBuffer = lines.pop() ?? ''
@@ -1023,13 +1264,31 @@ function spawnAiCommand(
         handleEvent(evt)
       }
     }
-  })
+  }
 
-  // Capture stderr
   let stderrBuffer = ''
-  proc.stderr?.on('data', (chunk: string) => {
-    stderrBuffer += chunk
-  })
+  if (logPath) {
+    // File-stdio: stdout+stderr are interleaved in the log file (no parent-held
+    // pipe). Tail the file for the live stream. The decoder inside FileTailer
+    // preserves multi-byte UTF-8 boundaries — the role setEncoding played for
+    // the pipe. stderr diagnostics ride the same path and surface inline via the
+    // unparseable-line fallback above.
+    const tailer = new FileTailer(logPath, onOutputChunk)
+    tailer.start()
+    entry.tailer = tailer
+  } else {
+    // Pipe fallback (non-detached / no log file). UTF-8 boundary safety — see
+    // Blocker 3. Without `setEncoding`, a multi-byte codepoint straddling a pipe
+    // boundary yields `�`, breaking JSON.parse on any vendor line carrying
+    // emoji/non-ASCII — including a line that may carry `session_id` for capture.
+    proc.stdout?.setEncoding('utf-8')
+    proc.stderr?.setEncoding('utf-8')
+    proc.stdout?.on('data', onOutputChunk)
+    // Capture stderr separately so a non-zero exit can append it as a verdict.
+    proc.stderr?.on('data', (chunk: string) => {
+      stderrBuffer += chunk
+    })
+  }
 
   proc.on('close', (code) => {
     // Stop the workflow-id auto-link polling — the process is done,
@@ -1043,6 +1302,14 @@ function spawnAiCommand(
     // from a CLI-only invocation outside the dashboard) doesn't
     // mistakenly link to this finished execution.
     clearSpawnMarker(ocrDir)
+
+    // File-stdio: final synchronous drain of the log tail before we process the
+    // remaining buffer, so bytes the agent wrote just before exiting (between
+    // the last poll and exit) are not lost.
+    if (entry.tailer) {
+      entry.tailer.stop()
+      entry.tailer = undefined
+    }
 
     // Process remaining buffered data
     if (lineBuffer.trim()) {
@@ -1074,8 +1341,9 @@ function spawnAiCommand(
     journal.close().catch((err) => {
       console.error('[event-journal] close failed:', err)
     })
-    const finalCode = code ?? (entry.cancelled ? -2 : -1)
-    finishExecution(io, db, ocrDir, executionId, finalCode, entry.outputBuffer)
+    // Cancel-wins is applied centrally in `finishExecution`; here we only map a
+    // signal-kill (null code) to -1.
+    finishExecution(io, db, ocrDir, executionId, code ?? -1, entry.outputBuffer)
   })
 
   proc.on('error', (err) => {
@@ -1102,18 +1370,56 @@ function finishExecution(
   db: Database,
   ocrDir: string,
   executionId: number,
-  code: number | null,
+  rawCode: number | null,
   output: string
 ): void {
   const finishedAt = new Date().toISOString()
   const entry = activeCommands.get(executionId)
 
-  db.run(
-    `UPDATE command_executions
-     SET exit_code = ?, finished_at = ?, output = ?, pid = NULL
-     WHERE id = ?`,
-    [code, finishedAt, output, executionId]
-  )
+  // Cancel wins the exit code regardless of which trigger finalizes (round-1
+  // SF4/S11). The cancel handler reaps the tree but defers finalization to
+  // `close`; if the agent had emitted `result` first, the watchdog's
+  // result-grace branch could otherwise finalize the cancelled run with 0/1,
+  // losing the cancellation in the recorded code + `cancellation_reason`.
+  const code = entry?.cancelled ? CANCELLED_EXIT_CODE : rawCode
+
+  // First-wins: finalization may be triggered by the `result` event, the
+  // `close` handler, the watchdog, or cancel. Only the first runs; the rest
+  // are no-ops. Without this, the same execution would be double-finalized
+  // (and double-emitted) when more than one trigger fires.
+  if (entry?.finalized) return
+  if (entry) {
+    entry.finalized = true
+    if (entry.watchdog) {
+      clearInterval(entry.watchdog)
+      entry.watchdog = undefined
+    }
+    // Backstop: release the file-stdio tailer's fd/timer on ANY finalize path
+    // (watchdog/cancel may finalize before `proc.on('close')` fires). Idempotent
+    // — the close handler's own stop() becomes a no-op. The close handler still
+    // owns the ordered final drain in the normal path.
+    if (entry.tailer) {
+      entry.tailer.stop()
+      entry.tailer = undefined
+    }
+  }
+
+  // CAS write — only finalize a row still in-flight, so a late close after an
+  // already-finalized result can never clobber the recorded exit code. Use the
+  // native prepared statement: the engine's `run()` returns void (it discards
+  // node:sqlite's StatementResultingChanges), whereas `prepare().run()` hands
+  // back `{ changes }` — which the CAS check below depends on.
+  const res = db
+    .prepare(
+      `UPDATE command_executions
+       SET exit_code = ?, finished_at = ?, output = ?, pid = NULL
+       WHERE id = ? AND finished_at IS NULL`
+    )
+    .run(code, finishedAt, output, executionId)
+  // Row already finalized in the DB (e.g. by a prior trigger on a stale entry)
+  // — nothing more to emit. `changes` is typed number|bigint; coerce so the
+  // zero-check is robust regardless of the binding's numeric representation.
+  if (Number(res.changes) === 0 && !entry) return
 
   // Cross-check workflow completeness (event-derived, via the
   // session_completeness view) so the UI distinguishes a genuinely finished
@@ -1138,7 +1444,7 @@ function finishExecution(
       started_at: entry.startedAt,
       finished_at: finishedAt,
       is_detached: entry.detached ? 1 : 0,
-      event: code === -2 ? 'cancel' : 'finish',
+      event: code === CANCELLED_EXIT_CODE ? 'cancel' : 'finish',
       writer: 'dashboard',
     })
   }
@@ -1152,4 +1458,39 @@ function finishExecution(
   })
 
   activeCommands.delete(executionId)
+
+  // Auto-finalize the linked workflow's session if this was the last execution
+  // of a provably-complete round. This closes the wedge's lasting symptom: an
+  // agent that finished its round but died before `ocr state finish` would
+  // otherwise leave the session `active`+`complete` forever. reconcileWorkflowOnExit
+  // no-ops unless the session is active, the round is complete, and nothing
+  // else is in flight — so it is safe to fire on every execution. Fire-and-
+  // forget: finalization of the execution row must not block on it, and a
+  // reconcile failure must never surface as a command error.
+  const workflowRow = db.exec(
+    'SELECT workflow_id FROM command_executions WHERE id = ?',
+    [executionId],
+  )
+  const workflowId = workflowRow[0]?.values[0]?.[0]
+  if (typeof workflowId === 'string' && workflowId.length > 0) {
+    // Reuse the dashboard's open handle (avoids a redundant ensureDatabase per
+    // finalize) and leave a debug paper trail of the outcome — a later
+    // post-mortem can see WHY a session did or didn't auto-close (round-1 S20/S21).
+    void reconcileWorkflowOnExit(ocrDir, workflowId, db)
+      .then((outcome) => {
+        if (outcome === 'closed') {
+          console.log(`[command-runner] auto-finalized workflow ${workflowId}`)
+        } else if (outcome === 'incomplete' || outcome === 'in-flight') {
+          console.debug(
+            `[command-runner] workflow ${workflowId} not finalized: ${outcome}`,
+          )
+        }
+      })
+      .catch((err) => {
+        console.error(
+          `[command-runner] reconcileWorkflowOnExit(${workflowId}) failed:`,
+          err instanceof Error ? err.message : err,
+        )
+      })
+  }
 }

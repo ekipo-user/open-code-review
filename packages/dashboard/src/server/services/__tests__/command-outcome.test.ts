@@ -26,6 +26,14 @@ describe('deriveCommandOutcome', () => {
     expect(deriveCommandOutcome(137, 'complete')).toBe('failed')
   })
 
+  it("explicitly recognizes the watchdog hard-deadline sentinel (-5) as 'failed'", () => {
+    // Not a silent fall-through: -5 is a named, handled terminal (round-1 SF9).
+    expect(deriveCommandOutcome(-5, null)).toBe('failed')
+    expect(deriveCommandOutcome(-5, 'complete')).toBe('failed')
+    // …and it is NOT a cancellation.
+    expect(deriveCancellationReason(-5)).toBeNull()
+  })
+
   describe('exit 0', () => {
     it("returns 'success' for non-workflow commands (no linked workflow)", () => {
       expect(deriveCommandOutcome(0, null)).toBe('success')

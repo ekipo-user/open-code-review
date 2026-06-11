@@ -81,10 +81,47 @@ describe('escapeUserHeaders', () => {
     expect(escapeUserHeaders('\t## tab indented')).toBe('\t\\## tab indented')
   })
 
-  it('escapes fullwidth ＃ (U+FF03) that visually mimics ASCII #', () => {
+  it('folds fullwidth ＃ (U+FF03) via NFKC, then escapes it as ASCII #', () => {
+    // NFKC collapses ＃→#, so the escaped output is the ASCII form.
     expect(escapeUserHeaders('＃＃ fullwidth header')).toBe(
-      '\\＃＃ fullwidth header',
+      '\\## fullwidth header',
     )
+  })
+
+  it('escapes an NBSP-indented header (NFKC folds U+00A0 → space)', () => {
+    // A non-breaking-space indent would dodge the ASCII `[ \t]` class without
+    // NFKC. After folding it is a regular space the leading-whitespace rule covers.
+    expect(escapeUserHeaders('\u00A0## nbsp indent')).toBe(' \\## nbsp indent')
+  })
+
+  it('strips a zero-width space wedged between the indent and the #', () => {
+    expect(escapeUserHeaders('\u200B## zero-width')).toBe('\\## zero-width')
+  })
+
+  it('strips a right-to-left override (U+202E) before the #', () => {
+    expect(escapeUserHeaders('\u202E## rlo header')).toBe('\\## rlo header')
+  })
+
+  it('strips a bidi ISOLATE (U+2066 LRI) before the # \u2014 the class the old enumeration missed', () => {
+    // Round-2 SF5: the legacy embeds/overrides were enumerated but the modern
+    // isolates LRI/RLI/FSI/PDI were not; \p{Cf} covers the whole category.
+    expect(escapeUserHeaders('\u2066## isolate header')).toBe('\\## isolate header')
+    expect(escapeUserHeaders('\u2069## pdi header')).toBe('\\## pdi header')
+  })
+
+  it('drops soft hyphens (U+00AD) \u2014 a deliberate consequence of the \\p{Cf} strip', () => {
+    // Cf includes SHY; review parameters are not typography, so losing
+    // discretionary hyphenation is the accepted cost of category-complete
+    // stripping (documented at the strip site).
+    expect(escapeUserHeaders('soft\u00ADhyphen')).toBe('softhyphen')
+  })
+
+  it('treats U+2028 / U+2029 as line breaks so a header after one is escaped', () => {
+    // These separate lines for the model but not for JS `/m`; folding to `\n`
+    // makes the following header line an independently-escaped line.
+    const escaped = escapeUserHeaders('intro text\u2028## injected after LS')
+    expect(escaped).toContain('\\## injected after LS')
+    expect(escaped).not.toContain('\u2028')
   })
 
   it('escapes setext-style underlines that re-type the preceding line as a heading', () => {

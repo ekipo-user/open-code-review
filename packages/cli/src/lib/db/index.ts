@@ -158,6 +158,7 @@ export {
   CANCELLED_EXIT_CODE,
   ORPHAN_EXIT_CODE,
   CASCADE_CLOSE_EXIT_CODE,
+  WATCHDOG_DEADLINE_EXIT_CODE,
 } from "../state/exit-codes.js";
 
 export { runMigrations, MIGRATIONS } from "./migrations.js";
@@ -168,13 +169,37 @@ export { resultToRows, resultToRow } from "./result-mapper.js";
 // `@open-code-review/cli/db` contract cannot leak the node:sqlite type.
 export type { Database, ExecResult, ExecResultRow, SqlValue, BindParams } from "./engine.js";
 export { probeEngine, isBusyError } from "./engine.js";
-export { reconcileLegacyState } from "./reconcile.js";
+export { reconcileLegacyState, hasInFlightDependents } from "./reconcile.js";
 export type {
   ReconcileResult,
   ReconcileAction,
   ReconcileKind,
   ReconcileOptions,
 } from "./reconcile.js";
+export {
+  collectDbHealth,
+  snapshotDb,
+  reapOrphanDbFiles,
+  reapStaleExecLogs,
+  fixDb,
+  vacuumDb,
+  pruneDb,
+  pruneBackups,
+  withForeignKeysDisabled,
+} from "./maintenance.js";
+export type {
+  DbHealthReport,
+  FkViolationGroup,
+  OrphanTempFile,
+  BackupFile,
+  DbFixOptions,
+  DbFixResult,
+  DbVacuumResult,
+  DbPruneOptions,
+  DbPruneResult,
+  DbPruneSessionPlan,
+  DbPruneBackupsResult,
+} from "./maintenance.js";
 export { getSchemaVersion } from "./migrations.js";
 
 export {

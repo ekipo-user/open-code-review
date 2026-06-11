@@ -76,6 +76,8 @@ describe("migration v13 — DROP COLUMN parent_id", () => {
     regressToPreV13();
     expect(() => runMigrations(db)).not.toThrow();
     const version = db.exec("SELECT MAX(version) FROM schema_version");
-    expect(version[0]!.values[0]![0]).toBe(13);
+    // The runner applies all pending migrations; assert it reached the latest
+    // (>= 13) rather than pinning a number that every new migration breaks.
+    expect(Number(version[0]!.values[0]![0])).toBeGreaterThanOrEqual(13);
   });
 });

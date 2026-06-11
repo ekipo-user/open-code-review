@@ -16,6 +16,20 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
+  typecheck:
+    name: Typecheck
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+      - uses: pnpm/action-setup@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: pnpm
+      - run: pnpm install --frozen-lockfile
+      - run: pnpm nx run-many -t typecheck
+
   test:
     name: Unit Tests
     runs-on: ubuntu-latest
@@ -32,7 +46,7 @@ jobs:
 
   e2e-api:
     name: API E2E (${{ matrix.os }})
-    needs: [test]
+    needs: [typecheck, test]
     timeout-minutes: 30
     strategy:
       fail-fast: false
@@ -52,7 +66,7 @@ jobs:
 
   e2e-ui:
     name: UI E2E (Playwright)
-    needs: [test]
+    needs: [typecheck, test]
     timeout-minutes: 30
     runs-on: ubuntu-latest
     steps:

@@ -776,7 +776,8 @@ describe("stateTransition — phase graph", () => {
     await expect(
       stateTransition({
         sessionId: "cross-type",
-        // @ts-expect-error — intentionally passing a map phase
+        // "topology" is a valid map phase (so it type-checks across workflows)
+        // but is rejected at runtime for a review session — the assertion below.
         phase: "topology",
         phaseNumber: 2,
         ocrDir,
