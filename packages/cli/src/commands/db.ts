@@ -388,12 +388,45 @@ const pruneSubcommand = new Command("prune")
 
 // ── prune-backups ──
 
+/**
+ * Validate `prune-backups` options at the CLI boundary. Returns an error
+ * message, or null when the combination is safe to execute.
+ *
+ * Exported pure so the rejection table is unit-testable. Two layers:
+ *  1. `keep` must be a non-negative INTEGER. `parseInt('oops')` is NaN, and
+ *     `NaN <= 0` is false — so without this check a typo would sail past the
+ *     `--force` guard and delete every backup (round-2 SF2). Validate, never
+ *     coerce.
+ *  2. `--keep 0` removes ALL snapshots — including a fresh `doctor --fix` /
+ *     `vacuum` safety net — so it requires `--force` (a dry-run is always
+ *     allowed for previewing). Round-1 S12.
+ */
+export function validatePruneBackupsOptions(options: {
+  keep: number;
+  force?: boolean;
+  dryRun?: boolean;
+}): string | null {
+  if (!Number.isInteger(options.keep) || options.keep < 0) {
+    return `--keep must be a non-negative integer (got "${String(options.keep)}").`;
+  }
+  if (options.keep === 0 && !options.force && !options.dryRun) {
+    return (
+      "--keep 0 removes every backup (including any just-written snapshot). " +
+      "Re-run with --dry-run to preview, or --force to confirm."
+    );
+  }
+  return null;
+}
+
 const pruneBackupsSubcommand = new Command("prune-backups")
   .description("Delete old ocr.db.bak.* snapshots, keeping the most recent few")
   .option(
     "--keep <n>",
     "retain the N most-recent backups (default 1; 0 removes all, requires --force)",
-    (v) => parseInt(v, 10),
+    // Raw conversion only — `Number('oops')` is NaN and flows into
+    // validatePruneBackupsOptions, the single validation home. (parseInt would
+    // also silently accept "3abc" → 3; Number rejects it as NaN.)
+    (v) => Number(v),
     1,
   )
   .option("--force", "permit --keep 0 (removing the last backup / safety net)")
@@ -402,14 +435,9 @@ const pruneBackupsSubcommand = new Command("prune-backups")
     const ocrDir = resolveOcrDir();
     const dataDir = join(ocrDir, "data");
 
-    // `--keep 0` removes ALL snapshots — including a fresh `doctor --fix` /
-    // `vacuum` safety net. Require an explicit --force for that (a dry-run is
-    // always allowed, so an operator can preview first). Round-1 S12.
-    if (options.keep <= 0 && !options.force && !options.dryRun) {
-      fail(
-        "--keep 0 removes every backup (including any just-written snapshot). " +
-          "Re-run with --dry-run to preview, or --force to confirm.",
-      );
+    const invalid = validatePruneBackupsOptions(options);
+    if (invalid !== null) {
+      fail(invalid);
     }
 
     // Pure file hygiene — no DB lock, so no live-dashboard guard needed.

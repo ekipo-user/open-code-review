@@ -287,6 +287,23 @@ describe("pruneBackups", () => {
     pruneBackups(dataDir, dbPath, { keep: 0 });
     expect(existsSync(dbPath)).toBe(true);
   });
+
+  it("throws on a non-integer keep instead of deleting everything (round-2 SF2)", () => {
+    const now = Date.now() / 1000;
+    makeBackup("ocr.db.bak.precious", 10, now - 100);
+    // NaN previously flowed through Math.max → slice(0, NaN)/slice(NaN) =
+    // "keep nothing, delete all". The library now rejects it at the boundary.
+    expect(() => pruneBackups(dataDir, dbPath, { keep: Number.NaN })).toThrow(
+      /non-negative integer/,
+    );
+    expect(() => pruneBackups(dataDir, dbPath, { keep: 1.5 })).toThrow(
+      /non-negative integer/,
+    );
+    expect(() => pruneBackups(dataDir, dbPath, { keep: -1 })).toThrow(
+      /non-negative integer/,
+    );
+    expect(existsSync(join(dataDir, "ocr.db.bak.precious"))).toBe(true);
+  });
 });
 
 describe("vacuumDb", () => {

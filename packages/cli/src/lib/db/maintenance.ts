@@ -406,7 +406,16 @@ export function pruneBackups(
   dbPath: string,
   opts: { keep?: number; dryRun?: boolean } = {},
 ): DbPruneBackupsResult {
-  const keep = Math.max(0, opts.keep ?? 1);
+  // Validate at the boundary, never clamp: `Math.max(0, NaN)` is NaN, and
+  // NaN flows through `slice(0, NaN)`/`slice(NaN)` as "keep nothing, delete
+  // everything" — the exact destructive outcome a malformed `keep` must not
+  // produce (round-2 SF2). A non-integer/negative keep is a caller bug; throw.
+  const keep = opts.keep ?? 1;
+  if (!Number.isInteger(keep) || keep < 0) {
+    throw new Error(
+      `pruneBackups: keep must be a non-negative integer (got ${String(keep)})`,
+    );
+  }
   const dryRun = opts.dryRun ?? false;
   const dbBase = basename(dbPath);
 
