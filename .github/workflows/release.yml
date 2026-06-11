@@ -209,6 +209,12 @@ jobs:
       - name: nx release publish (OIDC trusted publishing via pnpm 11)
         env:
           COREPACK_ENABLE_PROJECT_SPEC: '0'
+          # pnpm 11 itself enforces the repo's `packageManager: pnpm@9` pin
+          # (corepack's check is separate) and hard-errors under corepack.
+          # Downgrade that to a warning for this step only; the env var is
+          # inherited by the pnpm child nx spawns for the actual publish.
+          # (`pnpm_config_` prefix verified working; `npm_config_` is not.)
+          pnpm_config_pm_on_fail: 'warn'
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           corepack enable
