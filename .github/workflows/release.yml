@@ -8,11 +8,13 @@
 # and under npm) on the supported Node versions and prove `ocr doctor` + a real
 # on-disk DB command work, BEFORE promoting.
 #
-# TODOs for the maintainer before the first real run:
-#   - secrets.NPM_TOKEN (publish rights to the @open-code-review scope).
-#   - This workflow publishes whatever version is in the manifests; bump/tag to
-#     2.1.0 (e.g. `nx release version`) before triggering, or push a v2.1.0 tag.
-#   - `ocr init --tools claude` is the non-interactive form; confirm the tool id.
+# npm auth: OIDC TRUSTED PUBLISHING — there is NO NPM_TOKEN secret, by design.
+# The 2.2.0 release failed at publish because the token secret had vanished;
+# both packages (@open-code-review/cli, @open-code-review/agents) are now
+# configured on npmjs.com with this repo + workflow filename `release.yml`
+# (no environment) as a GitHub Actions trusted publisher. The publish job
+# mints a short-lived OIDC credential at run time (`id-token: write`) — see
+# the publish step for the pnpm-version requirement that makes this work.
 
 name: Release
 
@@ -176,7 +178,7 @@ jobs:
     timeout-minutes: 20
     permissions:
       contents: write   # Nx creates the GitHub release/changelog
-      id-token: write   # npm provenance, if enabled later
+      id-token: write   # REQUIRED: npm trusted publishing mints the OIDC token from this
     steps:
       - uses: actions/checkout@v4
         with: { fetch-depth: 0 }
@@ -185,14 +187,27 @@ jobs:
         with:
           node-version: 22
           cache: pnpm
-          registry-url: 'https://registry.npmjs.org'
+          # NOTE: no `registry-url` here, on purpose. It writes an .npmrc with
+          # `_authToken=${NODE_AUTH_TOKEN}` — with no token secret that line
+          # either errors (undefined env) or shadows OIDC trusted publishing.
       - run: pnpm install --frozen-lockfile
       - run: pnpm nx run-many -t build
-      - name: nx release publish
+      # ── npm auth: OIDC trusted publishing (no NPM_TOKEN secret) ──
+      # The publish client must support the OIDC exchange: pnpm >= 10.13 (or
+      # npm >= 11.5.1). The repo pins pnpm 9 for builds, so activate pnpm 10
+      # for THIS step only — COREPACK_ENABLE_PROJECT_SPEC=0 stops the project's
+      # packageManager pin from re-routing the corepack shim back to 9, and the
+      # version assertion fails loudly if PATH precedence ever changes. The
+      # install above deliberately stays on the repo's pnpm 9.
+      - name: nx release publish (OIDC trusted publishing via pnpm 10)
         env:
-          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
+          COREPACK_ENABLE_PROJECT_SPEC: '0'
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-        run: pnpm nx release publish --tag "${{ needs.setup.outputs.dist-tag }}"
+        run: |
+          corepack enable
+          corepack prepare pnpm@10.34.2 --activate
+          pnpm --version | grep -q '^10\.' || { echo "expected pnpm 10 for OIDC publish, got $(pnpm --version)" >&2; exit 1; }
+          pnpm nx release publish --tag "${{ needs.setup.outputs.dist-tag }}"
       - name: Registry drift guard
         shell: bash
         run: |
