@@ -97,7 +97,14 @@ export async function startTestServer(opts?: StartOptions): Promise<ServerInstan
         // Safety timeout — don't hang forever
         setTimeout(() => r(), 5_000);
       });
-      rmSync(tmpDir, { recursive: true, force: true });
+      // Retried + best-effort: Windows reports EBUSY on rmdir for a short
+      // window after the child server exits (same class as the cli-e2e
+      // temp-project teardown flake). A leaked CI temp dir is harmless.
+      try {
+        rmSync(tmpDir, { recursive: true, force: true, maxRetries: 10, retryDelay: 100 });
+      } catch {
+        /* best-effort cleanup */
+      }
     },
   };
 }
@@ -161,7 +168,14 @@ export function startServerEarly(opts?: StartOptions): {
         child.on("exit", () => r());
         setTimeout(() => r(), 5_000);
       });
-      rmSync(tmpDir, { recursive: true, force: true });
+      // Retried + best-effort: Windows reports EBUSY on rmdir for a short
+      // window after the child server exits (same class as the cli-e2e
+      // temp-project teardown flake). A leaked CI temp dir is harmless.
+      try {
+        rmSync(tmpDir, { recursive: true, force: true, maxRetries: 10, retryDelay: 100 });
+      } catch {
+        /* best-effort cleanup */
+      }
     },
   };
 }

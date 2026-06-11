@@ -41,7 +41,18 @@ export function createTempProject(): TempProject {
 
   return {
     dir,
-    cleanup: () => rmSync(dir, { recursive: true, force: true }),
+    // Windows can report EBUSY on rmdir for a short window after a spawned
+    // CLI child exits (handle release lags the process — broke a main CI run
+    // after all 42 tests PASSED). `maxRetries`/`retryDelay` make rmSync retry
+    // EBUSY/EPERM/ENOTEMPTY; the try/catch is the last resort — a leaked temp
+    // dir on a CI runner is harmless, a failed suite over teardown is not.
+    cleanup: () => {
+      try {
+        rmSync(dir, { recursive: true, force: true, maxRetries: 10, retryDelay: 100 });
+      } catch {
+        /* best-effort cleanup */
+      }
+    },
   };
 }
 
