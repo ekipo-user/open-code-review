@@ -220,7 +220,12 @@ jobs:
           corepack enable
           corepack prepare pnpm@11.5.3 --activate
           pnpm --version | grep -q '^11\.' || { echo "expected pnpm 11 for OIDC publish, got $(pnpm --version)" >&2; exit 1; }
-          pnpm nx release publish --tag "${{ needs.setup.outputs.dist-tag }}"
+          # Invoke nx DIRECTLY, not via `pnpm nx`: running through pnpm 11
+          # triggers its deps-status verification + auto-install against this
+          # pnpm-9 workspace (which hard-errors on ignored build scripts)
+          # before nx even starts. pnpm 11 only needs to be on PATH so the
+          # `pnpm publish` child that nx spawns is the OIDC-capable client.
+          ./node_modules/.bin/nx release publish --tag "${{ needs.setup.outputs.dist-tag }}"
       - name: Registry drift guard
         shell: bash
         run: |
