@@ -1,3 +1,16 @@
+## 2.2.1 (2026-06-11)
+
+### 🩹 Fixes
+
+- **dashboard:** disclose bundled model-list fallback and keep free-text entry reachable ([#39](https://github.com/spencermarx/open-code-review/issues/39))
+- **models:** rebuild vendor model enumeration as a single-source strategy table ([#39](https://github.com/spencermarx/open-code-review/issues/39))
+- **models:** address review round 1 — route hardening, guards, cache split, picker defaults ([6cb4d88](https://github.com/spencermarx/open-code-review/commit/6cb4d88))
+
+### ❤️ Thank You
+
+- claude-flow @agentic-org
+- Spencer Marx
+
 ## 2.2.0 (2026-06-11)
 
 ### 🚀 Features
