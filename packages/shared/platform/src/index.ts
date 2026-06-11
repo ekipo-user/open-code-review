@@ -106,15 +106,17 @@ export function isProcessAlive(pid: number): boolean {
 }
 
 /**
- * Enumerate all descendant PIDs of `rootPid` (children, grandchildren, …).
- *
- * On POSIX, builds the full ppid→children map from one `ps -A` call and BFSs
- * from the root — this catches descendants that `setsid()`'d into their own
- * process group (which `kill(-pgid)` would miss). Returns [] on Windows (use
- * `reapTree`, which shells out to `taskkill /T`) or if `ps` is unavailable.
+ * One descendant walk: the BFS result plus whether the enumerator (`ps`)
+ * actually ran. Derived from the SAME invocation — not a second probe — so
+ * the availability bit can never disagree with the walk it describes
+ * (round-2 S5: the previous separate probe was TOCTOU-prone and doubled the
+ * process spawns per reap).
  */
-export function descendantPids(rootPid: number): number[] {
-  if (isWindows) return [];
+function walkDescendants(rootPid: number): {
+  pids: number[];
+  psAvailable: boolean;
+} {
+  if (isWindows) return { pids: [], psAvailable: false };
   let out: string;
   try {
     out = execFileSync("ps", ["-A", "-o", "pid=,ppid="], {
@@ -122,7 +124,7 @@ export function descendantPids(rootPid: number): number[] {
       timeout: 5000,
     }) as string;
   } catch {
-    return [];
+    return { pids: [], psAvailable: false };
   }
   const children = new Map<number, number[]>();
   for (const line of out.split("\n")) {
@@ -145,7 +147,19 @@ export function descendantPids(rootPid: number): number[] {
       queue.push(c);
     }
   }
-  return acc;
+  return { pids: acc, psAvailable: true };
+}
+
+/**
+ * Enumerate all descendant PIDs of `rootPid` (children, grandchildren, …).
+ *
+ * On POSIX, builds the full ppid→children map from one `ps -A` call and BFSs
+ * from the root — this catches descendants that `setsid()`'d into their own
+ * process group (which `kill(-pgid)` would miss). Returns [] on Windows (use
+ * `reapTree`, which shells out to `taskkill /T`) or if `ps` is unavailable.
+ */
+export function descendantPids(rootPid: number): number[] {
+  return walkDescendants(rootPid).pids;
 }
 
 /**
@@ -156,12 +170,13 @@ export function descendantPids(rootPid: number): number[] {
  * exact "a leaked daemon refused to die" signal this primitive exists to catch).
  */
 export type ReapResult = {
-  /** Descendants + root we attempted to SIGTERM (POSIX), or 1 for the Windows
-   *  `taskkill /T` target. Zero only if the tree was already empty. */
+  /** Descendants + root we attempted to SIGTERM (POSIX — always >= 1, the
+   *  root itself), or 1 for the Windows `taskkill /T` target. */
   signaled: number;
-  /** Whether `ps` was available to enumerate descendants (POSIX). When false,
-   *  only the root could be signalled — a setsid()-escaped grandchild may be
-   *  missed, so callers may choose to surface a degraded-reaping warning. */
+  /** Whether `ps` ran for the SIGTERM-phase walk (POSIX) — derived from that
+   *  same walk, not a separate probe, so it cannot disagree with it. When
+   *  false, only the root was signalled and a setsid()-escaped grandchild may
+   *  have been missed; reapTree logs that degradation centrally. */
   psAvailable: boolean;
 };
 
@@ -189,11 +204,16 @@ export function reapTree(rootPid: number, graceMs = 5000): ReapResult {
     }
     return { signaled: 1, psAvailable: false };
   }
-  const descendants = descendantPids(rootPid);
-  // `descendantPids` returns [] both when `ps` is unavailable AND when the root
-  // is genuinely childless. Probe `ps` once to disambiguate so the diagnostic
-  // doesn't falsely claim full coverage on a platform where we can't walk.
-  const psAvailable = psIsAvailable();
+  const { pids: descendants, psAvailable } = walkDescendants(rootPid);
+  if (!psAvailable) {
+    // No production caller branches on the returned bit, so the degradation is
+    // surfaced HERE, once, where it happens: without `ps` only the root can be
+    // signalled and a setsid()-escaped grandchild survives the reap.
+    console.warn(
+      `[reapTree] 'ps' unavailable — signalling only the root (PID ${rootPid}); ` +
+        `escaped descendants cannot be enumerated on this system.`,
+    );
+  }
   const term = [...descendants, rootPid];
   for (const pid of term) {
     try {
@@ -216,28 +236,16 @@ export function reapTree(rootPid: number, graceMs = 5000): ReapResult {
       }
     }
     if (stragglers > 0) {
+      // Counted BEFORE the kill attempt — these survived SIGTERM and are now
+      // being sent SIGKILL (whether each SIGKILL landed is not re-verified).
       console.warn(
         `[reapTree] ${stragglers} process(es) under PID ${rootPid} survived SIGTERM ` +
-          `and were SIGKILL'd after ${graceMs}ms — investigate a leaked daemon.`,
+          `after ${graceMs}ms; sending SIGKILL — investigate a leaked daemon.`,
       );
     }
   }, graceMs).unref();
 
   return { signaled: term.length, psAvailable };
-}
-
-/** Whether the POSIX `ps` binary is invokable (used to disambiguate an empty
- *  descendant list from an unavailable enumerator). Never throws. */
-function psIsAvailable(): boolean {
-  if (isWindows) return false;
-  try {
-    execFileSync("ps", ["-o", "pid=", "-p", String(process.pid)], {
-      timeout: 3000,
-    });
-    return true;
-  } catch {
-    return false;
-  }
 }
 
 // ── Reviewer icons ──
