@@ -817,6 +817,7 @@ function AdvancedModelSection({
           value={sharedModel ?? ""}
           options={modelOptions}
           freeText={freeText}
+          allowCustom
           ariaLabel={`Model for ${personaName}`}
           onChange={(v) => onUniformChange(v || null)}
         />
@@ -831,6 +832,7 @@ function AdvancedModelSection({
                 value={models[i] ?? ""}
                 options={modelOptions}
                 freeText={freeText}
+                allowCustom
                 ariaLabel={`Model for ${personaName}-${i + 1}`}
                 onChange={(v) => onInstanceChange(i, v || null)}
               />

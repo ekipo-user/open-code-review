@@ -1,8 +1,6 @@
 import { describe, it, expect } from 'vitest'
 import { isModelVendor } from '@open-code-review/cli/models'
-import { ClaudeCodeAdapter } from '../claude-adapter.js'
-import { OpenCodeAdapter } from '../opencode-adapter.js'
-import type { AiCliAdapter } from '../types.js'
+import { createRegisteredAdapters } from '../index.js'
 
 /**
  * Every registered runtime adapter MUST have a model-listing strategy in the
@@ -11,11 +9,13 @@ import type { AiCliAdapter } from '../types.js'
  * longer carry their own `listModels()` (issue #39: the duplicated dead path
  * drifted into a permanently-failing probe), so a new vendor adapter fails
  * here until its strategy-table entry exists.
+ *
+ * The adapter list comes from `createRegisteredAdapters()` — the same
+ * registry `AiCliService` boots with — so this test cannot drift from what
+ * the service actually registers.
  */
-const ADAPTERS: AiCliAdapter[] = [new ClaudeCodeAdapter(), new OpenCodeAdapter()]
-
 describe('adapter ↔ model-strategy-table agreement', () => {
-  for (const adapter of ADAPTERS) {
+  for (const adapter of createRegisteredAdapters()) {
     it(`${adapter.binary} has a model-listing strategy`, () => {
       expect(isModelVendor(adapter.binary)).toBe(true)
     })

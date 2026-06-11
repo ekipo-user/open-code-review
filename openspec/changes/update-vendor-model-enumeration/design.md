@@ -113,9 +113,10 @@ passes an explicit vendor (`activeCli`) — `auto` is only a fallback.
 
 ### 8. E2E stub design (cross-platform, argv-strict)
 
-Stub = one generated `*-stub.mjs` holding all logic (runtime artifact written
-to a temp dir, not project source), fronted by a `#!/bin/sh` wrapper (POSIX)
-and a one-line `.cmd` shim (`@node "%~dp0…" %*`, Windows). Both shims are
+Stub = one generated `*-stub.cjs` holding all logic (runtime artifact written
+to a temp dir, not project source — CommonJS so the tripwire's `require` works
+without ESM ceremony), fronted by a `#!/bin/sh` wrapper (POSIX) and a one-line
+`.cmd` shim (`@node "%~dp0…" %*`, Windows). Both shims are
 written on every OS so the Windows branch cannot rot unseen (PR CI is
 ubuntu-only; the OS matrix runs on push to main). Strict argv dispatch:
 `--version` → version, `models` → configured output, anything else → stderr +

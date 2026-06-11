@@ -72,6 +72,19 @@ describe("parseOpenCodeModelList", () => {
     expect(parseOpenCodeModelList("")).toBeNull();
     expect(parseOpenCodeModelList("error: kaboom\nplain text")).toBeNull();
   });
+
+  it("keeps multi-slash ids (openrouter-style) — slash count is not constrained", () => {
+    const parsed = parseOpenCodeModelList("openrouter/meta-llama/llama-3\n");
+    expect(parsed).toEqual([
+      { id: "openrouter/meta-llama/llama-3", provider: "openrouter" },
+    ]);
+  });
+
+  it("rejects URL-shaped noise (colon in the provider segment)", () => {
+    expect(
+      parseOpenCodeModelList("https://opencode.ai/docs\nhttp://x/y\n"),
+    ).toBeNull();
+  });
 });
 
 describe("listModelsForVendor — opencode (native probe)", () => {
@@ -137,6 +150,45 @@ describe("listModelsForVendor — opencode (native probe)", () => {
     clearModelListCache();
     await listModelsForVendor("opencode");
     expect(execMock).toHaveBeenCalledTimes(2);
+  });
+
+  it("caches successes for 60s and expires them after", async () => {
+    vi.useFakeTimers();
+    try {
+      resolveWith("anthropic/claude-sonnet-4-6\n");
+      await listModelsForVendor("opencode");
+      vi.advanceTimersByTime(59_000);
+      await listModelsForVendor("opencode");
+      expect(execMock).toHaveBeenCalledTimes(1);
+      vi.advanceTimersByTime(2_000);
+      await listModelsForVendor("opencode");
+      expect(execMock).toHaveBeenCalledTimes(2);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("caches failures for only 10s so a just-installed CLI shows up quickly", async () => {
+    vi.useFakeTimers();
+    try {
+      execMock.mockRejectedValue(
+        Object.assign(new Error("ENOENT"), { code: "ENOENT" }),
+      );
+      const failed = await listModelsForVendor("opencode");
+      expect(failed.source).toBe("bundled");
+      vi.advanceTimersByTime(9_000);
+      await listModelsForVendor("opencode");
+      expect(execMock).toHaveBeenCalledTimes(1);
+
+      // CLI gets "installed" — past the failure TTL the probe re-runs.
+      vi.advanceTimersByTime(2_000);
+      resolveWith("opencode/big-pickle\n");
+      const recovered = await listModelsForVendor("opencode");
+      expect(execMock).toHaveBeenCalledTimes(2);
+      expect(recovered.source).toBe("native");
+    } finally {
+      vi.useRealTimers();
+    }
   });
 });
 
@@ -219,5 +271,11 @@ describe("vendor registry", () => {
     expect(isModelVendor("claude")).toBe(true);
     expect(isModelVendor("opencode")).toBe(true);
     expect(isModelVendor("codex")).toBe(false);
+  });
+
+  it("rejects prototype-chain keys (own-keys guard, not `in`)", () => {
+    expect(isModelVendor("constructor")).toBe(false);
+    expect(isModelVendor("__proto__")).toBe(false);
+    expect(isModelVendor("toString")).toBe(false);
   });
 });

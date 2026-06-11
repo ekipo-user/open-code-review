@@ -392,6 +392,7 @@ function PersonaRow({
               value={sharedModel ?? ''}
               options={modelOptions}
               freeText={modelListEmpty}
+              allowCustom
               onChange={(value) => onUniformModelChange(value || null)}
               className="max-w-md"
               ariaLabel={`Model for ${group.persona}`}
@@ -409,6 +410,7 @@ function PersonaRow({
                   value={inst.model ?? ''}
                   options={modelOptions}
                   freeText={modelListEmpty}
+                  allowCustom
                   onChange={(value) =>
                     onInstanceModelChange(inst.instance_index, value || null)
                   }

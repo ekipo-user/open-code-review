@@ -49,7 +49,7 @@
 ## 4. E2E regression coverage
 
 - [ ] 4.1 `packages/cli-e2e/src/helpers/vendor-stubs.ts`: argv-strict stub
-      generator (`.mjs` core + sh wrapper + `.cmd` shim, written on all
+      generator (`.cjs` core + sh wrapper + `.cmd` shim, written on all
       OSes), behaviors: native (LF/CRLF), garbage, exit-127, tripwire;
       case-insensitive PATH-key env merge
 - [ ] 4.2 cli-e2e: per-strategy cases — opencode native success (exact ids,

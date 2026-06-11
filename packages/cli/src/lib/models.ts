@@ -64,7 +64,10 @@ export function parseOpenCodeModelList(
   const models: ModelDescriptor[] = [];
   for (const rawLine of stdout.split(/\r?\n/)) {
     const line = rawLine.trim();
-    if (!/^\S+\/\S+$/.test(line)) continue;
+    // Provider segment may not contain ":" — that rejects URL-shaped noise
+    // (`https://…`) without constraining slash count, because legitimate ids
+    // can carry more than one slash (e.g. `openrouter/meta-llama/llama-3`).
+    if (!/^[^\s:]+\/\S+$/.test(line)) continue;
     const provider = line.slice(0, line.indexOf("/"));
     models.push({ id: line, provider });
   }
@@ -117,7 +120,10 @@ export const SUPPORTED_VENDORS = Object.keys(
 ) as ModelVendor[];
 
 export function isModelVendor(value: string): value is ModelVendor {
-  return value in VENDOR_MODEL_STRATEGIES;
+  // Own-keys only: `in` would also accept prototype-chain keys like
+  // "constructor", which then explode downstream as a TypeError (500)
+  // instead of failing validation (400).
+  return Object.hasOwn(VENDOR_MODEL_STRATEGIES, value);
 }
 
 /**
@@ -170,10 +176,16 @@ function describeProbeFailure(
     return `\`${vendor}\` is not installed or not on PATH`;
   }
   if (e.killed) {
-    return `\`${command}\` timed out`;
+    return `\`${command}\` timed out or exceeded output limits`;
   }
+  // First stderr line, ANSI/control characters stripped, capped at 200
+  // chars: the reason string travels into JSON payloads and the dashboard UI.
   const stderr = typeof e.stderr === "string" ? e.stderr.trim() : "";
-  const detail = stderr ? `: ${stderr.split(/\r?\n/)[0]?.slice(0, 200)}` : "";
+  const firstLine = (stderr.split(/\r?\n/)[0] ?? "")
+    .replace(/\u001b\[[0-9;]*[A-Za-z]/g, "")
+    .replace(/[\u0000-\u001f\u007f]/g, "")
+    .slice(0, 200);
+  const detail = firstLine ? `: ${firstLine}` : "";
   const exit = typeof e.code === "number" ? ` with exit code ${e.code}` : "";
   return `\`${command}\` failed${exit}${detail}`;
 }
@@ -207,7 +219,13 @@ async function tryNativeEnumeration(
 // The dashboard server calls `listModelsForVendor` on a request path; a
 // short TTL cache bounds child-process spawns for long-lived consumers.
 // One-shot CLI invocations are unaffected (fresh process each run).
-const CACHE_TTL_MS = 60_000;
+// Failures get a much shorter TTL so a CLI installed (or fixed) while the
+// dashboard is running shows up within seconds rather than masking itself
+// behind a stale failure. Note this cache covers enumeration only —
+// `detectActiveVendor` (the route's `vendor=auto` path) probes fresh each
+// call.
+const SUCCESS_TTL_MS = 60_000;
+const FAILURE_TTL_MS = 10_000;
 const cache = new Map<ModelVendor, { result: ModelListResult; expiresAt: number }>();
 
 /** Test seam: drop cached enumeration results. */
@@ -255,6 +273,7 @@ export async function listModelsForVendor(
         };
   }
 
-  cache.set(vendor, { result, expiresAt: Date.now() + CACHE_TTL_MS });
+  const ttl = result.source === "native" ? SUCCESS_TTL_MS : FAILURE_TTL_MS;
+  cache.set(vendor, { result, expiresAt: Date.now() + ttl });
   return result;
 }

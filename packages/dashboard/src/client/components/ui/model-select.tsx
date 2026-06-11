@@ -33,8 +33,10 @@ type ModelSelectProps = {
   className?: string
   /**
    * Offer a "Custom…" entry that switches the picker to free-text input.
-   * On by default: listed models are advisory — any id the vendor CLI
-   * accepts is valid, and the list may be a bundled fallback (issue #39).
+   * Opt-in: enable it on MODEL pickers (listed models are advisory — any id
+   * the vendor CLI accepts is valid, issue #39's escape hatch), and leave it
+   * off for non-model uses of this component (e.g. the Add-reviewer picker),
+   * where free-text input is meaningless.
    */
   allowCustom?: boolean
   /**
@@ -70,7 +72,7 @@ export function ModelSelect({
   freeTextPlaceholder = 'Type model id…',
   disabled = false,
   className,
-  allowCustom = true,
+  allowCustom = false,
   ariaLabel,
   defaultOpen = false,
   onOpenChange,
@@ -202,6 +204,13 @@ export function ModelSelect({
           placeholder={freeTextPlaceholder}
           disabled={disabled}
           onChange={(e) => onChange(e.target.value)}
+          onKeyDown={(e) => {
+            // Keyboard path back to the list (mirrors the back button).
+            if (e.key === 'Escape' && customMode) {
+              e.preventDefault()
+              setCustomMode(false)
+            }
+          }}
           aria-label={ariaLabel}
           className={cn(
             'w-full min-w-0 flex-1 rounded-md border bg-white px-2.5 py-1.5 font-mono text-xs',

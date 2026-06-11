@@ -144,6 +144,26 @@ describe("GET /api/team/models", () => {
     expect(res.status).toBe(400);
   });
 
+  it("rejects an array-form vendor query with 400 instead of hanging", async () => {
+    const stubs = trackedStubs(
+      createVendorStubs({ opencode: { kind: "native", ids: ["a/b"] } }),
+    );
+    const server = trackedServer(await startTestServer({ env: stubs.env }));
+
+    // Express parses ?vendor=a&vendor=b as an array. Before the fix this
+    // threw outside the async handler's try → swallowed unhandled rejection
+    // and a request that never answers. AbortSignal.timeout turns a hung
+    // response into a deterministic test failure instead of a suite stall.
+    const res = await fetch(
+      `${server.baseUrl}/api/team/models?vendor=opencode&vendor=claude`,
+      {
+        headers: { Authorization: `Bearer ${server.token}` },
+        signal: AbortSignal.timeout(5000),
+      },
+    );
+    expect(res.status).toBe(400);
+  });
+
   it("returns the null envelope when no vendor is installed", async () => {
     const stubs = trackedStubs(
       createVendorStubs({

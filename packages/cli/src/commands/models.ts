@@ -29,7 +29,9 @@ const listSubcommand = new Command("list")
   .action(async (options: { vendor?: string; json?: boolean }) => {
     let vendor: ModelVendor | null;
     if (options.vendor) {
-      if (!isModelVendor(options.vendor)) {
+      // Case-insensitive, matching the dashboard route's behavior.
+      const requested = options.vendor.toLowerCase();
+      if (!isModelVendor(requested)) {
         console.error(
           chalk.red(
             `Invalid --vendor: "${options.vendor}". Must be one of: ${vendorList}.`,
@@ -37,7 +39,7 @@ const listSubcommand = new Command("list")
         );
         process.exit(1);
       }
-      vendor = options.vendor;
+      vendor = requested;
     } else {
       vendor = await detectActiveVendor();
       if (!vendor) {

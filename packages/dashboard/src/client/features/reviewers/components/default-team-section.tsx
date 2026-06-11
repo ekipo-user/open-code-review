@@ -813,6 +813,7 @@ function EditTeamReviewerDialog({
                   value={sharedModel ?? ''}
                   options={modelOptions}
                   freeText={modelListEmpty}
+                  allowCustom
                   ariaLabel="Model"
                   onChange={(value) => onUniformModelChange(value || null)}
                 />
@@ -829,6 +830,7 @@ function EditTeamReviewerDialog({
                       value={inst.model ?? ''}
                       options={modelOptions}
                       freeText={modelListEmpty}
+                      allowCustom
                       ariaLabel={`Model for ${inst.name}`}
                       onChange={(value) =>
                         onInstanceModelChange(inst.instance_index, value || null)
