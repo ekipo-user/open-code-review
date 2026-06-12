@@ -6,7 +6,7 @@
  */
 
 import { mkdirSync, writeFileSync, unlinkSync, openSync, closeSync } from 'node:fs'
-import type { StdioOptions } from 'node:child_process'
+import type { ChildProcess, StdioOptions } from 'node:child_process'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { randomUUID } from 'node:crypto'
@@ -17,21 +17,48 @@ import { randomUUID } from 'node:crypto'
  * Build the `stdio` triple for a workflow spawn. When `logFile` is set, stdout
  * AND stderr are redirected to that FILE (the file-stdio wedge fix — a leaked
  * grandchild inheriting fd 1/2 holds no pipe whose EOF the dashboard waits on);
- * the caller tails it. Otherwise both are pipes. `stdin` differs per vendor
- * (Claude pipes the prompt; OpenCode passes it as argv), so it is a parameter.
+ * the caller tails it. Otherwise both are pipes. stdin is always a pipe: BOTH
+ * vendors receive the prompt on stdin via {@link deliverPrompt} — the prompt
+ * must never appear in argv (issue #43: injection surface under the old
+ * Windows shell:true spawning, cmd.exe's ~8191-char command-line limit, and
+ * prompt visibility in process listings).
  *
  * Returns the open `logFd` (the caller MUST `closeFileStdio` it after spawn —
  * the child has dup'd it) and `logPath` for the SpawnResult.
  */
 export function buildFileStdio(
-  stdin: 'pipe' | 'ignore',
   logFile: string | undefined,
 ): { stdio: StdioOptions; logFd: number | null; logPath: string | undefined } {
   if (!logFile) {
-    return { stdio: [stdin, 'pipe', 'pipe'], logFd: null, logPath: undefined }
+    return { stdio: ['pipe', 'pipe', 'pipe'], logFd: null, logPath: undefined }
   }
   const logFd = openSync(logFile, 'a')
-  return { stdio: [stdin, logFd, logFd], logFd, logPath: logFile }
+  return { stdio: ['pipe', logFd, logFd], logFd, logPath: logFile }
+}
+
+/**
+ * Deliver the prompt to a freshly spawned vendor child over stdin.
+ *
+ * An `error` handler is attached BEFORE writing: if the child dies before
+ * draining stdin (binary errors at startup, AV kill, …), Node emits EPIPE on
+ * the stream — unhandled, that throws out of the write and can crash the
+ * dashboard server. The error is swallowed by design: a dead child is
+ * detected and reported by the existing close/result/watchdog machinery,
+ * not by the prompt writer.
+ *
+ * Rejects empty prompts loudly — OpenCode errors on an empty message, and a
+ * missing prompt is a caller bug better caught at spawn time than
+ * mid-workflow.
+ */
+export function deliverPrompt(proc: ChildProcess, prompt: string): void {
+  if (prompt.length === 0) {
+    throw new Error('deliverPrompt: refusing to spawn with an empty prompt')
+  }
+  proc.stdin?.on('error', () => {
+    /* EPIPE etc. — the close/watchdog path owns failure reporting */
+  })
+  proc.stdin?.write(prompt)
+  proc.stdin?.end()
 }
 
 /** Close the parent's copy of the log fd after spawn (best-effort). */

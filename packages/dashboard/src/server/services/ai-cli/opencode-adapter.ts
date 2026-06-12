@@ -3,11 +3,10 @@
  *
  * Implements the AiCliAdapter interface for the OpenCode coding agent.
  *
- * Invocation: `opencode run "prompt" --format json --agent build`
+ * Invocation: `opencode run --format json --agent build` with the prompt on stdin
  * Output:     NDJSON with event types: text, tool_use, reasoning, step_start, step_finish, error
  *
  * Key differences from Claude Code:
- * - Prompt passed as CLI argument (no stdin pipe needed)
  * - `--format json` for NDJSON output (different event schema from Claude)
  * - Agent-based tool control (`--agent build` for full tools, `--agent plan` for read-only)
  * - Session resume via `--session <id> --continue` (not `--resume`)
@@ -16,7 +15,7 @@
  */
 
 import { execBinary, spawnBinary } from '@open-code-review/platform'
-import { buildFileStdio, closeFileStdio } from './helpers.js'
+import { buildFileStdio, closeFileStdio, deliverPrompt } from './helpers.js'
 import type {
   AiCliAdapter,
   DetectionResult,
@@ -83,9 +82,14 @@ export class OpenCodeAdapter implements AiCliAdapter {
       ? undefined // caller specified tools — skip agent flag and let OpenCode defaults apply
       : isWorkflow ? 'build' : 'plan'
 
+    // The prompt is NOT an argv element — it is delivered on stdin below
+    // (issue #43): argv embedded user input + review content in process
+    // listings, was an injection surface under the old Windows shell:true
+    // spawning, and hit cmd.exe's ~8191-char command-line limit on large
+    // workflow prompts. `opencode run` reads the message from stdin when
+    // no positional is given (verified, including with --session/--continue).
     const args: string[] = [
       'run',
-      opts.prompt,
       '--format', 'json',
     ]
 
@@ -122,15 +126,13 @@ export class OpenCodeAdapter implements AiCliAdapter {
 
     // File-stdio (root-cause wedge fix — see claude-adapter): in workflow mode
     // with a per-execution log file, stdout+stderr go to the FILE so a leaked
-    // grandchild can't hold a pipe whose EOF blocks `proc.on('close')`. stdin is
-    // 'ignore' (the prompt is a positional arg). Shared helper, same as Claude.
+    // grandchild can't hold a pipe whose EOF blocks `proc.on('close')`. stdin
+    // is a pipe carrying the prompt. Shared helper, same as Claude.
     const { stdio, logFd, logPath } = buildFileStdio(
-      'ignore',
       isWorkflow ? opts.logFile : undefined,
     )
 
     // OpenCode does not support --max-turns; agents run to completion.
-    // stdin is not needed — the prompt is passed as a positional argument.
     // Merge caller-supplied env vars (e.g. OCR_DASHBOARD_EXECUTION_UID for
     // the late-linking workflow_id flow) on top of the cleaned baseline so
     // child `ocr` invocations inherit the dashboard's execution context.
@@ -148,6 +150,10 @@ export class OpenCodeAdapter implements AiCliAdapter {
     // never hold the dashboard's event loop open; the command-runner reaps the
     // tree and finalizes via the `result` event + watchdog.
     if (isWorkflow) proc.unref()
+
+    // Prompt over stdin via the shared helper (EPIPE-guarded) — mirrors the
+    // Claude adapter byte for byte.
+    deliverPrompt(proc, opts.prompt)
 
     return {
       process: proc,

@@ -18,7 +18,7 @@ import type {
   SpawnOptions,
   SpawnResult,
 } from './types.js'
-import { extractAssistantText, buildFileStdio, closeFileStdio } from './helpers.js'
+import { extractAssistantText, buildFileStdio, closeFileStdio, deliverPrompt } from './helpers.js'
 import { cleanEnv } from '../../socket/env.js'
 import {
   buildResumeArgs as buildResumeArgsShared,
@@ -105,7 +105,6 @@ export class ClaudeCodeAdapter implements AiCliAdapter {
     // on — `proc.on('close')` fires on the direct child's exit. stdin stays a
     // pipe to deliver the prompt. Shared helper keeps both adapters in lockstep.
     const { stdio, logFd, logPath } = buildFileStdio(
-      'pipe',
       isWorkflow ? opts.logFile : undefined,
     )
 
@@ -129,9 +128,10 @@ export class ClaudeCodeAdapter implements AiCliAdapter {
     // `result` event + watchdog, not by the parent waiting on the child handle.
     if (isWorkflow) proc.unref()
 
-    // Write prompt to stdin
-    proc.stdin?.write(opts.prompt)
-    proc.stdin?.end()
+    // Prompt over stdin via the shared helper — its stdin error guard is
+    // load-bearing: a bare write here was an unhandled-EPIPE crash vector
+    // if the child died before draining (issue #43 review).
+    deliverPrompt(proc, opts.prompt)
 
     return {
       process: proc,
