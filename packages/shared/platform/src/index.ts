@@ -8,18 +8,9 @@
  */
 
 import { pathToFileURL } from "node:url";
-import {
-  execFile,
-  execFileSync,
-  spawn,
-  type ExecFileOptions,
-  type SpawnOptions,
-  type ExecFileSyncOptions,
-  type ChildProcess,
-} from "node:child_process";
-import { promisify } from "node:util";
+import { execFileSync } from "node:child_process";
 
-const execFilePromise = promisify(execFile);
+export { execBinary, execBinaryAsync, spawnBinary } from "./spawn.js";
 
 const isWindows = process.platform === "win32";
 
@@ -34,59 +25,6 @@ export async function importModule<T = Record<string, unknown>>(
   absolutePath: string,
 ): Promise<T> {
   return import(pathToFileURL(absolutePath).href) as Promise<T>;
-}
-
-/**
- * Execute a binary synchronously with cross-platform .cmd/.bat support.
- *
- * On Windows, npm-installed binaries are `.cmd` shims that require a shell
- * to execute. On POSIX, `shell: false` is used to avoid unnecessary shell
- * injection surface.
- */
-export function execBinary(
-  binary: string,
-  args: string[],
-  opts: ExecFileSyncOptions & { encoding: BufferEncoding },
-): string {
-  return execFileSync(binary, args, {
-    ...opts,
-    shell: isWindows,
-  }) as string;
-}
-
-/**
- * Execute a binary asynchronously with cross-platform .cmd/.bat support.
- *
- * Async counterpart of `execBinary`. On Windows, npm-installed binaries are
- * `.cmd` shims that require a shell to execute.
- */
-export async function execBinaryAsync(
-  binary: string,
-  args: string[],
-  opts: ExecFileOptions & { encoding: BufferEncoding },
-): Promise<{ stdout: string; stderr: string }> {
-  return execFilePromise(binary, args, {
-    ...opts,
-    shell: isWindows,
-  }) as Promise<{ stdout: string; stderr: string }>;
-}
-
-/**
- * Spawn a child process with cross-platform .cmd/.bat support.
- *
- * On Windows, sets `shell: true` for .cmd shim resolution and
- * `windowsHide: true` to prevent a console window from flashing
- * (important when combined with `detached: true`).
- */
-export function spawnBinary(
-  binary: string,
-  args: string[],
-  opts?: SpawnOptions,
-): ChildProcess {
-  return spawn(binary, args, {
-    ...opts,
-    ...(isWindows && { shell: true, windowsHide: true }),
-  });
 }
 
 // ── Process-tree reaping ──
