@@ -129,9 +129,9 @@ export function createVendorStubs(
       "utf-8",
     );
     chmodSync(resolve(dir, binary), 0o755);
-    // Windows shim — cmd.exe resolves it via PATH + PATHEXT under the
-    // `shell: true` that execBinary uses on win32. `%~dp0` is quoted so
-    // temp paths with spaces are safe.
+    // Windows shim — resolved via PATH + PATHEXT by cross-spawn inside the
+    // platform wrappers (no shell involved). `%~dp0` is quoted so temp
+    // paths with spaces are safe.
     writeFileSync(
       resolve(dir, `${binary}.cmd`),
       `@node "%~dp0${scriptName}" %*\r\n`,

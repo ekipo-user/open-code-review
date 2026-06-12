@@ -293,3 +293,137 @@ describe("process-tree reaping", () => {
     expect(await eventually(() => !isProcessAlive(grandchildPid), 4000)).toBe(true);
   });
 });
+
+describe("spawn wrapper contracts", () => {
+  // Pinned against the REAL implementation (not consumer-side mocks): the
+  // CLI's describeProbeFailure and its hermetic tests assume this exact
+  // failure shape, and these contracts are what make the cross-spawn
+  // internals swappable. Fixtures use process.execPath — PATH-proof and
+  // metacharacter-free on every OS.
+  const node = process.execPath;
+
+  it("execBinary returns stdout on success", () => {
+    const out = execBinary(node, ["-e", "process.stdout.write('out')"], {
+      encoding: "utf-8",
+    });
+    expect(out).toBe("out");
+  });
+
+  it("execBinary passes argv VERBATIM — shell metacharacters are data, not syntax", () => {
+    // THE issue-#43 regression pin. Under the old `shell: true` Windows
+    // path this argument would have been interpreted by cmd.exe.
+    const hostile = 'sonnet & calc.exe | echo "%PATH%" > x';
+    const out = execBinary(
+      node,
+      ["-e", "process.stdout.write(process.argv[1])", hostile],
+      { encoding: "utf-8" },
+    );
+    expect(out).toBe(hostile);
+  });
+
+  it("execBinary passes stdin input through", () => {
+    const out = execBinary(node, ["-e", "process.stdin.pipe(process.stdout)"], {
+      encoding: "utf-8",
+      input: "hello",
+    });
+    expect(out).toBe("hello");
+  });
+
+  it("execBinary throws on non-zero exit with the exit code attached", () => {
+    let caught: unknown;
+    try {
+      execBinary(node, ["-e", "console.error('boom'); process.exit(3)"], {
+        encoding: "utf-8",
+        stdio: ["ignore", "pipe", "pipe"],
+      });
+    } catch (err) {
+      caught = err;
+    }
+    expect(caught).toBeInstanceOf(Error);
+    const e = caught as Error & { status?: number; code?: number; stderr?: string };
+    expect(e.status).toBe(3);
+    expect(e.code).toBe(3);
+    expect(String(e.stderr)).toContain("boom");
+  });
+
+  it("execBinary throws ENOENT for a missing binary", () => {
+    let caught: unknown;
+    try {
+      execBinary("definitely-not-a-real-binary-xyz", ["--version"], {
+        encoding: "utf-8",
+        timeout: 5000,
+      });
+    } catch (err) {
+      caught = err;
+    }
+    expect(caught).toBeInstanceOf(Error);
+    expect((caught as { code?: unknown }).code).toBe("ENOENT");
+  });
+
+  it("execBinaryAsync resolves stdout and stderr", async () => {
+    const { stdout, stderr } = await execBinaryAsync(
+      node,
+      ["-e", "console.log('o'); console.error('e')"],
+      { encoding: "utf-8" },
+    );
+    expect(stdout.trim()).toBe("o");
+    expect(stderr.trim()).toBe("e");
+  });
+
+  it("execBinaryAsync rejects non-zero exit with { code, stderr, killed: false }", async () => {
+    let caught: unknown;
+    try {
+      await execBinaryAsync(node, ["-e", "console.error('nope'); process.exit(2)"], {
+        encoding: "utf-8",
+      });
+    } catch (err) {
+      caught = err;
+    }
+    const e = caught as Error & { code?: unknown; stderr?: string; killed?: boolean };
+    expect(e).toBeInstanceOf(Error);
+    expect(e.code).toBe(2);
+    expect(String(e.stderr)).toContain("nope");
+    expect(e.killed).toBe(false);
+  });
+
+  it("execBinaryAsync rejects ENOENT for a missing binary", async () => {
+    let caught: unknown;
+    try {
+      await execBinaryAsync("definitely-not-a-real-binary-xyz", ["--version"], {
+        encoding: "utf-8",
+        timeout: 5000,
+      });
+    } catch (err) {
+      caught = err;
+    }
+    expect((caught as { code?: unknown }).code).toBe("ENOENT");
+  });
+
+  it("execBinaryAsync kills on timeout and reports killed: true", async () => {
+    let caught: unknown;
+    try {
+      await execBinaryAsync(node, ["-e", "setInterval(() => {}, 1 << 30)"], {
+        encoding: "utf-8",
+        timeout: 300,
+      });
+    } catch (err) {
+      caught = err;
+    }
+    expect((caught as { killed?: boolean }).killed).toBe(true);
+  });
+
+  it("execBinaryAsync kills on maxBuffer overflow and reports killed: true", async () => {
+    let caught: unknown;
+    try {
+      // Default maxBuffer is 1 MiB (execFile's historical default) — write 2 MiB.
+      await execBinaryAsync(
+        node,
+        ["-e", "process.stdout.write('x'.repeat(2 * 1024 * 1024))"],
+        { encoding: "utf-8", timeout: 10_000 },
+      );
+    } catch (err) {
+      caught = err;
+    }
+    expect((caught as { killed?: boolean }).killed).toBe(true);
+  });
+});
