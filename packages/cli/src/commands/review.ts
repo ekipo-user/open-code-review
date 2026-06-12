@@ -14,7 +14,7 @@
 
 import { Command } from "commander";
 import chalk from "chalk";
-import { spawn } from "node:child_process";
+import { spawnBinary } from "@open-code-review/platform";
 import { join } from "node:path";
 import { requireOcrSetup } from "../lib/guards.js";
 import {
@@ -90,8 +90,12 @@ export const reviewCommand = new Command("review")
     );
 
     // Hand control to the vendor CLI with stdio inherited so the user
-    // interacts with it directly. We exit when it exits.
-    const child = spawn(binary, args, {
+    // interacts with it directly. We exit when it exits. spawnBinary (not a
+    // raw spawn) is required: the vendor binaries are npm .cmd shims on
+    // Windows, where a shell-less raw spawn ENOENTs — `ocr review --resume`
+    // was broken there until issue #43's sweep (and the session id, while
+    // validated at bind time, stays argv-safe through the platform layer).
+    const child = spawnBinary(binary, args, {
       stdio: "inherit",
       cwd: targetDir,
     });

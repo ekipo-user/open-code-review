@@ -9,7 +9,7 @@
  * - AI workflow commands (map, review): spawned via the AI CLI adapter strategy
  */
 
-import { type ChildProcess } from 'node:child_process'
+import type { ChildProcess } from 'node:child_process'
 import { spawnBinary, reapTree } from '@open-code-review/platform'
 import { readFileSync, writeFileSync, unlinkSync, mkdirSync, existsSync } from 'node:fs'
 import { dirname, join } from 'node:path'

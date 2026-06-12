@@ -9,10 +9,9 @@ import express from 'express'
 import { createServer } from 'node:http'
 import { existsSync, readFileSync, writeFileSync, unlinkSync, mkdirSync } from 'node:fs'
 import { join, dirname, resolve } from 'node:path'
-import { reapTree, isProcessAlive } from '@open-code-review/platform'
+import { reapTree, isProcessAlive, execBinary } from '@open-code-review/platform'
 import { fileURLToPath } from 'node:url'
 import { randomBytes } from 'node:crypto'
-import { execFileSync } from 'node:child_process'
 import { Server as SocketIOServer } from 'socket.io'
 
 import { resolveOcrDir } from './services/ocr-resolver.js'
@@ -180,10 +179,10 @@ function isOcrDashboardProcess(pid: number): boolean {
   if (process.platform === 'win32') return false
   try {
     const cmd = (
-      execFileSync('ps', ['-p', String(pid), '-o', 'command='], {
+      execBinary('ps', ['-p', String(pid), '-o', 'command='], {
         encoding: 'utf-8',
         timeout: 3000,
-      }) as string
+      })
     ).trim()
     // Primary, positive identification: our stamped title at argv[0].
     if (/^ocr-dashboard\b/.test(cmd)) return true
