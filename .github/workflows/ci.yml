@@ -44,6 +44,48 @@ jobs:
       - run: pnpm install --frozen-lockfile
       - run: pnpm nx run-many -t test
 
+  # Unit tests on the non-Linux OSes. This job exists because issue #41
+  # shipped through a green PR: units ran on ubuntu only and the OS matrix
+  # covered e2e only, so three classes of Windows-only unit failures lived
+  # on main undetected. Windows runs on PRs too (that is where #41 should
+  # have been caught); macOS runs on push only (its unit-level divergence
+  # from ubuntu is near nil). Deliberately NOT in `e2e-api`'s `needs` — a
+  # slow Windows leg must not gate e2e start.
+  #
+  # The legs run vitest DIRECTLY per package (after an nx build of their
+  # deps) rather than `nx run-many -t test`: nx demonstrably swallows a
+  # failed task's vitest stdout on Windows — even with
+  # --output-style=stream — which made #41 undiagnosable through the
+  # normal path. Mirrors the `unit-direct` dispatch mode in
+  # cross-platform-test.yml.
+  test-os:
+    name: Unit Tests (${{ matrix.os }})
+    timeout-minutes: 25
+    strategy:
+      fail-fast: false
+      matrix:
+        os: ${{ github.event_name == 'push' && fromJSON('["windows-latest","macos-latest"]') || fromJSON('["windows-latest"]') }}
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: pnpm/action-setup@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: pnpm
+      - run: pnpm install --frozen-lockfile
+      - name: Unit tests (direct vitest per package)
+        shell: bash
+        run: |
+          set -uo pipefail
+          pnpm nx run-many -t build --projects=platform,cli,dashboard
+          rc=0
+          for dir in packages/shared/platform packages/cli packages/dashboard; do
+            echo "===== vitest: $dir ====="
+            (cd "$dir" && pnpm exec vitest run --reporter=verbose) || rc=1
+          done
+          exit $rc
+
   e2e-api:
     name: API E2E (${{ matrix.os }})
     needs: [typecheck, test]
