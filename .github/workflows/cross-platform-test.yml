@@ -21,6 +21,11 @@ on:
         options:
           - all
           - e2e-only
+          # unit-direct bypasses nx and runs vitest per package with output
+          # straight to the job log — nx drops failed-task vitest stdout on
+          # Windows even with --output-style=stream, which made the Windows
+          # unit failures (issue #41) undiagnosable through the normal path.
+          - unit-direct
         default: all
       debug:
         description: "Open SSH debug session after tests"
@@ -47,12 +52,31 @@ jobs:
 
       - run: pnpm install --frozen-lockfile
       - name: Unit tests
-        if: ${{ inputs.targets != 'e2e-only' }}
+        if: ${{ inputs.targets == 'all' }}
         # --output-style=stream so a failing task's vitest output is not
         # swallowed by nx's grouped terminal output (it was, on Windows).
         run: pnpm nx run-many -t test --output-style=stream
-      - run: pnpm nx e2e cli-e2e
-      - run: pnpm nx e2e dashboard-api-e2e
+      - name: Unit tests (direct vitest, no nx)
+        if: ${{ inputs.targets == 'unit-direct' }}
+        shell: bash
+        # Continue past each failure so one run surfaces ALL three packages'
+        # failing assertions. Builds run first via nx (the dashboard suite
+        # imports built deps); only the vitest invocations bypass nx.
+        run: |
+          set -uo pipefail
+          pnpm nx run-many -t build --projects=platform,cli,dashboard
+          rc=0
+          for dir in packages/shared/platform packages/cli packages/dashboard; do
+            echo "===== vitest: $dir ====="
+            (cd "$dir" && pnpm exec vitest run --reporter=verbose) || rc=1
+          done
+          exit $rc
+      - name: cli-e2e
+        if: ${{ inputs.targets != 'unit-direct' }}
+        run: pnpm nx e2e cli-e2e
+      - name: dashboard-api-e2e
+        if: ${{ inputs.targets != 'unit-direct' }}
+        run: pnpm nx e2e dashboard-api-e2e
 
       - name: Install Playwright (Linux only)
         if: ${{ inputs.os == 'ubuntu-latest' }}
