@@ -187,6 +187,44 @@ describe("ocr session bind-vendor-id", () => {
     const rows = JSON.parse(list.stdout);
     expect(rows[0].vendor_session_id).toBe("vendor-abc-123");
   });
+
+  it("rejects an argv-unsafe vendor session id without binding anything", async () => {
+    const project = tracked(createInitializedProject());
+    const workflowId = await initWorkflow(project);
+
+    const startResult = await spawnCli(
+      [
+        "session",
+        "start-instance",
+        "--workflow",
+        workflowId,
+        "--persona",
+        "principal",
+        "--instance",
+        "1",
+        "--vendor",
+        "claude",
+      ],
+      { cwd: project.dir },
+    );
+    const agentId = startResult.stdout.trim();
+
+    // A bound id is sticky and later becomes spawn argv (`--session <id>`)
+    // — issue #43. Metacharacter-bearing ids must be rejected at bind time.
+    const rejected = await spawnCli(
+      ["session", "bind-vendor-id", agentId, "ses_x & calc.exe"],
+      { cwd: project.dir },
+    );
+    expect(rejected.exitCode).not.toBe(0);
+    expect(rejected.stderr).toMatch(/not a plausible vendor session id/);
+
+    // Nothing was bound — the slot remains available for the real id.
+    const realBind = await spawnCli(
+      ["session", "bind-vendor-id", agentId, "ses_real-123"],
+      { cwd: project.dir },
+    );
+    expect(realBind.exitCode).toBe(0);
+  });
 });
 
 describe("ocr session end-instance", () => {

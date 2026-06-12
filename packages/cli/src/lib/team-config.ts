@@ -103,6 +103,9 @@ export function parseTeamConfigYaml(content: string): ParsedTeamConfig {
         aliases,
         defaultModel,
       );
+      if (resolvedModel !== null) {
+        assertSafeModelId(resolvedModel, `default_team.${persona}[${i}]`);
+      }
       team.push({
         persona,
         instance_index: i + 1,
@@ -214,6 +217,47 @@ function readOptionalString(
   return value;
 }
 
+// ── Model-id argv safety (issue #43, defense in depth) ──
+
+/**
+ * The vendor-id syntax class: every known vendor model-id shape fits —
+ * claude aliases incl. `sonnet[1m]`, dated ids, Bedrock `:`/ARN-ish ids,
+ * Vertex `@` versions, provider-prefixed and multi-slash openrouter ids,
+ * `:tag` suffixes — while whitespace, quotes, and shell metacharacters
+ * (`& | < > ^ % ! ( ) ; $`) are excluded: no vendor model id contains
+ * them, and model strings later travel into spawn argv. The spawn layer
+ * (cross-spawn, no shell) is the security boundary; this is the
+ * defense-in-depth gate at the PARSE boundary, where rejection reaches
+ * the user as a config error instead of a mid-workflow failure. The
+ * exclusion of `%` matters specifically: cmd.exe `%VAR%` expansion inside
+ * .cmd shims is the historically weakest spot of Windows arg escaping.
+ */
+const SAFE_MODEL_ID = /^[A-Za-z0-9][A-Za-z0-9._/:@[\]+-]{0,255}$/;
+
+/**
+ * Rejects model ids outside the vendor-id syntax class, naming the first
+ * offending character. Applied wherever model strings ENTER the system
+ * (YAML team config, session-time `--team` overrides) — never during model
+ * enumeration and never at adapter spawn time.
+ */
+export function assertSafeModelId(value: string, pathLabel: string): void {
+  if (SAFE_MODEL_ID.test(value)) return;
+  const allowed = /[A-Za-z0-9._/:@[\]+-]/;
+  const offending = [...value].find((ch) => !allowed.test(ch));
+  const detail =
+    value.length === 0
+      ? "empty string"
+      : value.length > 256
+        ? "longer than 256 characters"
+        : offending !== undefined
+          ? `contains ${JSON.stringify(offending)}`
+          : `starts with ${JSON.stringify(value[0])}`;
+  throw new Error(
+    `${pathLabel}: model id ${detail} — no vendor model id uses that. ` +
+      "Allowed: letters and digits plus . _ / : @ [ ] + - (max 256 chars).",
+  );
+}
+
 // ── Internal: aliases & resolution ──
 
 function readAliases(root: Record<string, unknown>): Record<string, string> {
@@ -292,6 +336,11 @@ export function resolveTeamComposition(
     result.push(inst);
   }
   for (const inst of override) {
+    // Session-time overrides (`--team` JSON, dashboard panel) bypass the
+    // YAML parse — gate them here, the other entry boundary.
+    if (inst.model !== null) {
+      assertSafeModelId(inst.model, `override ${inst.persona}#${inst.instance_index}`);
+    }
     result.push(inst);
   }
   return result;

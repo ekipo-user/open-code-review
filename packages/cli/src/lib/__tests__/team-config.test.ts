@@ -1,5 +1,6 @@
 import { describe, it, expect } from "vitest";
 import {
+  assertSafeModelId,
   parseTeamConfigYaml,
   resolveTeamComposition,
   type ReviewerInstance,
@@ -186,5 +187,79 @@ describe("resolveTeamComposition", () => {
     ];
     const resolved = resolveTeamComposition(baseTeam, override);
     expect(resolved.filter((i) => i.persona === "quality")).toHaveLength(3);
+  });
+});
+
+describe("assertSafeModelId — vendor-id syntax class (issue #43)", () => {
+  // Every known vendor id shape must pass: the spec promises free-text
+  // model entry is gatekept ONLY by this syntax class.
+  const realVendorIds = [
+    "opus",
+    "sonnet",
+    "haiku",
+    "sonnet[1m]", // Claude Code's documented 1M-context selector
+    "claude-sonnet-4-5-20250929",
+    "us.anthropic.claude-sonnet-4-5-20250929-v2:0", // Bedrock
+    "arn:aws:bedrock:us-east-1:123456789012:inference-profile/us.anthropic.claude-sonnet-4-5", // ARN form
+    "claude-sonnet-4-5@20250929", // Vertex
+    "anthropic/claude-sonnet-4-6",
+    "openrouter/meta-llama/llama-3", // multi-slash
+    "openrouter/anthropic/claude-3.5-sonnet:nitro", // :tag suffix
+    "ollama/llama3.1:8b",
+    "gemini-2.5-pro",
+    "gpt-5-codex",
+  ];
+
+  it.each(realVendorIds)("accepts real vendor id %s", (id) => {
+    expect(() => assertSafeModelId(id, "test")).not.toThrow();
+  });
+
+  const hostile = [
+    "sonnet & calc.exe",
+    "sonnet|whoami",
+    "sonnet;rm -rf /",
+    "sonnet > out.txt",
+    'sonnet"quoted"',
+    "sonnet`backtick`",
+    "%PATH%",
+    "sonnet!delayed!",
+    "sonnet$(id)",
+    "sonnet^caret",
+    "has space",
+  ];
+
+  it.each(hostile)("rejects %s as outside the syntax class", (id) => {
+    expect(() => assertSafeModelId(id, "test")).toThrow(/model id contains/);
+  });
+
+  it("names the first offending character in the error", () => {
+    expect(() => assertSafeModelId("sonnet&calc", "test")).toThrow(/contains "&"/);
+    expect(() => assertSafeModelId("sonnet calc", "test")).toThrow(/contains " "/);
+  });
+
+  it("rejects empty and over-long ids", () => {
+    expect(() => assertSafeModelId("", "test")).toThrow(/empty string/);
+    expect(() => assertSafeModelId("a".repeat(300), "test")).toThrow(/longer than 256/);
+  });
+
+  it("gates YAML team config at parse time with the config path in the error", () => {
+    expect(() =>
+      parseTeamConfigYaml(
+        `default_team:\n  security:\n    count: 1\n    model: "sonnet & calc.exe"\n`,
+      ),
+    ).toThrow(/default_team\.security\[0\].*contains/);
+  });
+
+  it("gates session-time overrides in resolveTeamComposition", () => {
+    const override: ReviewerInstance[] = [
+      { persona: "security", instance_index: 1, name: "security-1", model: "sonnet|whoami" },
+    ];
+    expect(() => resolveTeamComposition([], override)).toThrow(/override security#1/);
+  });
+
+  it("still allows model: null everywhere (no model = no --model flag)", () => {
+    const { team } = parseTeamConfigYaml(`default_team:\n  security: 1\n`);
+    expect(team[0]!.model).toBeNull();
+    expect(() => resolveTeamComposition([], team)).not.toThrow();
   });
 });

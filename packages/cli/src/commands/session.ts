@@ -126,11 +126,29 @@ const startInstanceSubcommand = new Command("start-instance")
 
 // ── bind-vendor-id ──
 
+/**
+ * Argv-safety syntax class for vendor session ids (issue #43). A bound id
+ * is STICKY (rebinding is refused) and later becomes spawn argv
+ * (`--session <id>`), so a garbage bind both poisons resume for the
+ * workflow and rides into a child process invocation. Covers every real
+ * shape (Claude Code UUIDs, OpenCode `ses_…`); deliberately NOT per-vendor
+ * grammar — vendors drift id formats silently, and the caller is an AI
+ * orchestrator mid-workflow, where a false rejection fails the review.
+ */
+const SAFE_VENDOR_SESSION_ID = /^[A-Za-z0-9][A-Za-z0-9._:-]{0,255}$/;
+
 const bindVendorIdSubcommand = new Command("bind-vendor-id")
   .description("Bind the underlying CLI's session id to an OCR agent session")
   .argument("<agent-session-id>", "OCR agent session id")
   .argument("<vendor-session-id>", "Underlying CLI's session id")
   .action(async (agentId: string, vendorId: string) => {
+    if (!SAFE_VENDOR_SESSION_ID.test(vendorId)) {
+      fail(
+        `vendor-session-id ${JSON.stringify(vendorId)} is not a plausible vendor session id ` +
+          "(allowed: letters and digits plus . _ : - , max 256 chars). " +
+          "Nothing was bound — retry with the id the vendor CLI actually emitted.",
+      );
+    }
     const { ocrDir } = await setup();
     const db = await ensureDatabase(ocrDir);
 
