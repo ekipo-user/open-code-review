@@ -92,16 +92,33 @@ export function spawnBinary(
 // ── Process-tree reaping ──
 
 /**
+ * Classifies a `process.kill(pid, 0)` failure: only ESRCH ("no such
+ * process") is positive evidence of death. EPERM means the process exists
+ * but is not ours to signal — alive. Any other error, or a thrown
+ * non-Error, cannot prove death, so the conservative verdict is alive.
+ *
+ * Exported as the single shared decision behind the platform's
+ * `isProcessAlive` and the CLI's `defaultIsAlive` (previously duplicated),
+ * and so the errno contract is testable deterministically on every OS —
+ * the old tests manufactured EPERM by probing pid 1, which does not exist
+ * on Windows (issue #41).
+ */
+export function killErrorMeansDead(err: unknown): boolean {
+  return err instanceof Error && "code" in err && err.code === "ESRCH";
+}
+
+/**
  * Whether a PID is currently signalable (alive). `process.kill(pid, 0)` sends
- * no signal; only an `ESRCH` error is positive evidence of death. Mirrors the
- * CLI's `defaultIsAlive` so callers across packages share one liveness probe.
+ * no signal; only an `ESRCH` error is positive evidence of death. Shares the
+ * `killErrorMeansDead` classifier with the CLI's `defaultIsAlive` so callers
+ * across packages share one liveness contract.
  */
 export function isProcessAlive(pid: number): boolean {
   try {
     process.kill(pid, 0);
     return true;
   } catch (err) {
-    return !(err instanceof Error && "code" in err && err.code === "ESRCH");
+    return !killErrorMeansDead(err);
   }
 }
 

@@ -1,12 +1,21 @@
 import { resolve } from "node:path";
 import { writeFileSync, mkdtempSync, rmSync, realpathSync } from "node:fs";
 import { tmpdir } from "node:os";
-import { describe, it, expect, afterAll } from "vitest";
+// Raw spawn here is TEST SCAFFOLDING for the process fixtures below — the
+// APIs under test are isProcessAlive/descendantPids/reapTree, not the spawn
+// wrappers, and `process.execPath` + script files sidestep PATH/PATHEXT and
+// shell quoting entirely (no `sleep` binary exists on Windows).
+import { spawn, type ChildProcess } from "node:child_process";
+import { describe, it, expect, afterAll, vi } from "vitest";
 import {
   importModule,
   execBinary,
   execBinaryAsync,
   defaultIconFor,
+  killErrorMeansDead,
+  isProcessAlive,
+  descendantPids,
+  reapTree,
   BUILTIN_ICON_MAP,
 } from "../index.js";
 
@@ -161,39 +170,126 @@ describe("defaultIconFor", () => {
   });
 });
 
-describe("process-tree reaping", () => {
-  const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
-
-  it("isProcessAlive reflects a real process's liveness", async () => {
-    const { isProcessAlive, spawnBinary } = await import("../index.js");
-    const proc = spawnBinary("sleep", ["30"], { stdio: "ignore" });
-    await sleep(100);
-    expect(isProcessAlive(proc.pid!)).toBe(true);
-    process.kill(proc.pid!, "SIGKILL");
-    await sleep(200);
-    expect(isProcessAlive(proc.pid!)).toBe(false);
+describe("killErrorMeansDead", () => {
+  // The errno contract behind isProcessAlive (and the CLI's defaultIsAlive):
+  // only ESRCH is positive evidence of death. Tested synthetically so the
+  // contract is pinned deterministically on every OS — manufacturing a real
+  // EPERM requires platform-specific pids (pid 1 does not exist on Windows).
+  it("treats ESRCH as proof of death", () => {
+    expect(killErrorMeansDead(Object.assign(new Error("kill ESRCH"), { code: "ESRCH" }))).toBe(true);
   });
 
-  it("descendantPids finds a child and reapTree kills the whole tree", async () => {
-    const { descendantPids, reapTree, isProcessAlive, spawnBinary } = await import("../index.js");
-    // A node parent that spawns a `sleep` grandchild and stays alive.
-    const parent = spawnBinary(
-      "node",
-      ["-e", "require('child_process').spawn('sleep',['30']); setInterval(()=>{},1e9)"],
-      { stdio: "ignore", detached: true },
-    );
-    await sleep(400);
+  it("treats EPERM as alive (exists but not ours to signal)", () => {
+    expect(killErrorMeansDead(Object.assign(new Error("kill EPERM"), { code: "EPERM" }))).toBe(false);
+  });
+
+  it("treats unknown errors and non-Errors as alive (conservative)", () => {
+    expect(killErrorMeansDead(new Error("no code"))).toBe(false);
+    expect(killErrorMeansDead("not an error")).toBe(false);
+    expect(killErrorMeansDead(undefined)).toBe(false);
+  });
+});
+
+describe("isProcessAlive", () => {
+  it("treats an EPERM probe failure as alive (wiring to the classifier)", () => {
+    const spy = vi.spyOn(process, "kill").mockImplementation(() => {
+      throw Object.assign(new Error("kill EPERM"), { code: "EPERM" });
+    });
+    try {
+      expect(isProcessAlive(424242)).toBe(true);
+    } finally {
+      spy.mockRestore();
+    }
+  });
+});
+
+describe("process-tree reaping", () => {
+  const isWindows = process.platform === "win32";
+
+  // Node script fixtures replace the previous `sleep`-binary children:
+  // `sleep` does not exist on Windows (the old test only "passed" there by
+  // watching the cmd.exe wrapper that shell:true interposed). Spawning
+  // `process.execPath` on a script file is PATH- and quoting-proof on
+  // every OS.
+  const longLivedFixture = resolve(tmpDir, "long-lived.cjs");
+  writeFileSync(longLivedFixture, "setInterval(() => {}, 1 << 30);\n");
+  const parentFixture = resolve(tmpDir, "parent.cjs");
+  writeFileSync(
+    parentFixture,
+    [
+      "const { spawn } = require('node:child_process');",
+      "const child = spawn(process.execPath, [process.argv[2]], { stdio: 'ignore' });",
+      // pid handshake: the test learns the grandchild pid from stdout instead
+      // of racing a fixed sleep against process startup.
+      "console.log(String(child.pid));",
+      "setInterval(() => {}, 1 << 30);",
+      "",
+    ].join("\n"),
+  );
+
+  /** Poll `cond` until true or the deadline passes. */
+  async function eventually(cond: () => boolean, timeoutMs: number): Promise<boolean> {
+    const deadline = Date.now() + timeoutMs;
+    while (Date.now() < deadline) {
+      if (cond()) return true;
+      await new Promise((r) => setTimeout(r, 50));
+    }
+    return cond();
+  }
+
+  /** Read the first stdout line (the grandchild pid handshake). */
+  function firstLine(proc: ChildProcess): Promise<string> {
+    return new Promise((resolvePromise, reject) => {
+      let buf = "";
+      proc.stdout?.setEncoding("utf-8");
+      proc.stdout?.on("data", (chunk: string) => {
+        buf += chunk;
+        const nl = buf.indexOf("\n");
+        if (nl >= 0) resolvePromise(buf.slice(0, nl).trim());
+      });
+      proc.on("error", reject);
+      setTimeout(() => reject(new Error("no pid handshake within 5s")), 5000);
+    });
+  }
+
+  it("isProcessAlive reflects a real process's liveness", async () => {
+    const proc = spawn(process.execPath, [longLivedFixture], { stdio: "ignore" });
+    await eventually(() => proc.pid !== undefined, 1000);
+    expect(isProcessAlive(proc.pid!)).toBe(true);
+    proc.kill("SIGKILL");
+    // Windows handle teardown can lag TerminateProcess — poll, don't sleep.
+    expect(await eventually(() => !isProcessAlive(proc.pid!), 3000)).toBe(true);
+  });
+
+  it("reapTree kills the whole tree; enumeration matches the per-platform contract", async () => {
+    // Parent stays alive until reaped (taskkill /T cannot enumerate orphans),
+    // and prints its child's pid so the kill is observable on Windows even
+    // though descendantPids is documented to return [] there.
+    const parent = spawn(process.execPath, [parentFixture, longLivedFixture], {
+      stdio: ["ignore", "pipe", "ignore"],
+    });
+    const grandchildPid = Number(await firstLine(parent));
+    expect(Number.isInteger(grandchildPid)).toBe(true);
+    expect(isProcessAlive(grandchildPid)).toBe(true);
+
     const kids = descendantPids(parent.pid!);
-    expect(kids.length).toBeGreaterThan(0); // the spawned `sleep` is a descendant
-
     const result = reapTree(parent.pid!, 200);
-    // The diagnostic reports the SIGTERM phase: the root + its descendants were
-    // signalled, and `ps` was available to enumerate them (round-1 S13).
-    expect(result.signaled).toBeGreaterThanOrEqual(kids.length + 1);
-    expect(result.psAvailable).toBe(true);
 
-    await sleep(700);
-    expect(isProcessAlive(parent.pid!)).toBe(false);
-    for (const pid of kids) expect(isProcessAlive(pid)).toBe(false);
+    if (isWindows) {
+      // Documented Windows contract (asserted, not skipped): no `ps`-based
+      // enumeration — reaping is delegated to `taskkill /T /F` on the root.
+      expect(kids).toEqual([]);
+      expect(result).toEqual({ signaled: 1, psAvailable: false });
+    } else {
+      expect(kids).toContain(grandchildPid);
+      // SIGTERM phase covered root + descendants, with `ps` available.
+      expect(result.signaled).toBeGreaterThanOrEqual(kids.length + 1);
+      expect(result.psAvailable).toBe(true);
+    }
+
+    // The platform-neutral observable contract: after reap + grace, the
+    // whole tree is dead — on every OS.
+    expect(await eventually(() => !isProcessAlive(parent.pid!), 4000)).toBe(true);
+    expect(await eventually(() => !isProcessAlive(grandchildPid), 4000)).toBe(true);
   });
 });

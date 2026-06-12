@@ -7,25 +7,27 @@
  * classical school — no internal mocks).
  */
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
-import { mkdtempSync, rmSync, mkdirSync } from 'node:fs'
-import { tmpdir } from 'node:os'
+import { mkdirSync } from 'node:fs'
 import { join, resolve } from 'node:path'
 import { insertSession } from '@open-code-review/cli/db'
 import { openDb } from '../../../db.js'
 import type { AiCliAdapter, AiCliService } from '../../ai-cli/index.js'
 import { createSessionCaptureService } from '../session-capture-service.js'
+import { makeTempWorkspace, removeTempWorkspace } from './temp-workspace.js'
 
 let workspace: string
 let ocrDir: string
 
 beforeEach(async () => {
-  workspace = mkdtempSync(join(tmpdir(), 'capture-svc-'))
+  workspace = makeTempWorkspace('capture-svc-')
   ocrDir = join(workspace, '.ocr')
   mkdirSync(join(ocrDir, 'data'), { recursive: true })
 })
 
 afterEach(() => {
-  rmSync(workspace, { recursive: true, force: true })
+  // Closes the shared DB connection cache before removal — an open
+  // node:sqlite handle EBUSY-locks ocr.db on Windows (issue #41).
+  removeTempWorkspace(workspace)
 })
 
 /**

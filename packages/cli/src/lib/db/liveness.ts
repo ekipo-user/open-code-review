@@ -8,6 +8,8 @@
  * signalable. OCR is local-first / single-machine, so this is authoritative.
  */
 
+import { killErrorMeansDead } from "@open-code-review/platform";
+
 /** Predicate: true if `pid` names a live process we must NOT declare dead. */
 export type IsAlive = (pid: number) => boolean;
 
@@ -46,10 +48,10 @@ export function defaultIsAlive(pid: number): boolean {
     process.kill(pid, 0);
     return true;
   } catch (err) {
-    // Only ESRCH ("no such process") is positive evidence of death. Read the
-    // code via a type guard (no type assertion) — any other error, or a thrown
-    // non-Error, means we cannot prove the process is gone, so: alive.
-    return !(err instanceof Error && "code" in err && err.code === "ESRCH");
+    // Only ESRCH ("no such process") is positive evidence of death — the
+    // shared platform classifier owns that decision (one contract for this
+    // and the platform's `isProcessAlive`; previously duplicated).
+    return !killErrorMeansDead(err);
   }
 }
 
