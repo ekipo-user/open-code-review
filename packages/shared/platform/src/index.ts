@@ -2,7 +2,8 @@
  * Cross-platform utilities for Open Code Review.
  *
  * Thin wrappers around Node.js built-in APIs that handle Windows-specific
- * requirements (file:// URLs for ESM imports, shell for .cmd shims).
+ * requirements (file:// URLs for ESM imports, shell-less `.cmd`/`.bat` shim
+ * resolution via cross-spawn — see `spawn.ts`; there is no interpreting shell).
  * These work identically on all platforms — no conditional branching needed
  * at call sites.
  */
@@ -11,6 +12,7 @@ import { pathToFileURL } from "node:url";
 import { execFileSync } from "node:child_process";
 
 export { execBinary, execBinaryAsync, spawnBinary } from "./spawn.js";
+export type { ExecBinaryAsyncOptions, ExecError } from "./spawn.js";
 
 const isWindows = process.platform === "win32";
 

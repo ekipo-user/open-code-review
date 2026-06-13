@@ -41,6 +41,46 @@ import type {
 const DEFAULT_MAX_BUFFER = 1024 * 1024;
 
 /**
+ * The options {@link execBinaryAsync} actually honors — a deliberately narrow
+ * subset of `ExecFileOptions`. The previous signature advertised the full
+ * `ExecFileOptions` (`input`, `signal`, `stdio`, `killSignal`, …) while the
+ * body forwarded only these, silently dropping the rest. Narrowing makes the
+ * contract honest so a caller can't pass `input`/`signal` and expect them to
+ * take effect (issue #43 review, should-fix). To honor more, widen this type
+ * AND forward the new field in the body — keep the two in lockstep.
+ */
+export type ExecBinaryAsyncOptions = {
+  encoding: BufferEncoding;
+  cwd?: ExecFileOptions["cwd"];
+  env?: ExecFileOptions["env"];
+  /** Kill the child and reject with `killed: true` after this many ms. */
+  timeout?: number;
+  /** Reject (after killing) once buffered stdout/stderr exceeds this. */
+  maxBuffer?: number;
+};
+
+/**
+ * The rejection shape of {@link execBinary} and {@link execBinaryAsync}.
+ * Consumers (model discovery's `describeProbeFailure`, the dashboard team
+ * route) should narrow a caught error with `as ExecError` rather than
+ * re-declaring the shape inline. Every field is optional: which ones are
+ * present depends on the failure class (ENOENT vs non-zero exit vs timeout).
+ */
+export type ExecError = Error & {
+  /** Numeric exit code, or `"ENOENT"` when the binary is missing. */
+  code?: number | string;
+  /** spawnSync's numeric exit status (sync path only). */
+  status?: number | null;
+  /** Signal that terminated the child (e.g. on timeout/overflow kill). */
+  signal?: NodeJS.Signals | null;
+  stdout?: string;
+  stderr?: string;
+  /** True when the child was killed by our timeout/maxBuffer guard. */
+  killed?: boolean;
+  pid?: number;
+};
+
+/**
  * Execute a binary synchronously. Throws on any failure — missing binary
  * (`code: "ENOENT"` on every platform), non-zero exit (`status`/`code` =
  * the numeric exit code, with `stdout`/`stderr`/`signal` attached), or
@@ -92,7 +132,7 @@ export function execBinary(
 export async function execBinaryAsync(
   binary: string,
   args: string[],
-  opts: ExecFileOptions & { encoding: BufferEncoding },
+  opts: ExecBinaryAsyncOptions,
 ): Promise<{ stdout: string; stderr: string }> {
   return new Promise((resolvePromise, rejectPromise) => {
     const child = crossSpawn(binary, args, {
