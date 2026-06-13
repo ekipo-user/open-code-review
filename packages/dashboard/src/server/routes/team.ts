@@ -23,7 +23,8 @@ import {
   SUPPORTED_VENDORS,
   type ModelVendor,
 } from '@open-code-review/cli/models'
-import { execBinary } from '@open-code-review/platform'
+import { execBinary, type ExecError } from '@open-code-review/platform'
+import { dirname } from 'node:path'
 
 function isReviewerInstanceArray(input: unknown): input is ReviewerInstance[] {
   if (!Array.isArray(input)) return false
@@ -92,13 +93,18 @@ export function createTeamRouter(ocrDir: string): Router {
       execBinary('ocr', ['team', 'set', '--stdin'], {
         input: JSON.stringify(body.team),
         encoding: 'utf-8',
-        cwd: ocrDir.replace(/\/\.ocr$/, ''),
+        // Run from the project root (parent of `.ocr`). `dirname` is
+        // separator-correct on every platform — a prior `/\/\.ocr$/` regex
+        // silently no-op'd on Windows (join builds the path with `\`), running
+        // `ocr team set` inside the `.ocr` dir itself (blocker B2). Matches the
+        // `dirname(ocrDir)` derivation used across the socket handlers.
+        cwd: dirname(ocrDir),
         timeout: 10000,
       })
       res.json({ ok: true, team: body.team })
     } catch (err) {
       console.error('Failed to persist team:', err)
-      const e = err as { stderr?: unknown; status?: unknown }
+      const e = err as ExecError
       res.status(500).json({
         error: 'Failed to persist team',
         detail: err instanceof Error ? err.message : String(err),
