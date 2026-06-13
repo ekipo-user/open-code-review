@@ -903,6 +903,15 @@ The dashboard server SHALL use a strategy pattern to detect, select, and interac
 - **AND** the adapter SHALL return a `ChildProcess` handle and a `parseLine()` method
 - **AND** `parseLine()` SHALL normalize raw CLI output into the standard event union
 
+#### Scenario: Prompt delivery via stdin, never argv
+
+- **GIVEN** an adapter spawns its CLI with a prompt (workflow, chat, or query mode)
+- **WHEN** the child process is created
+- **THEN** the prompt SHALL be delivered on the child's stdin — it SHALL NOT appear in any argv element
+- **AND** the stdin stream SHALL have an error handler attached before writing, so a child that dies before draining (EPIPE) cannot crash the dashboard process
+- **AND** an empty prompt SHALL be rejected before spawning
+- **AND** each adapter's spawn shape (argv plus stdin delivery) SHALL be pinned by unit tests, including the negative invariant that no argv element contains the prompt
+
 #### Scenario: Normalized event stream
 
 - **GIVEN** an adapter has spawned a CLI process
@@ -916,8 +925,6 @@ The dashboard server SHALL use a strategy pattern to detect, select, and interac
 - **WHEN** the client fetches `GET /api/config`
 - **THEN** the response SHALL include `aiCli.active` indicating the detected adapter name or `null`
 - **AND** the client SHALL render capability-aware UI based on this value (e.g., AddressFeedbackPopover shows run mode when active, copy mode when null)
-
----
 
 ### Requirement: Unified Execution Tracking
 
