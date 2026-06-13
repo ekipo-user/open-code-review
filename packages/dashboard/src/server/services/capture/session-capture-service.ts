@@ -23,6 +23,7 @@ import type { Database } from '@open-code-review/cli/db'
 import {
   getLatestAgentSessionWithVendorId,
   getSession,
+  isSafeVendorSessionId,
   linkDashboardInvocationToWorkflow,
   recordVendorSessionIdForExecution,
 } from '@open-code-review/cli/db'
@@ -125,6 +126,15 @@ export function createSessionCaptureService(deps: SessionCaptureDeps) {
   const driftLoggedFor = new Set<number>()
 
   /**
+   * Per-process record of executions we've already logged a
+   * rejected (syntactically implausible) vendor-session-id for. Same
+   * one-log-per-execution discipline as {@link driftLoggedFor}: a vendor
+   * emitting a malformed id will re-emit it on every stream message, and
+   * we want one observability signal, not a torrent.
+   */
+  const rejectLoggedFor = new Set<number>()
+
+  /**
    * Returns the currently bound vendor_session_id for an execution row,
    * or null when no value is stored. Cheap pre-check used to gate
    * write-amplification on `recordSessionId` — vendors emit `session_id`
@@ -157,6 +167,25 @@ export function createSessionCaptureService(deps: SessionCaptureDeps) {
    */
   function recordSessionId(executionId: number, vendorSessionId: string): void {
     try {
+      // Stream-boundary syntax-class gate (issue #43). The captured id
+      // is STICKY (resume target) and later rides into spawn argv as
+      // `--session <id>`, so a garbage id from a misbehaving vendor both
+      // poisons resume and rides into a child invocation. Apply the same
+      // SAFE_VENDOR_SESSION_ID check the CLI's `bind-vendor-id` parse
+      // boundary uses, shared via the db layer. Log-and-drop (don't
+      // throw): this runs in the stream pump on every `session_id` event,
+      // and a throw would tear down a live capture over a cosmetic id.
+      if (!isSafeVendorSessionId(vendorSessionId)) {
+        if (!rejectLoggedFor.has(executionId)) {
+          rejectLoggedFor.add(executionId)
+          console.warn(
+            `[session-capture] rejecting implausible vendor session id on execution ${executionId}: ` +
+              `${JSON.stringify(vendorSessionId)} (allowed: letters/digits plus . _ : - , max 256 chars). ` +
+              `Not recorded — resume for this execution is unavailable.`,
+          )
+        }
+        return
+      }
       const existing = readBoundSessionId(executionId)
       if (existing === vendorSessionId) return // already recorded; no save needed
       if (existing) {

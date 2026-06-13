@@ -30,6 +30,7 @@ import {
   setAgentSessionStatus,
   setAgentSessionVendorId,
   sweepStaleAgentSessions,
+  SAFE_VENDOR_SESSION_ID,
 } from "../lib/db/index.js";
 import { getAgentHeartbeatSeconds } from "../lib/runtime-config.js";
 import { resolveActiveSession } from "../lib/state/index.js";
@@ -125,17 +126,16 @@ const startInstanceSubcommand = new Command("start-instance")
   );
 
 // ── bind-vendor-id ──
-
-/**
- * Argv-safety syntax class for vendor session ids (issue #43). A bound id
- * is STICKY (rebinding is refused) and later becomes spawn argv
- * (`--session <id>`), so a garbage bind both poisons resume for the
- * workflow and rides into a child process invocation. Covers every real
- * shape (Claude Code UUIDs, OpenCode `ses_…`); deliberately NOT per-vendor
- * grammar — vendors drift id formats silently, and the caller is an AI
- * orchestrator mid-workflow, where a false rejection fails the review.
- */
-const SAFE_VENDOR_SESSION_ID = /^[A-Za-z0-9][A-Za-z0-9._:-]{0,255}$/;
+//
+// The argv-safety syntax class for vendor session ids (issue #43) is
+// SAFE_VENDOR_SESSION_ID, imported from the db layer so this parse-boundary
+// check and the dashboard's stream-boundary check (capture service) share one
+// definition. A bound id is STICKY (rebinding is refused) and later becomes
+// spawn argv (`--session <id>`), so a garbage bind both poisons resume and
+// rides into a child process invocation. The class covers every real shape
+// (Claude Code UUIDs, OpenCode `ses_…`) and is deliberately NOT per-vendor
+// grammar — vendors drift id formats silently and the caller is an AI
+// orchestrator mid-workflow where a false rejection fails the review.
 
 const bindVendorIdSubcommand = new Command("bind-vendor-id")
   .description("Bind the underlying CLI's session id to an OCR agent session")
