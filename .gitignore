@@ -62,7 +62,10 @@ test-results/
 playwright-report/
 blob-report/
 
-# Agent runtime telemetry (claude-flow) — not source. Per-package data
-# directories accumulate insights, traces, and intermediate state that
-# shouldn't reach PRs.
+# Agent runtime telemetry (claude-flow) — not source. Per-package data and
+# session directories accumulate insights, traces, and intermediate state
+# that shouldn't reach PRs (and, when written under .ocr/, desync the skill
+# mirror). The committed root .claude-flow/ config/metrics are unaffected —
+# these patterns scope to the runtime-only subdirs.
 **/.claude-flow/data/
+**/.claude-flow/sessions/
