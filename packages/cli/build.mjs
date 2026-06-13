@@ -61,9 +61,23 @@ await build(libraryBundle('src/lib/db/index.ts', 'dist/lib/db/index.js'))
 // Test-only helper (`@open-code-review/cli/test-support`). Built into dist
 // because the dashboard's vitest externalizes workspace packages and resolves
 // `cli/*` subpaths through `exports` → dist (source aliases are provably dead
-// there; see dashboard/vitest.config.ts). It re-exports `closeAllDatabases`
-// from db/index, so it inherits the same cross-spawn externalization.
-await build(libraryBundle('src/lib/db/test-support.ts', 'dist/lib/db/test-support.js'))
+// there; see dashboard/vitest.config.ts).
+//
+// `./index.js` (the db bundle) is externalized — NOT inlined. This is load-
+// bearing: `removeTempWorkspace` calls `closeAllDatabases`, which drains a
+// MODULE-LEVEL connection cache. The dashboard opens its handles through the
+// `cli/db` dist bundle, so the close must hit THAT bundle's cache singleton.
+// Bundling db/index into test-support would give it a second, private copy of
+// that cache — the drain would no-op against an empty map and the dashboard's
+// real handles would stay open, leaving `ocr.db` locked → EBUSY on the Windows
+// teardown unlink (issue #41, exactly the failure this helper exists to kill;
+// it passes on POSIX, which tolerates unlinking an open file). Keeping
+// `./index.js` external makes test-support.js import the one shared singleton
+// at runtime — the emitted output is sibling-relative, so it resolves to
+// dist/lib/db/index.js next to it.
+await build(
+  libraryBundle('src/lib/db/test-support.ts', 'dist/lib/db/test-support.js', ['./index.js']),
+)
 await build(libraryBundle('src/lib/runtime-config.ts', 'dist/lib/runtime-config.js'))
 // `yaml` is CommonJS-published, and inlining it via esbuild emits a
 // `require()` call that fails when the consuming dashboard server is
