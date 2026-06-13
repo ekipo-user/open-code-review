@@ -353,6 +353,27 @@ export function bindVendorSessionIdOpportunistically(
 }
 
 /**
+ * Syntax class for a plausible vendor session id — the single source of truth
+ * shared by the CLI `bind-vendor-id` command (parse-boundary validation) and
+ * the dashboard's capture service (stream-boundary validation). Letters/digits
+ * to start, then letters, digits, and `. _ : - `, max 256 chars.
+ *
+ * This is defense-in-depth: a vendor session id flows into a `--resume <id>`
+ * argv and a user-facing copy-paste resume command. The shell-less spawn (see
+ * `@open-code-review/platform`) is the real injection boundary, but per issue
+ * #43 every parse/stream boundary that ingests an untrusted vendor string
+ * validates it too — and BOTH boundaries must agree, so the regex lives here,
+ * not duplicated per call site. `%` is deliberately excluded (cmd.exe
+ * `%VAR%`-expansion is the weakest spot of `.cmd` argument escaping).
+ */
+export const SAFE_VENDOR_SESSION_ID = /^[A-Za-z0-9][A-Za-z0-9._:-]{0,255}$/;
+
+/** Whether `id` matches {@link SAFE_VENDOR_SESSION_ID}. */
+export function isSafeVendorSessionId(id: string): boolean {
+  return SAFE_VENDOR_SESSION_ID.test(id);
+}
+
+/**
  * Records a vendor session id on the parent `command_executions` row
  * spawned by the dashboard. Idempotent (COALESCE) — vendors emit
  * `session_id` events on every stream message, we record only the first.

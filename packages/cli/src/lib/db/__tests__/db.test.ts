@@ -1,6 +1,5 @@
-import { mkdtempSync, rmSync, existsSync } from "node:fs";
+import { existsSync } from "node:fs";
 import { join } from "node:path";
-import { tmpdir } from "node:os";
 import { describe, it, expect, beforeEach, afterEach } from "vitest";
 import {
   openDatabase,
@@ -15,6 +14,7 @@ import {
   getEventsForSession,
   getLatestEventId,
 } from "../index.js";
+import { makeTempWorkspace, removeTempWorkspace } from "../test-support.js";
 import { runMigrations, MIGRATIONS } from "../migrations.js";
 import type { Database } from "../engine.js";
 
@@ -23,15 +23,14 @@ let db: Database;
 let dbPath: string;
 
 beforeEach(async () => {
-  tmpDir = mkdtempSync(join(tmpdir(), "ocr-db-test-"));
+  tmpDir = makeTempWorkspace("ocr-db-test-");
   dbPath = join(tmpDir, "test.db");
   db = await openDatabase(dbPath);
   runMigrations(db);
 });
 
 afterEach(() => {
-  closeAllDatabases();
-  rmSync(tmpDir, { recursive: true, force: true });
+  removeTempWorkspace(tmpDir);
 });
 
 describe("Database creation and migration", () => {

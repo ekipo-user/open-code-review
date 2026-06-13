@@ -19,6 +19,12 @@
       "import": "./dist/lib/db/index.js",
       "default": "./dist/lib/db/index.js"
     },
+    "./test-support": {
+      "types": "./src/lib/db/test-support.ts",
+      "source": "./src/lib/db/test-support.ts",
+      "import": "./dist/lib/db/test-support.js",
+      "default": "./dist/lib/db/test-support.js"
+    },
     "./runtime-config": {
       "types": "./src/lib/runtime-config.ts",
       "source": "./src/lib/runtime-config.ts",
@@ -77,6 +83,7 @@
     "chalk": "^5.4.1",
     "chokidar": "^4.0.3",
     "commander": "^13.0.0",
+    "cross-spawn": "^7.0.6",
     "log-update": "^7.0.2",
     "ora": "^8.1.1",
     "socket.io": "^4.8",

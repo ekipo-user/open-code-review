@@ -127,6 +127,8 @@ export {
   setAgentSessionVendorId,
   bindVendorSessionIdOpportunistically,
   recordVendorSessionIdForExecution,
+  SAFE_VENDOR_SESSION_ID,
+  isSafeVendorSessionId,
   linkDashboardInvocationToWorkflow,
   setAgentSessionStatus,
   updateAgentSession,

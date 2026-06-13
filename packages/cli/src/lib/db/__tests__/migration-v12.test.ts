@@ -1,6 +1,5 @@
-import { mkdtempSync, rmSync, existsSync } from "node:fs";
+import { existsSync } from "node:fs";
 import { join } from "node:path";
-import { tmpdir } from "node:os";
 import { describe, it, expect, beforeEach, afterEach, vi } from "vitest";
 import {
   openDatabase,
@@ -13,12 +12,13 @@ import {
   formatUpgradeNotice,
   type Database,
 } from "../index.js";
+import { makeTempWorkspace, removeTempWorkspace } from "../test-support.js";
 
 let tmpDir: string;
 let db: Database;
 
 async function freshDb(): Promise<Database> {
-  tmpDir = mkdtempSync(join(tmpdir(), "ocr-v12-test-"));
+  tmpDir = makeTempWorkspace("ocr-v12-test-");
   const conn = await openDatabase(join(tmpDir, "ocr.db"));
   runMigrations(conn);
   return conn;
@@ -29,8 +29,7 @@ beforeEach(async () => {
 });
 
 afterEach(() => {
-  closeAllDatabases();
-  rmSync(tmpDir, { recursive: true, force: true });
+  removeTempWorkspace(tmpDir);
 });
 
 describe("migration v12 — event_type taxonomy guard", () => {

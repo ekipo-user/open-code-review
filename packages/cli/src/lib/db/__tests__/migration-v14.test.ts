@@ -1,26 +1,23 @@
-import { mkdtempSync, rmSync } from "node:fs";
 import { join } from "node:path";
-import { tmpdir } from "node:os";
 import { describe, it, expect, beforeEach, afterEach } from "vitest";
 import {
   openDatabase,
-  closeAllDatabases,
   runMigrations,
   type Database,
 } from "../index.js";
+import { makeTempWorkspace, removeTempWorkspace } from "../test-support.js";
 
 let tmpDir: string;
 let db: Database;
 
 beforeEach(async () => {
-  tmpDir = mkdtempSync(join(tmpdir(), "ocr-v14-test-"));
+  tmpDir = makeTempWorkspace("ocr-v14-test-");
   db = await openDatabase(join(tmpDir, "ocr.db"));
   runMigrations(db);
 });
 
 afterEach(() => {
-  closeAllDatabases();
-  if (tmpDir) rmSync(tmpDir, { recursive: true, force: true });
+  if (tmpDir) removeTempWorkspace(tmpDir);
 });
 
 function count(sql: string): number {

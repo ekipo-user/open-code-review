@@ -1,9 +1,8 @@
-import { mkdtempSync, mkdirSync, rmSync, existsSync, readFileSync } from "node:fs";
+import { mkdirSync, existsSync, readFileSync } from "node:fs";
 import { join } from "node:path";
-import { tmpdir } from "node:os";
 import { describe, it, expect, beforeEach, afterEach } from "vitest";
 import { writeFileSync } from "node:fs";
-import { closeAllDatabases } from "../../db/index.js";
+import { makeTempWorkspace, removeTempWorkspace } from "../../db/test-support.js";
 import {
   stateInit,
   stateTransition,
@@ -29,14 +28,13 @@ let ocrDir: string;
 let sessionsDir: string;
 
 beforeEach(() => {
-  tmpDir = mkdtempSync(join(tmpdir(), "ocr-state-test-"));
+  tmpDir = makeTempWorkspace("ocr-state-test-");
   ocrDir = join(tmpDir, ".ocr");
   sessionsDir = join(ocrDir, "sessions");
 });
 
 afterEach(() => {
-  closeAllDatabases();
-  rmSync(tmpDir, { recursive: true, force: true });
+  removeTempWorkspace(tmpDir);
 });
 
 function sessionDir(sessionId: string): string {

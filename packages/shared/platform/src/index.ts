@@ -2,24 +2,17 @@
  * Cross-platform utilities for Open Code Review.
  *
  * Thin wrappers around Node.js built-in APIs that handle Windows-specific
- * requirements (file:// URLs for ESM imports, shell for .cmd shims).
+ * requirements (file:// URLs for ESM imports, shell-less `.cmd`/`.bat` shim
+ * resolution via cross-spawn — see `spawn.ts`; there is no interpreting shell).
  * These work identically on all platforms — no conditional branching needed
  * at call sites.
  */
 
 import { pathToFileURL } from "node:url";
-import {
-  execFile,
-  execFileSync,
-  spawn,
-  type ExecFileOptions,
-  type SpawnOptions,
-  type ExecFileSyncOptions,
-  type ChildProcess,
-} from "node:child_process";
-import { promisify } from "node:util";
+import { execFileSync } from "node:child_process";
 
-const execFilePromise = promisify(execFile);
+export { execBinary, execBinaryAsync, spawnBinary } from "./spawn.js";
+export type { ExecBinaryAsyncOptions, ExecError } from "./spawn.js";
 
 const isWindows = process.platform === "win32";
 
@@ -36,72 +29,36 @@ export async function importModule<T = Record<string, unknown>>(
   return import(pathToFileURL(absolutePath).href) as Promise<T>;
 }
 
-/**
- * Execute a binary synchronously with cross-platform .cmd/.bat support.
- *
- * On Windows, npm-installed binaries are `.cmd` shims that require a shell
- * to execute. On POSIX, `shell: false` is used to avoid unnecessary shell
- * injection surface.
- */
-export function execBinary(
-  binary: string,
-  args: string[],
-  opts: ExecFileSyncOptions & { encoding: BufferEncoding },
-): string {
-  return execFileSync(binary, args, {
-    ...opts,
-    shell: isWindows,
-  }) as string;
-}
-
-/**
- * Execute a binary asynchronously with cross-platform .cmd/.bat support.
- *
- * Async counterpart of `execBinary`. On Windows, npm-installed binaries are
- * `.cmd` shims that require a shell to execute.
- */
-export async function execBinaryAsync(
-  binary: string,
-  args: string[],
-  opts: ExecFileOptions & { encoding: BufferEncoding },
-): Promise<{ stdout: string; stderr: string }> {
-  return execFilePromise(binary, args, {
-    ...opts,
-    shell: isWindows,
-  }) as Promise<{ stdout: string; stderr: string }>;
-}
-
-/**
- * Spawn a child process with cross-platform .cmd/.bat support.
- *
- * On Windows, sets `shell: true` for .cmd shim resolution and
- * `windowsHide: true` to prevent a console window from flashing
- * (important when combined with `detached: true`).
- */
-export function spawnBinary(
-  binary: string,
-  args: string[],
-  opts?: SpawnOptions,
-): ChildProcess {
-  return spawn(binary, args, {
-    ...opts,
-    ...(isWindows && { shell: true, windowsHide: true }),
-  });
-}
-
 // ── Process-tree reaping ──
 
 /**
+ * Classifies a `process.kill(pid, 0)` failure: only ESRCH ("no such
+ * process") is positive evidence of death. EPERM means the process exists
+ * but is not ours to signal — alive. Any other error, or a thrown
+ * non-Error, cannot prove death, so the conservative verdict is alive.
+ *
+ * Exported as the single shared decision behind the platform's
+ * `isProcessAlive` and the CLI's `defaultIsAlive` (previously duplicated),
+ * and so the errno contract is testable deterministically on every OS —
+ * the old tests manufactured EPERM by probing pid 1, which does not exist
+ * on Windows (issue #41).
+ */
+export function killErrorMeansDead(err: unknown): boolean {
+  return err instanceof Error && "code" in err && err.code === "ESRCH";
+}
+
+/**
  * Whether a PID is currently signalable (alive). `process.kill(pid, 0)` sends
- * no signal; only an `ESRCH` error is positive evidence of death. Mirrors the
- * CLI's `defaultIsAlive` so callers across packages share one liveness probe.
+ * no signal; only an `ESRCH` error is positive evidence of death. Shares the
+ * `killErrorMeansDead` classifier with the CLI's `defaultIsAlive` so callers
+ * across packages share one liveness contract.
  */
 export function isProcessAlive(pid: number): boolean {
   try {
     process.kill(pid, 0);
     return true;
   } catch (err) {
-    return !(err instanceof Error && "code" in err && err.code === "ESRCH");
+    return !killErrorMeansDead(err);
   }
 }
 

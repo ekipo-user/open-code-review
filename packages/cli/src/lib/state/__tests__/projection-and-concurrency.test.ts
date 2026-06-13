@@ -1,17 +1,16 @@
-import { mkdtempSync, rmSync, mkdirSync, writeFileSync } from "node:fs";
+import { mkdirSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
-import { tmpdir } from "node:os";
 import { spawn } from "node:child_process";
 import { describe, it, expect, beforeEach, afterEach } from "vitest";
 import {
   openDatabase,
-  closeAllDatabases,
   runMigrations,
   getSession,
   insertSession,
   insertEvent,
   updateSession,
 } from "../../db/index.js";
+import { makeTempWorkspace, removeTempWorkspace } from "../../db/test-support.js";
 import { openEngine } from "../../db/engine.js";
 import {
   stateInit,
@@ -25,14 +24,13 @@ let tmpDir: string;
 let ocrDir: string;
 
 beforeEach(() => {
-  tmpDir = mkdtempSync(join(tmpdir(), "ocr-proj-"));
+  tmpDir = makeTempWorkspace("ocr-proj-");
   ocrDir = join(tmpDir, ".ocr");
   mkdirSync(join(ocrDir, "sessions"), { recursive: true });
 });
 
 afterEach(() => {
-  closeAllDatabases();
-  rmSync(tmpDir, { recursive: true, force: true });
+  removeTempWorkspace(tmpDir);
 });
 
 describe("event-sourced projection", () => {

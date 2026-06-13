@@ -1,10 +1,8 @@
-import { mkdtempSync, rmSync, mkdirSync, writeFileSync } from "node:fs";
+import { mkdirSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
-import { tmpdir } from "node:os";
 import { describe, it, expect, beforeEach, afterEach } from "vitest";
 import {
   openDatabase,
-  closeAllDatabases,
   runMigrations,
   insertSession,
   insertEvent,
@@ -12,13 +10,14 @@ import {
   reconcileLegacyState,
   type Database,
 } from "../index.js";
+import { makeTempWorkspace, removeTempWorkspace } from "../test-support.js";
 
 let tmpDir: string;
 let ocrDir: string;
 let db: Database;
 
 beforeEach(async () => {
-  tmpDir = mkdtempSync(join(tmpdir(), "ocr-reconcile-"));
+  tmpDir = makeTempWorkspace("ocr-reconcile-");
   ocrDir = join(tmpDir, ".ocr");
   mkdirSync(join(ocrDir, "data"), { recursive: true });
   db = await openDatabase(join(ocrDir, "data", "ocr.db"));
@@ -26,8 +25,7 @@ beforeEach(async () => {
 });
 
 afterEach(() => {
-  closeAllDatabases();
-  rmSync(tmpDir, { recursive: true, force: true });
+  removeTempWorkspace(tmpDir);
 });
 
 /** Seed a session and write its session_dir as a project-relative path. */

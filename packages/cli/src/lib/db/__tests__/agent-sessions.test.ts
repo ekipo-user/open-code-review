@@ -1,10 +1,7 @@
-import { mkdtempSync, rmSync } from "node:fs";
 import { join } from "node:path";
-import { tmpdir } from "node:os";
 import { describe, it, expect, beforeEach, afterEach } from "vitest";
 import {
   openDatabase,
-  closeAllDatabases,
   insertSession,
   insertAgentSession,
   getAgentSession,
@@ -20,6 +17,7 @@ import {
   insertEvent,
   rowKind,
 } from "../index.js";
+import { makeTempWorkspace, removeTempWorkspace } from "../test-support.js";
 import { runMigrations } from "../migrations.js";
 import type { Database } from "../engine.js";
 
@@ -29,7 +27,7 @@ let dbPath: string;
 const WORKFLOW_ID = "2026-04-29-feat-test";
 
 async function freshDb(): Promise<Database> {
-  tmpDir = mkdtempSync(join(tmpdir(), "ocr-agent-sessions-test-"));
+  tmpDir = makeTempWorkspace("ocr-agent-sessions-test-");
   dbPath = join(tmpDir, "test.db");
   const conn = await openDatabase(dbPath);
   runMigrations(conn);
@@ -47,8 +45,7 @@ beforeEach(async () => {
 });
 
 afterEach(() => {
-  closeAllDatabases();
-  rmSync(tmpDir, { recursive: true, force: true });
+  removeTempWorkspace(tmpDir);
 });
 
 describe("agent_sessions journal", () => {

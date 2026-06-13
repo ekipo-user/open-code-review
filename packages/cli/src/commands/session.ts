@@ -30,6 +30,7 @@ import {
   setAgentSessionStatus,
   setAgentSessionVendorId,
   sweepStaleAgentSessions,
+  SAFE_VENDOR_SESSION_ID,
 } from "../lib/db/index.js";
 import { getAgentHeartbeatSeconds } from "../lib/runtime-config.js";
 import { resolveActiveSession } from "../lib/state/index.js";
@@ -125,12 +126,29 @@ const startInstanceSubcommand = new Command("start-instance")
   );
 
 // ── bind-vendor-id ──
+//
+// The argv-safety syntax class for vendor session ids (issue #43) is
+// SAFE_VENDOR_SESSION_ID, imported from the db layer so this parse-boundary
+// check and the dashboard's stream-boundary check (capture service) share one
+// definition. A bound id is STICKY (rebinding is refused) and later becomes
+// spawn argv (`--session <id>`), so a garbage bind both poisons resume and
+// rides into a child process invocation. The class covers every real shape
+// (Claude Code UUIDs, OpenCode `ses_…`) and is deliberately NOT per-vendor
+// grammar — vendors drift id formats silently and the caller is an AI
+// orchestrator mid-workflow where a false rejection fails the review.
 
 const bindVendorIdSubcommand = new Command("bind-vendor-id")
   .description("Bind the underlying CLI's session id to an OCR agent session")
   .argument("<agent-session-id>", "OCR agent session id")
   .argument("<vendor-session-id>", "Underlying CLI's session id")
   .action(async (agentId: string, vendorId: string) => {
+    if (!SAFE_VENDOR_SESSION_ID.test(vendorId)) {
+      fail(
+        `vendor-session-id ${JSON.stringify(vendorId)} is not a plausible vendor session id ` +
+          "(allowed: letters and digits plus . _ : - , max 256 chars). " +
+          "Nothing was bound — retry with the id the vendor CLI actually emitted.",
+      );
+    }
     const { ocrDir } = await setup();
     const db = await ensureDatabase(ocrDir);
 

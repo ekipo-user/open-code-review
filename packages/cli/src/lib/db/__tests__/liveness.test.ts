@@ -1,5 +1,5 @@
 import { spawn } from "node:child_process";
-import { describe, it, expect } from "vitest";
+import { describe, it, expect, vi } from "vitest";
 import { defaultIsAlive, sqliteUtcMs } from "../liveness.js";
 
 describe("sqliteUtcMs", () => {
@@ -41,9 +41,22 @@ describe("defaultIsAlive", () => {
     expect(defaultIsAlive(pid)).toBe(false);
   });
 
-  it("treats a non-ESRCH failure (e.g. pid 1 / EPERM) as alive, never dead", () => {
-    // pid 1 (init/launchd) exists but isn't ours to signal → EPERM on most
-    // platforms. The contract: only ESRCH means dead; EPERM means alive.
-    expect(defaultIsAlive(1)).toBe(true);
+  it("treats a non-ESRCH failure (EPERM) as alive, never dead", () => {
+    // The contract: only ESRCH means dead; EPERM (exists but not ours to
+    // signal) means alive. Simulated via a process.kill spy — the previous
+    // fixture probed pid 1, which exists on POSIX but not on Windows (where
+    // kill(1, 0) throws ESRCH and the test asserted the wrong branch), and
+    // was vacuous anyway wherever the runner may signal pid 1. The errno
+    // classification itself lives in the shared platform classifier
+    // (killErrorMeansDead), pinned by platform unit tests; this pins the
+    // CLI wiring.
+    const spy = vi.spyOn(process, "kill").mockImplementation(() => {
+      throw Object.assign(new Error("kill EPERM"), { code: "EPERM" });
+    });
+    try {
+      expect(defaultIsAlive(424242)).toBe(true);
+    } finally {
+      spy.mockRestore();
+    }
   });
 });

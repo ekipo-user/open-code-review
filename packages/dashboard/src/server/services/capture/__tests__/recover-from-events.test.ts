@@ -7,8 +7,7 @@
  * (Khorikov classical school — real fs + real node:sqlite DB).
  */
 import { afterEach, beforeEach, describe, expect, it } from 'vitest'
-import { mkdtempSync, mkdirSync, rmSync, writeFileSync } from 'node:fs'
-import { tmpdir } from 'node:os'
+import { mkdirSync, writeFileSync } from 'node:fs'
 import { join, resolve } from 'node:path'
 import { insertSession } from '@open-code-review/cli/db'
 import { openDb } from '../../../db.js'
@@ -17,18 +16,21 @@ import {
   eventsDir,
 } from '../../event-journal.js'
 import { recoverFromEventsJsonl } from '../recover-from-events.js'
+import { makeTempWorkspace, removeTempWorkspace } from './temp-workspace.js'
 
 let workspace: string
 let ocrDir: string
 
 beforeEach(() => {
-  workspace = mkdtempSync(join(tmpdir(), 'recover-events-'))
+  workspace = makeTempWorkspace('recover-events-')
   ocrDir = join(workspace, '.ocr')
   mkdirSync(join(ocrDir, 'data'), { recursive: true })
 })
 
 afterEach(() => {
-  rmSync(workspace, { recursive: true, force: true })
+  // Closes the shared DB connection cache before removal — an open
+  // node:sqlite handle EBUSY-locks ocr.db on Windows (issue #41).
+  removeTempWorkspace(workspace)
 })
 
 function seedExecution(

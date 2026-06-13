@@ -11,7 +11,6 @@
  */
 
 import { Router } from 'express'
-import { spawnSync } from 'node:child_process'
 import {
   loadTeamConfig,
   resolveTeamComposition,
@@ -24,6 +23,8 @@ import {
   SUPPORTED_VENDORS,
   type ModelVendor,
 } from '@open-code-review/cli/models'
+import { execBinary, type ExecError } from '@open-code-review/platform'
+import { dirname } from 'node:path'
 
 function isReviewerInstanceArray(input: unknown): input is ReviewerInstance[] {
   if (!Array.isArray(input)) return false
@@ -84,36 +85,30 @@ export function createTeamRouter(ocrDir: string): Router {
 
     // Pipe the team JSON to `ocr team set --stdin`. We shell out (rather than
     // calling team-config functions directly) so the YAML round-trip happens
-    // in one canonical place.
+    // in one canonical place. execBinary (not a raw spawnSync): `ocr` is an
+    // npm .cmd shim on Windows, where a shell-less raw spawn ENOENTs — this
+    // route was broken there until issue #43's sweep. execBinary throws on
+    // any failure with status/stderr attached.
     try {
-      const result = spawnSync('ocr', ['team', 'set', '--stdin'], {
+      execBinary('ocr', ['team', 'set', '--stdin'], {
         input: JSON.stringify(body.team),
         encoding: 'utf-8',
-        cwd: ocrDir.replace(/\/\.ocr$/, ''),
+        // Run from the project root (parent of `.ocr`). `dirname` is
+        // separator-correct on every platform — a prior `/\/\.ocr$/` regex
+        // silently no-op'd on Windows (join builds the path with `\`), running
+        // `ocr team set` inside the `.ocr` dir itself (blocker B2). Matches the
+        // `dirname(ocrDir)` derivation used across the socket handlers.
+        cwd: dirname(ocrDir),
         timeout: 10000,
       })
-
-      if (result.error) {
-        res.status(500).json({
-          error: 'Failed to invoke ocr team set',
-          detail: result.error.message,
-        })
-        return
-      }
-      if (result.status !== 0) {
-        res.status(500).json({
-          error: 'ocr team set exited non-zero',
-          stderr: result.stderr,
-        })
-        return
-      }
-
       res.json({ ok: true, team: body.team })
     } catch (err) {
       console.error('Failed to persist team:', err)
+      const e = err as ExecError
       res.status(500).json({
         error: 'Failed to persist team',
         detail: err instanceof Error ? err.message : String(err),
+        ...(typeof e.stderr === 'string' && e.stderr ? { stderr: e.stderr } : {}),
       })
     }
   })

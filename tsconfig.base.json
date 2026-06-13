@@ -23,6 +23,7 @@
     "paths": {
       "@open-code-review/cli": ["packages/cli/src/index.ts"],
       "@open-code-review/cli/db": ["packages/cli/src/lib/db/index.ts"],
+      "@open-code-review/cli/test-support": ["packages/cli/src/lib/db/test-support.ts"],
       "@open-code-review/agents": ["packages/agents"],
       "@open-code-review/dashboard": ["packages/dashboard/src/server/index.ts"],
       "@open-code-review/platform": ["packages/shared/platform/src/index.ts"]

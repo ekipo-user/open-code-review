@@ -1,19 +1,17 @@
-import { mkdtempSync, rmSync } from "node:fs";
 import { join } from "node:path";
-import { tmpdir } from "node:os";
 import { describe, it, expect, beforeEach, afterEach } from "vitest";
 import {
   openDatabase,
-  closeAllDatabases,
   runMigrations,
   type Database,
 } from "../index.js";
+import { makeTempWorkspace, removeTempWorkspace } from "../test-support.js";
 
 let tmpDir: string;
 let db: Database;
 
 async function freshDb(): Promise<Database> {
-  tmpDir = mkdtempSync(join(tmpdir(), "ocr-v13-test-"));
+  tmpDir = makeTempWorkspace("ocr-v13-test-");
   const conn = await openDatabase(join(tmpDir, "ocr.db"));
   runMigrations(conn); // applies all migrations, including v13
   return conn;
@@ -38,8 +36,7 @@ beforeEach(async () => {
 });
 
 afterEach(() => {
-  closeAllDatabases();
-  rmSync(tmpDir, { recursive: true, force: true });
+  removeTempWorkspace(tmpDir);
 });
 
 describe("migration v13 — DROP COLUMN parent_id", () => {

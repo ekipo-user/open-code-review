@@ -1,14 +1,14 @@
 import { describe, it, expect, beforeEach, afterEach } from 'vitest'
-import { mkdirSync, writeFileSync, rmSync } from 'node:fs'
+import { mkdirSync, writeFileSync } from 'node:fs'
 import { join } from 'node:path'
 import { tmpdir } from 'node:os'
 import { randomUUID } from 'node:crypto'
 import {
   openDatabase,
-  closeAllDatabases,
   runMigrations,
   type Database,
 } from '@open-code-review/cli/db'
+import { removeTempWorkspace } from '@open-code-review/cli/test-support'
 import { FilesystemSync } from '../filesystem-sync.js'
 
 let db: Database
@@ -47,8 +47,7 @@ beforeEach(async () => {
 })
 
 afterEach(() => {
-  closeAllDatabases()
-  rmSync(tmpDir, { recursive: true, force: true })
+  removeTempWorkspace(tmpDir)
 })
 
 describe('FilesystemSync', () => {
