@@ -73,6 +73,9 @@ importers:
       commander:
         specifier: ^13.0.0
         version: 13.1.0
+      cross-spawn:
+        specifier: ^7.0.6
+        version: 7.0.6
       log-update:
         specifier: ^7.0.2
         version: 7.0.2
@@ -110,6 +113,9 @@ importers:
       clsx:
         specifier: ^2.1.1
         version: 2.1.1
+      cross-spawn:
+        specifier: ^7.0.6
+        version: 7.0.6
       express:
         specifier: ^4
         version: 4.22.1

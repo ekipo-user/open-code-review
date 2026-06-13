@@ -9,7 +9,7 @@
     "dev:server": "tsx watch src/server/index.ts",
     "build": "pnpm build:client && pnpm build:server",
     "build:client": "vite build",
-    "build:server": "esbuild src/server/index.ts --bundle --platform=node --format=esm --outfile=dist/server.js --conditions=source --external:chokidar --external:socket.io --banner:js=\"import { createRequire as _cjsReq } from 'module'; const require = _cjsReq(import.meta.url);\"",
+    "build:server": "esbuild src/server/index.ts --bundle --platform=node --format=esm --outfile=dist/server.js --conditions=source --external:chokidar --external:socket.io --external:cross-spawn --banner:js=\"import { createRequire as _cjsReq } from 'module'; const require = _cjsReq(import.meta.url);\"",
     "preview": "node dist/server.js",
     "test": "vitest run"
   },
@@ -18,6 +18,7 @@
     "chokidar": "^4",
     "class-variance-authority": "^0.7.1",
     "clsx": "^2.1.1",
+    "cross-spawn": "^7.0.6",
     "express": "^4",
     "lucide-react": "^0.577.0",
     "mermaid": "^11.12.3",
