@@ -1,19 +1,18 @@
 import { describe, it, expect, vi, beforeEach, afterEach } from "vitest";
-import { mkdtempSync, mkdirSync, rmSync, existsSync } from "node:fs";
+import { mkdirSync, existsSync } from "node:fs";
 import { join } from "node:path";
-import { tmpdir } from "node:os";
 import { dashboardCommand, resolveServerPath } from "../dashboard.js";
 import { closeAllDatabases } from "../../lib/db/index.js";
+import { makeTempWorkspace, removeTempWorkspace } from "../../lib/db/test-support.js";
 
 let tmpDir: string;
 
 beforeEach(() => {
-  tmpDir = mkdtempSync(join(tmpdir(), "ocr-dashboard-test-"));
+  tmpDir = makeTempWorkspace("ocr-dashboard-test-");
 });
 
 afterEach(() => {
-  closeAllDatabases();
-  rmSync(tmpDir, { recursive: true, force: true });
+  removeTempWorkspace(tmpDir);
   vi.restoreAllMocks();
 });
 

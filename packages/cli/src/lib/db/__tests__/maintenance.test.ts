@@ -1,11 +1,9 @@
-import { mkdtempSync, rmSync, writeFileSync, utimesSync, existsSync } from "node:fs";
+import { writeFileSync, utimesSync, existsSync } from "node:fs";
 import { join } from "node:path";
-import { tmpdir } from "node:os";
 import { describe, it, expect, beforeEach, afterEach } from "vitest";
 import { mkdirSync } from "node:fs";
 import {
   openDatabase,
-  closeAllDatabases,
   runMigrations,
   insertEvent,
   collectDbHealth,
@@ -18,6 +16,7 @@ import {
   withForeignKeysDisabled,
   type Database,
 } from "../index.js";
+import { makeTempWorkspace, removeTempWorkspace } from "../test-support.js";
 
 let tmpDir: string;
 let dataDir: string;
@@ -25,7 +24,7 @@ let dbPath: string;
 let db: Database;
 
 beforeEach(async () => {
-  tmpDir = mkdtempSync(join(tmpdir(), "ocr-maint-test-"));
+  tmpDir = makeTempWorkspace("ocr-maint-test-");
   dataDir = tmpDir; // dbPath's dirname — where temp/backup files live
   dbPath = join(dataDir, "ocr.db");
   db = await openDatabase(dbPath);
@@ -33,8 +32,7 @@ beforeEach(async () => {
 });
 
 afterEach(() => {
-  closeAllDatabases();
-  if (tmpDir) rmSync(tmpDir, { recursive: true, force: true });
+  if (tmpDir) removeTempWorkspace(tmpDir);
 });
 
 function count(sql: string): number {

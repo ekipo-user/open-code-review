@@ -19,6 +19,12 @@
       "import": "./dist/lib/db/index.js",
       "default": "./dist/lib/db/index.js"
     },
+    "./test-support": {
+      "types": "./src/lib/db/test-support.ts",
+      "source": "./src/lib/db/test-support.ts",
+      "import": "./dist/lib/db/test-support.js",
+      "default": "./dist/lib/db/test-support.js"
+    },
     "./runtime-config": {
       "types": "./src/lib/runtime-config.ts",
       "source": "./src/lib/runtime-config.ts",

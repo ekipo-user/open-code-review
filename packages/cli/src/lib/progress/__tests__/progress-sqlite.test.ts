@@ -5,11 +5,11 @@
  * and handle the waiting state correctly.
  */
 
-import { mkdtempSync, mkdirSync, rmSync } from "node:fs";
+import { mkdirSync } from "node:fs";
 import { join } from "node:path";
-import { tmpdir } from "node:os";
 import { describe, it, expect, beforeEach, afterEach } from "vitest";
-import { closeAllDatabases, openDatabase } from "../../db/index.js";
+import { openDatabase } from "../../db/index.js";
+import { makeTempWorkspace, removeTempWorkspace } from "../../db/test-support.js";
 import {
   stateInit,
   stateTransition,
@@ -26,7 +26,7 @@ let ocrDir: string;
 let sessionsDir: string;
 
 beforeEach(() => {
-  tmpDir = mkdtempSync(join(tmpdir(), "ocr-progress-test-"));
+  tmpDir = makeTempWorkspace("ocr-progress-test-");
   ocrDir = join(tmpDir, ".ocr");
   sessionsDir = join(ocrDir, "sessions");
   // Reset progress DB cache
@@ -35,8 +35,7 @@ beforeEach(() => {
 
 afterEach(() => {
   setProgressDb(null);
-  closeAllDatabases();
-  rmSync(tmpDir, { recursive: true, force: true });
+  removeTempWorkspace(tmpDir);
 });
 
 function createSessionDir(sessionId: string): string {

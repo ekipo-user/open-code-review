@@ -1,8 +1,8 @@
-import { mkdtempSync, rmSync, mkdirSync } from "node:fs";
+import { mkdirSync } from "node:fs";
 import { join } from "node:path";
-import { tmpdir } from "node:os";
 import { describe, it, expect, beforeEach, afterEach } from "vitest";
-import { closeAllDatabases, ensureDatabase } from "../../db/index.js";
+import { ensureDatabase } from "../../db/index.js";
+import { makeTempWorkspace, removeTempWorkspace } from "../../db/test-support.js";
 import {
   stateBegin,
   stateAdvance,
@@ -17,14 +17,13 @@ let tmpDir: string;
 let ocrDir: string;
 
 beforeEach(() => {
-  tmpDir = mkdtempSync(join(tmpdir(), "ocr-reconcile-exit-"));
+  tmpDir = makeTempWorkspace("ocr-reconcile-exit-");
   ocrDir = join(tmpDir, ".ocr");
   mkdirSync(join(ocrDir, "sessions"), { recursive: true });
 });
 
 afterEach(() => {
-  closeAllDatabases();
-  rmSync(tmpDir, { recursive: true, force: true });
+  removeTempWorkspace(tmpDir);
 });
 
 const META = JSON.stringify({ schema_version: 1, verdict: "APPROVE", reviewers: [] });

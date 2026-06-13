@@ -9,17 +9,15 @@
  */
 
 import { afterEach, beforeEach, describe, expect, it } from 'vitest'
-import { mkdtempSync, rmSync } from 'node:fs'
-import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import {
   openDatabase,
-  closeAllDatabases,
   runMigrations,
   insertSession,
   updateSession,
   type Database,
 } from '@open-code-review/cli/db'
+import { makeTempWorkspace, removeTempWorkspace } from '@open-code-review/cli/test-support'
 import type { Server as SocketIOServer } from 'socket.io'
 import { DbSyncWatcher } from '../db-sync-watcher.js'
 
@@ -44,7 +42,7 @@ let db: Database
 let emits: Emit[]
 
 beforeEach(async () => {
-  workspace = mkdtempSync(join(tmpdir(), 'ocr-watcher-'))
+  workspace = makeTempWorkspace('ocr-watcher-')
   dbPath = join(workspace, 'ocr.db')
   db = await openDatabase(dbPath)
   runMigrations(db)
@@ -52,8 +50,7 @@ beforeEach(async () => {
 })
 
 afterEach(() => {
-  closeAllDatabases()
-  rmSync(workspace, { recursive: true, force: true })
+  removeTempWorkspace(workspace)
 })
 
 describe('DbSyncWatcher change notification', () => {

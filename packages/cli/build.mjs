@@ -58,6 +58,12 @@ const libraryBundle = (entryPoint, outfile, externals = []) => ({
 })
 
 await build(libraryBundle('src/lib/db/index.ts', 'dist/lib/db/index.js'))
+// Test-only helper (`@open-code-review/cli/test-support`). Built into dist
+// because the dashboard's vitest externalizes workspace packages and resolves
+// `cli/*` subpaths through `exports` → dist (source aliases are provably dead
+// there; see dashboard/vitest.config.ts). It re-exports `closeAllDatabases`
+// from db/index, so it inherits the same cross-spawn externalization.
+await build(libraryBundle('src/lib/db/test-support.ts', 'dist/lib/db/test-support.js'))
 await build(libraryBundle('src/lib/runtime-config.ts', 'dist/lib/runtime-config.js'))
 // `yaml` is CommonJS-published, and inlining it via esbuild emits a
 // `require()` call that fails when the consuming dashboard server is
