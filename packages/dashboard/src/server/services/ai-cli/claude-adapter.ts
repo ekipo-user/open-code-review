@@ -18,7 +18,7 @@ import type {
   SpawnOptions,
   SpawnResult,
 } from './types.js'
-import { extractAssistantText, buildFileStdio, closeFileStdio, deliverPrompt } from './helpers.js'
+import { extractAssistantText, buildFileStdio, closeFileStdio, deliverPrompt, assertNonEmptyPrompt } from './helpers.js'
 import { cleanEnv } from '../../socket/env.js'
 import {
   buildResumeArgs as buildResumeArgsShared,
@@ -62,6 +62,10 @@ export class ClaudeCodeAdapter implements AiCliAdapter {
   }
 
   spawn(opts: SpawnOptions): SpawnResult {
+    // Reject an empty prompt before spawning — a workflow child is detached
+    // and unref'd, so a post-spawn rejection would orphan it (blocker B1).
+    assertNonEmptyPrompt(opts.prompt)
+
     const isWorkflow = opts.mode === 'workflow'
     // Workflow turn budget needs to cover the whole 8-phase orchestration
     // plus per-reviewer fan-out. A 6-reviewer round measured at roughly

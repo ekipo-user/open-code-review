@@ -37,6 +37,23 @@ export function buildFileStdio(
 }
 
 /**
+ * Pre-spawn guard: reject an empty prompt BEFORE any process is created.
+ *
+ * OpenCode errors on an empty message and a missing prompt is always a caller
+ * bug, but the load-bearing reason this runs *before* `spawnBinary` is that a
+ * workflow spawn is `detached` + `unref`'d: if validation waited until
+ * {@link deliverPrompt} (which runs after the spawn) the child would already be
+ * a live, untracked, orphaned process by the time we threw. Call this at the
+ * top of every adapter `spawn()` so an empty prompt never reaches the OS
+ * (issue #43 review, blocker B1).
+ */
+export function assertNonEmptyPrompt(prompt: string): void {
+  if (prompt.length === 0) {
+    throw new Error('refusing to spawn with an empty prompt')
+  }
+}
+
+/**
  * Deliver the prompt to a freshly spawned vendor child over stdin.
  *
  * An `error` handler is attached BEFORE writing: if the child dies before
@@ -46,13 +63,14 @@ export function buildFileStdio(
  * detected and reported by the existing close/result/watchdog machinery,
  * not by the prompt writer.
  *
- * Rejects empty prompts loudly — OpenCode errors on an empty message, and a
- * missing prompt is a caller bug better caught at spawn time than
- * mid-workflow.
+ * The empty-prompt check is kept here as cheap defense-in-depth, but the
+ * authoritative gate is {@link assertNonEmptyPrompt}, called before the spawn —
+ * by the time we reach here the (detached) child already exists, so throwing
+ * now would orphan it.
  */
 export function deliverPrompt(proc: ChildProcess, prompt: string): void {
   if (prompt.length === 0) {
-    throw new Error('deliverPrompt: refusing to spawn with an empty prompt')
+    throw new Error('deliverPrompt: refusing to write an empty prompt')
   }
   proc.stdin?.on('error', () => {
     /* EPIPE etc. — the close/watchdog path owns failure reporting */

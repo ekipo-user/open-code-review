@@ -15,7 +15,7 @@
  */
 
 import { execBinary, spawnBinary } from '@open-code-review/platform'
-import { buildFileStdio, closeFileStdio, deliverPrompt } from './helpers.js'
+import { buildFileStdio, closeFileStdio, deliverPrompt, assertNonEmptyPrompt } from './helpers.js'
 import type {
   AiCliAdapter,
   DetectionResult,
@@ -73,6 +73,10 @@ export class OpenCodeAdapter implements AiCliAdapter {
   }
 
   spawn(opts: SpawnOptions): SpawnResult {
+    // Reject an empty prompt before spawning — a workflow child is detached
+    // and unref'd, so a post-spawn rejection would orphan it (blocker B1).
+    assertNonEmptyPrompt(opts.prompt)
+
     const isWorkflow = opts.mode === 'workflow'
 
     // OpenCode uses agent-based tool control instead of allowlists:

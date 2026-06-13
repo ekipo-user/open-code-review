@@ -166,11 +166,16 @@ describe.each([
     ).not.toThrow()
   })
 
-  it('refuses to spawn with an empty prompt', () => {
+  it('rejects an empty prompt BEFORE spawning — no child process is created (blocker B1)', () => {
     const child = fakeChild()
     spawnMock.mockReturnValue(child.proc)
-    expect(() => make().spawn({ prompt: '', cwd: '/tmp', mode: 'query' })).toThrow(
+    // The throw alone is not the contract: the old guard fired inside
+    // deliverPrompt, AFTER spawnBinary + unref, orphaning a detached child.
+    // The fix rejects before the spawn, so spawnBinary must never be called.
+    expect(() => make().spawn({ prompt: '', cwd: '/tmp', mode: 'workflow' })).toThrow(
       /empty prompt/,
     )
+    expect(spawnMock).not.toHaveBeenCalled()
+    expect(child.unref).not.toHaveBeenCalled()
   })
 })
