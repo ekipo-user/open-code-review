@@ -7,16 +7,26 @@
  * no imports from the state barrel.
  */
 
-import type {
-  RoundMeta,
-  RoundMetaFinding,
-} from "./types.js";
+import type { RoundMeta } from "./types.js";
 import { sanitizeMetadataString } from "./meta-util.js";
+import {
+  CANONICAL_VERDICTS,
+  isCanonicalVerdict,
+  deriveCounts,
+  resolveRoundCounts,
+} from "@open-code-review/platform";
 
 // ── Round-meta validation helpers ──
 
 const VALID_CATEGORIES = new Set(["blocker", "should_fix", "suggestion", "style"]);
 const VALID_SEVERITIES = new Set(["critical", "high", "medium", "low", "info"]);
+
+/**
+ * Minimum trimmed length for a finding title. Rejects degenerate titles (e.g.
+ * `"s"`) that pass a mere non-empty check but carry no information — the
+ * symptom that put `title='s'` rows in the dashboard.
+ */
+const MIN_TITLE_LEN = 8;
 
 export function validateRoundMeta(meta: unknown): RoundMeta {
   if (!meta || typeof meta !== "object") {
@@ -31,10 +41,20 @@ export function validateRoundMeta(meta: unknown): RoundMeta {
     );
   }
 
-  if (typeof obj.verdict !== "string" || obj.verdict.trim().length === 0) {
-    throw new Error("round-meta.json must contain a non-empty verdict string");
+  if (typeof obj.verdict !== "string") {
+    throw new Error("round-meta.json must contain a verdict string");
   }
-  obj.verdict = sanitizeMetadataString(obj.verdict);
+  // Strict on vocabulary, tolerant of surrounding whitespace. The verdict is the
+  // merge gate only — residual work (follow-ups, suggestions) is carried by
+  // finding category, never by a composite verdict. An off-vocabulary value
+  // (e.g. `accept_with_followups`) is rejected so the orchestrator self-corrects.
+  const verdict = sanitizeMetadataString(obj.verdict).trim();
+  if (!isCanonicalVerdict(verdict)) {
+    throw new Error(
+      `round-meta.json verdict "${verdict}" is not one of: ${CANONICAL_VERDICTS.join(", ")}`,
+    );
+  }
+  obj.verdict = verdict;
 
   if (!Array.isArray(obj.reviewers)) {
     throw new Error("round-meta.json must contain a reviewers array");
@@ -59,8 +79,10 @@ export function validateRoundMeta(meta: unknown): RoundMeta {
         throw new Error("Each finding must be an object");
       }
       const f = finding as Record<string, unknown>;
-      if (typeof f.title !== "string" || f.title.trim().length === 0) {
-        throw new Error("Each finding must have a non-empty title");
+      if (typeof f.title !== "string" || f.title.trim().length < MIN_TITLE_LEN) {
+        throw new Error(
+          `Each finding title must be at least ${MIN_TITLE_LEN} characters; got "${String(f.title)}"`,
+        );
       }
       f.title = sanitizeMetadataString(f.title);
       if (typeof f.category !== 'string' || !VALID_CATEGORIES.has(f.category)) {
@@ -107,6 +129,34 @@ export function validateRoundMeta(meta: unknown): RoundMeta {
     if (typeof sc.suggestions !== "number" || sc.suggestions < 0) {
       throw new Error("synthesis_counts.suggestions must be a non-negative number");
     }
+
+    // Directional cross-check: synthesis_counts are *deduplicated* totals, so a
+    // count may be <= the derived per-reviewer tally (cross-reviewer dedup) but
+    // can never EXCEED it — you cannot dedup to more than you started with. An
+    // inflated count is the "wrong counts" symptom; reject it.
+    //
+    // Derive-then-compare against the SINGLE shared derivation rule: tally the
+    // per-category counts once via the canonical `deriveCounts`, then assert the
+    // present synthesis counts don't exceed that tally. No second transcription
+    // of the derivation rule lives here (defect D3).
+    const allFindings = (obj.reviewers as Array<{ findings: Array<{ category: string }> }>)
+      .flatMap((reviewer) => reviewer.findings);
+    const derived = deriveCounts(allFindings);
+    if (sc.blockers > derived.blocker) {
+      throw new Error(
+        `synthesis_counts.blockers (${sc.blockers}) exceeds the ${derived.blocker} blocker finding(s) present`,
+      );
+    }
+    if (sc.should_fix > derived.should_fix) {
+      throw new Error(
+        `synthesis_counts.should_fix (${sc.should_fix}) exceeds the ${derived.should_fix} should_fix finding(s) present`,
+      );
+    }
+    if (sc.suggestions > derived.suggestion) {
+      throw new Error(
+        `synthesis_counts.suggestions (${sc.suggestions}) exceeds the ${derived.suggestion} suggestion finding(s) present`,
+      );
+    }
   }
 
   return meta as RoundMeta;
@@ -115,18 +165,17 @@ export function validateRoundMeta(meta: unknown): RoundMeta {
 /**
  * Compute counts for a RoundMeta.
  *
- * When `synthesis_counts` is present, those values are preferred because they
- * reflect the **deduplicated, post-synthesis** totals matching `final.md`.
- * The per-reviewer findings array can contain duplicates (the same issue
- * flagged by multiple reviewers), so derived counts may exceed the actual
- * number of unique items in the synthesis.
- *
- * `reviewerCount` and `totalFindingCount` are always derived from the data
- * (they aren't affected by deduplication).
+ * Delegates to the SINGLE shared `resolveRoundCounts` rule in
+ * `@open-code-review/platform` so the CLI writer and the dashboard reader cannot
+ * derive counts differently (defect D3). The rule: prefer the deduplicated
+ * `synthesis_counts` when present (they reflect the post-synthesis totals
+ * matching `final.md`); otherwise derive each per-category tally from
+ * `findings[].category`. `reviewerCount` and `totalFindingCount` are always
+ * derived from the data (deduplication does not change them).
  *
  * Note: `style` findings are intentionally included only in `totalFindingCount`
- * and do not have a separate named counter. The dashboard displays them as part
- * of the total but does not break them out in summary cards.
+ * and do not have a separate named counter — that omission is documented once at
+ * the shared helper, not re-decided here.
  */
 export function computeRoundCounts(meta: RoundMeta): {
   blockerCount: number;
@@ -135,19 +184,5 @@ export function computeRoundCounts(meta: RoundMeta): {
   reviewerCount: number;
   totalFindingCount: number;
 } {
-  const allFindings: RoundMetaFinding[] = [];
-  for (const reviewer of meta.reviewers) {
-    allFindings.push(...reviewer.findings);
-  }
-
-  // Prefer explicit synthesis counts (deduplicated) over derived counts
-  const sc = meta.synthesis_counts;
-
-  return {
-    blockerCount: sc ? sc.blockers : allFindings.filter((f) => f.category === "blocker").length,
-    shouldFixCount: sc ? sc.should_fix : allFindings.filter((f) => f.category === "should_fix").length,
-    suggestionCount: sc ? sc.suggestions : allFindings.filter((f) => f.category === "suggestion").length,
-    reviewerCount: meta.reviewers.length,
-    totalFindingCount: allFindings.length,
-  };
+  return resolveRoundCounts(meta);
 }

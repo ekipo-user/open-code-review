@@ -10,7 +10,7 @@
  * pure decision logic lives in `runtime-checks.ts`.
  */
 
-import { isSupportedNode, nodeVersionGuardMessage } from "./runtime-checks.js";
+import { isSupportedNode, nodeVersionGuardMessage } from "@open-code-review/persistence/runtime-checks";
 
 if (!isSupportedNode(process.versions.node)) {
   process.stderr.write(nodeVersionGuardMessage(process.versions.node));

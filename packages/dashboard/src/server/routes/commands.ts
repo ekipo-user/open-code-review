@@ -3,7 +3,7 @@
  */
 
 import { Router } from 'express'
-import type { Database } from '@open-code-review/cli/db'
+import type { Database } from '@open-code-review/persistence'
 import { getCommandHistory } from '../db.js'
 import { getActiveCommands } from '../socket/command-runner.js'
 import { readEventJournal } from '../services/event-journal.js'

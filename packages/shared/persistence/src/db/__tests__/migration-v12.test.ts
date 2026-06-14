@@ -208,6 +208,8 @@ describe("migration v12 — pre-upgrade snapshot", () => {
       session_dir: ".ocr/sessions/keep",
     });
     conn.run("DELETE FROM schema_version WHERE version >= 12");
+    // Not teardown — simulating a process restart so the re-open re-runs
+    // migrations. Intentional mid-test drain, not a stray SF3 leftover.
     closeAllDatabases();
 
     // Re-open: getSchemaVersion now reports 11 → snapshot fires.
@@ -257,6 +259,8 @@ describe("migration v12 — one-time upgrade notice", () => {
       const ocrDir = join(tmpDir, "legacy", ".ocr");
       const conn = await ensureDatabase(ocrDir);
       conn.run("DELETE FROM schema_version WHERE version >= 12");
+      // Not teardown — simulating a process restart so the next ensureDatabase
+      // sees version 11 and emits the upgrade notice. Intentional mid-test drain.
       closeAllDatabases();
       errSpy.mockClear();
 

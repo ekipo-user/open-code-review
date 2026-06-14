@@ -13,7 +13,7 @@ import { writeFileSync, renameSync } from "node:fs";
 import { join } from "node:path";
 import { requireOcrSetup } from "../lib/guards.js";
 import { generateReviewersMeta } from "../lib/installer.js";
-import type { ReviewersMeta, ReviewerTier } from "../lib/state/types.js";
+import type { ReviewersMeta, ReviewerTier } from "@open-code-review/persistence/state";
 import { defaultIconFor } from "@open-code-review/platform";
 
 // ── Helpers ──

@@ -94,7 +94,7 @@ async function initProgressDb(ocrDir: string): Promise<void> {
   }
 
   try {
-    const { openDatabase } = await import("../lib/db/index.js");
+    const { openDatabase } = await import("@open-code-review/persistence");
     const db = await openDatabase(dbPath);
     setProgressDb(db);
   } catch {

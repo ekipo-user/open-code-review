@@ -5,7 +5,7 @@
 // ── Session types ──
 
 // Import for local use in this file's type aliases AND re-export so existing
-// `@open-code-review/cli/db` consumers keep importing them from here. A bare
+// `@open-code-review/persistence` consumers keep importing them from here. A bare
 // `export type { … } from` re-exports without binding the names locally, so
 // the references below (`status: SessionStatus`, …) would not resolve.
 import type { WorkflowType, SessionStatus } from "../state/types.js";

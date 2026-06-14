@@ -31,10 +31,10 @@ import {
   setAgentSessionVendorId,
   sweepStaleAgentSessions,
   SAFE_VENDOR_SESSION_ID,
-} from "../lib/db/index.js";
-import { getAgentHeartbeatSeconds } from "../lib/runtime-config.js";
-import { resolveActiveSession } from "../lib/state/index.js";
-import type { AgentSessionStatus, AgentVendor } from "../lib/state/types.js";
+} from "@open-code-review/persistence";
+import { getAgentHeartbeatSeconds } from "@open-code-review/config/runtime-config";
+import { resolveActiveSession } from "@open-code-review/persistence/state";
+import type { AgentSessionStatus, AgentVendor } from "@open-code-review/persistence";
 
 // ── Helpers ──
 

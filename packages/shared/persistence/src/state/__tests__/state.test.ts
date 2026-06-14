@@ -1,4 +1,4 @@
-import { mkdirSync, existsSync, readFileSync } from "node:fs";
+import { mkdirSync, existsSync, readFileSync, rmSync } from "node:fs";
 import { join } from "node:path";
 import { describe, it, expect, beforeEach, afterEach } from "vitest";
 import { writeFileSync } from "node:fs";
@@ -1087,7 +1087,44 @@ describe("validateRoundMeta", () => {
   it("throws on missing verdict", () => {
     expect(() =>
       validateRoundMeta({ schema_version: 1, reviewers: [] }),
-    ).toThrow("non-empty verdict");
+    ).toThrow("must contain a verdict string");
+  });
+
+  it("throws on an off-vocabulary verdict (the accept_with_followups bug)", () => {
+    expect(() =>
+      validateRoundMeta({
+        schema_version: 1,
+        verdict: "accept_with_followups",
+        reviewers: [],
+      }),
+    ).toThrow(/is not one of: APPROVE, REQUEST CHANGES, NEEDS DISCUSSION/);
+  });
+
+  it("accepts a canonical verdict modulo surrounding whitespace", () => {
+    const meta = validateRoundMeta({
+      schema_version: 1,
+      verdict: "  APPROVE  ",
+      reviewers: [],
+    });
+    expect(meta.verdict).toBe("APPROVE");
+  });
+
+  it("throws on a degenerate (too-short) finding title", () => {
+    expect(() =>
+      validateRoundMeta({
+        schema_version: 1,
+        verdict: "APPROVE",
+        reviewers: [
+          {
+            type: "principal",
+            instance: 1,
+            findings: [
+              { title: "s", category: "blocker", severity: "high", summary: "x" },
+            ],
+          },
+        ],
+      }),
+    ).toThrow(/at least 8 characters/);
   });
 
   it("throws when reviewers is not an array", () => {
@@ -1106,7 +1143,7 @@ describe("validateRoundMeta", () => {
             type: "principal",
             instance: 1,
             findings: [
-              { title: "Bad", category: "critical_issue", severity: "high", summary: "x" },
+              { title: "Bad category here", category: "critical_issue", severity: "high", summary: "x" },
             ],
           },
         ],
@@ -1124,7 +1161,7 @@ describe("validateRoundMeta", () => {
             type: "principal",
             instance: 1,
             findings: [
-              { title: "Bad", category: "blocker", severity: "nuclear", summary: "x" },
+              { title: "Bad severity here", category: "blocker", severity: "nuclear", summary: "x" },
             ],
           },
         ],
@@ -1144,6 +1181,24 @@ describe("validateRoundMeta", () => {
 
   it("accepts a well-formed round-meta and returns it", () => {
     const meta = makeRoundMeta();
+    expect(validateRoundMeta(meta)).toBe(meta);
+  });
+
+  it("throws when a synthesis_count exceeds its derived category tally (inflated)", () => {
+    // makeRoundMeta has 1 blocker finding; claiming 2 is impossible (you cannot
+    // dedup up to more than you started with) — the "wrong counts" symptom.
+    expect(() =>
+      validateRoundMeta(
+        makeRoundMeta({ synthesis_counts: { blockers: 2, should_fix: 0, suggestions: 0 } }),
+      ),
+    ).toThrow(/synthesis_counts.blockers \(2\) exceeds the 1 blocker finding/);
+  });
+
+  it("allows a synthesis_count <= the derived tally (legitimate cross-reviewer dedup)", () => {
+    // 2 should_fix findings present; a deduplicated count of 1 is legal.
+    const meta = makeRoundMeta({
+      synthesis_counts: { blockers: 1, should_fix: 1, suggestions: 1 },
+    });
     expect(validateRoundMeta(meta)).toBe(meta);
   });
 });
@@ -1343,6 +1398,157 @@ describe("stateCompleteRound (atomic finalize)", () => {
   });
 });
 
+describe("stateCompleteRound — canonical verdict contract (exit 7)", () => {
+  // The accept_with_followups bug: the orchestrator wrote an off-vocabulary
+  // verdict that slipped past the old non-empty check and rendered as "?" in
+  // the dashboard. complete-round must now fail-fast with SCHEMA_INVALID
+  // (exit 7) so the orchestrator self-corrects and nothing is written.
+  it("rejects an off-vocabulary verdict with SCHEMA_INVALID", async () => {
+    await beginReviewAtSynthesis("verdict-offvocab");
+
+    await expect(
+      stateCompleteRound({
+        source: "stdin",
+        ocrDir,
+        data: JSON.stringify({
+          schema_version: 1,
+          verdict: "accept_with_followups",
+          reviewers: [],
+        }),
+        sessionId: "verdict-offvocab",
+      }),
+    ).rejects.toMatchObject({
+      code: STATE_EXIT.SCHEMA_INVALID,
+      message: expect.stringContaining("is not one of"),
+    });
+
+    // Nothing written: no round_completed event for the session.
+    const state = await stateShow(ocrDir, "verdict-offvocab");
+    expect(
+      state?.events.find((e) => e.event_type === "round_completed"),
+    ).toBeUndefined();
+  });
+
+  it("rejects a degenerate finding title with SCHEMA_INVALID", async () => {
+    await beginReviewAtSynthesis("title-degenerate");
+
+    await expect(
+      stateCompleteRound({
+        source: "stdin",
+        ocrDir,
+        data: JSON.stringify({
+          schema_version: 1,
+          verdict: "APPROVE",
+          reviewers: [
+            {
+              type: "principal",
+              instance: 1,
+              findings: [
+                { title: "s", category: "blocker", severity: "high", summary: "x" },
+              ],
+            },
+          ],
+        }),
+        sessionId: "title-degenerate",
+      }),
+    ).rejects.toMatchObject({
+      code: STATE_EXIT.SCHEMA_INVALID,
+      message: expect.stringContaining("at least 8 characters"),
+    });
+  });
+
+  it("rejects an inflated synthesis_count with SCHEMA_INVALID", async () => {
+    await beginReviewAtSynthesis("count-inflated");
+
+    await expect(
+      stateCompleteRound({
+        source: "stdin",
+        ocrDir,
+        // One blocker finding present, but synthesis claims two.
+        data: JSON.stringify({
+          schema_version: 1,
+          verdict: "REQUEST CHANGES",
+          synthesis_counts: { blockers: 2, should_fix: 0, suggestions: 0 },
+          reviewers: [
+            {
+              type: "principal",
+              instance: 1,
+              findings: [
+                { title: "Real blocker here", category: "blocker", severity: "high", summary: "x" },
+              ],
+            },
+          ],
+        }),
+        sessionId: "count-inflated",
+      }),
+    ).rejects.toMatchObject({
+      code: STATE_EXIT.SCHEMA_INVALID,
+      message: expect.stringContaining("exceeds"),
+    });
+  });
+
+  it("accepts a deduplicated (lower-than-derived) synthesis_count", async () => {
+    await beginReviewAtSynthesis("count-dedup");
+
+    // Two should_fix findings present (same issue from two reviewers); the
+    // deduplicated synthesis count of 1 is legitimate and must complete.
+    const result = await stateCompleteRound({
+      source: "stdin",
+      ocrDir,
+      data: JSON.stringify({
+        schema_version: 1,
+        verdict: "REQUEST CHANGES",
+        synthesis_counts: { blockers: 0, should_fix: 1, suggestions: 0 },
+        reviewers: [
+          {
+            type: "principal",
+            instance: 1,
+            findings: [
+              { title: "Duplicated finding", category: "should_fix", severity: "medium", summary: "x" },
+            ],
+          },
+          {
+            type: "quality",
+            instance: 1,
+            findings: [
+              { title: "Duplicated finding", category: "should_fix", severity: "medium", summary: "x" },
+            ],
+          },
+        ],
+      }),
+      sessionId: "count-dedup",
+    });
+
+    expect(result.sessionId).toBe("count-dedup");
+    const state = await stateShow(ocrDir, "count-dedup");
+    const rcEvent = state?.events.find((e) => e.event_type === "round_completed");
+    expect(rcEvent).toBeDefined();
+    // synthesis_counts is preferred over the derived (2) tally.
+    expect(JSON.parse(rcEvent!.metadata!).should_fix_count).toBe(1);
+  });
+
+  it("completes a round on the canonical happy path", async () => {
+    await beginReviewAtSynthesis("verdict-happy");
+
+    const result = await stateCompleteRound({
+      source: "stdin",
+      ocrDir,
+      data: JSON.stringify({
+        schema_version: 1,
+        verdict: "NEEDS DISCUSSION",
+        reviewers: [],
+      }),
+      sessionId: "verdict-happy",
+    });
+
+    expect(result.sessionId).toBe("verdict-happy");
+    const state = await stateShow(ocrDir, "verdict-happy");
+    const rcEvent = state?.events.find((e) => e.event_type === "round_completed");
+    expect(rcEvent).toBeDefined();
+    expect(JSON.parse(rcEvent!.metadata!).verdict).toBe("NEEDS DISCUSSION");
+  });
+});
+
 describe("stateCompleteRound with stdin", () => {
   it("accepts raw JSON data and creates round_completed event", async () => {
     await beginReviewAtSynthesis("stdin-basic");
@@ -1454,20 +1660,105 @@ describe("stateCompleteRound with stdin", () => {
     });
   });
 
-  it("file mode does not write round-meta.json", async () => {
-    const dir = await beginReviewAtSynthesis("file-no-write");
+  it("file mode materializes round-meta.json at the canonical round path (D2)", async () => {
+    // The artifact is the post-condition of a successful complete-round on BOTH
+    // sources. A --file payload staged outside the round dir is copied to the
+    // canonical path so the DB never reports `complete` without an on-disk artifact.
+    const dir = await beginReviewAtSynthesis("file-materializes");
 
     const meta = makeRoundMeta();
+    // Stage the payload OUTSIDE the canonical round dir (session root).
     const filePath = writeRoundMeta(dir, meta);
+    const canonicalPath = join(dir, "rounds", "round-1", "round-meta.json");
+    expect(existsSync(canonicalPath)).toBe(false);
 
     const result = await stateCompleteRound({
       source: "file",
       ocrDir,
       filePath,
-      sessionId: "file-no-write",
+      sessionId: "file-materializes",
     });
 
-    expect(result.metaPath).toBeUndefined();
+    expect(result.metaPath).toBe(canonicalPath);
+    expect(existsSync(canonicalPath)).toBe(true);
+    const written = JSON.parse(readFileSync(canonicalPath, "utf-8"));
+    expect(written.schema_version).toBe(1);
+    expect(written.verdict).toBe("REQUEST CHANGES");
+  });
+
+  it("re-running with the artifact present is a safe no-op (D2)", async () => {
+    const dir = await beginReviewAtSynthesis("file-rerun-noop");
+    const meta = makeRoundMeta();
+    const filePath = writeRoundMeta(dir, meta);
+
+    await stateCompleteRound({ source: "file", ocrDir, filePath, sessionId: "file-rerun-noop" });
+
+    const before = await stateShow(ocrDir, "file-rerun-noop");
+    const rcBefore = before!.events.filter((e) => e.event_type === "round_completed").length;
+    const phaseBefore = before!.session.current_phase;
+    const roundBefore = before!.session.current_round;
+
+    // Re-run: artifact already present → no duplicate event, no re-advance.
+    const result = await stateCompleteRound({
+      source: "file",
+      ocrDir,
+      filePath,
+      sessionId: "file-rerun-noop",
+    });
+    expect(result.metaPath).toBe(join(dir, "rounds", "round-1", "round-meta.json"));
+
+    const after = await stateShow(ocrDir, "file-rerun-noop");
+    expect(after!.events.filter((e) => e.event_type === "round_completed").length).toBe(rcBefore);
+    expect(after!.session.current_phase).toBe(phaseBefore);
+    expect(after!.session.current_round).toBe(roundBefore);
+  });
+
+  it("re-running with the artifact missing self-heals it without duplicating the event (D2)", async () => {
+    const dir = await beginReviewAtSynthesis("file-self-heal");
+    const meta = makeRoundMeta();
+    const filePath = writeRoundMeta(dir, meta);
+
+    await stateCompleteRound({ source: "file", ocrDir, filePath, sessionId: "file-self-heal" });
+    const canonicalPath = join(dir, "rounds", "round-1", "round-meta.json");
+    expect(existsSync(canonicalPath)).toBe(true);
+
+    // Simulate a lost artifact (e.g. crash between commit and write, or deletion).
+    rmSync(canonicalPath);
+    expect(existsSync(canonicalPath)).toBe(false);
+
+    const before = await stateShow(ocrDir, "file-self-heal");
+    const rcBefore = before!.events.filter((e) => e.event_type === "round_completed").length;
+    const roundBefore = before!.session.current_round;
+
+    const result = await stateCompleteRound({
+      source: "file",
+      ocrDir,
+      filePath,
+      sessionId: "file-self-heal",
+    });
+
+    // Re-materialized, no duplicate event, no re-advance.
+    expect(existsSync(canonicalPath)).toBe(true);
+    expect(result.metaPath).toBe(canonicalPath);
+    const after = await stateShow(ocrDir, "file-self-heal");
+    expect(after!.events.filter((e) => e.event_type === "round_completed").length).toBe(rcBefore);
+    expect(after!.session.current_round).toBe(roundBefore);
+  });
+
+  it("never commits the round_completed event while the artifact is absent (D2)", async () => {
+    // The artifact write precedes the DB transaction, so a session reported
+    // `complete` always has its on-disk artifact.
+    const dir = await beginReviewAtSynthesis("file-invariant");
+    const meta = makeRoundMeta();
+    const filePath = writeRoundMeta(dir, meta);
+
+    await stateCompleteRound({ source: "file", ocrDir, filePath, sessionId: "file-invariant" });
+
+    const state = await stateShow(ocrDir, "file-invariant");
+    const hasEvent = state!.events.some((e) => e.event_type === "round_completed");
+    const canonicalPath = join(dir, "rounds", "round-1", "round-meta.json");
+    expect(hasEvent).toBe(true);
+    expect(existsSync(canonicalPath)).toBe(true);
   });
 });
 
@@ -1731,19 +2022,52 @@ describe("stateCompleteMap with stdin", () => {
     });
   });
 
-  it("file mode does not write map-meta.json", async () => {
-    const dir = await beginMapAtSynthesis("map-file-no-write");
+  it("file mode materializes map-meta.json at the canonical run path (D2)", async () => {
+    const dir = await beginMapAtSynthesis("map-file-materializes");
 
     const meta = makeMapMeta();
+    // Stage the payload OUTSIDE the canonical run dir (session root).
     const filePath = writeMapMeta(dir, meta);
+    const canonicalPath = join(dir, "map", "runs", "run-1", "map-meta.json");
+    expect(existsSync(canonicalPath)).toBe(false);
 
     const result = await stateCompleteMap({
       source: "file",
       ocrDir,
       filePath,
-      sessionId: "map-file-no-write",
+      sessionId: "map-file-materializes",
     });
 
-    expect(result.metaPath).toBeUndefined();
+    expect(result.metaPath).toBe(canonicalPath);
+    expect(existsSync(canonicalPath)).toBe(true);
+    const written = JSON.parse(readFileSync(canonicalPath, "utf-8"));
+    expect(written.schema_version).toBe(1);
+    expect(written.sections).toHaveLength(2);
+  });
+
+  it("re-running with the artifact missing self-heals it without duplicating the event (D2)", async () => {
+    const dir = await beginMapAtSynthesis("map-self-heal");
+    const meta = makeMapMeta();
+    const filePath = writeMapMeta(dir, meta);
+
+    await stateCompleteMap({ source: "file", ocrDir, filePath, sessionId: "map-self-heal" });
+    const canonicalPath = join(dir, "map", "runs", "run-1", "map-meta.json");
+    rmSync(canonicalPath);
+    expect(existsSync(canonicalPath)).toBe(false);
+
+    const before = await stateShow(ocrDir, "map-self-heal");
+    const mcBefore = before!.events.filter((e) => e.event_type === "map_completed").length;
+
+    const result = await stateCompleteMap({
+      source: "file",
+      ocrDir,
+      filePath,
+      sessionId: "map-self-heal",
+    });
+
+    expect(existsSync(canonicalPath)).toBe(true);
+    expect(result.metaPath).toBe(canonicalPath);
+    const after = await stateShow(ocrDir, "map-self-heal");
+    expect(after!.events.filter((e) => e.event_type === "map_completed").length).toBe(mcBefore);
   });
 });

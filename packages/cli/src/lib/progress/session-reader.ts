@@ -6,8 +6,8 @@
  */
 
 import { basename } from "node:path";
-import type { Database } from "../db/engine.js";
-import { resultToRow } from "../db/result-mapper.js";
+import type { Database } from "@open-code-review/persistence";
+import { resultToRow } from "@open-code-review/persistence";
 import type { SessionStateData } from "./types.js";
 
 // Cached DB reference — set once during progress command startup

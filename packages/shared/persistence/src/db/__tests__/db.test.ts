@@ -284,6 +284,8 @@ describe("Event insertion and querying", () => {
 
 describe("ensureDatabase", () => {
   it("creates the data directory and database file", async () => {
+    // Not teardown — simulating a process restart before re-opening the DB.
+    // Keep: this is an intentional mid-test drain, not a stray SF3 leftover.
     closeAllDatabases();
     const ocrDir = join(tmpDir, "ocr-project", ".ocr");
     const ensuredDb = await ensureDatabase(ocrDir);

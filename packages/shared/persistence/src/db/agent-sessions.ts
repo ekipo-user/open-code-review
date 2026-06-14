@@ -236,8 +236,8 @@ export function listAgentSessionsForWorkflow(
  * and the terminal-handoff route.
  *
  * Resolution requires an explicit `workflow_id` link. The link is
- * established at write time by the CLI's `ocr state begin` reading the
- * dashboard spawn marker file (`.ocr/data/dashboard-active-spawn.json`)
+ * established at write time by the CLI's `ocr state begin` reading a
+ * dashboard spawn marker (`.ocr/data/dashboard-active-spawn/{uid}.json`)
  * and binding the dashboard parent execution to the freshly-created
  * workflow id. That marker is the durable handshake — if it's present
  * the link IS made, deterministically.

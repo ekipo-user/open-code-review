@@ -21,11 +21,11 @@ import {
   ensureDatabase,
   getLatestAgentSessionWithVendorId,
   getSession,
-} from "../lib/db/index.js";
+} from "@open-code-review/persistence";
 import {
   VENDOR_BINARIES,
   buildResumeArgs,
-} from "../lib/vendor-resume.js";
+} from "@open-code-review/persistence/vendor-resume";
 
 function fail(message: string): never {
   console.error(chalk.red(`Error: ${message}`));

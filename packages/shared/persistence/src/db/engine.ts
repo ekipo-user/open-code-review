@@ -13,7 +13,7 @@
  * The engine LOAD is self-guarding: it requires Node >= 22.5 (when `node:sqlite`
  * landed) and suppresses the experimental warning at the point it actually
  * loads `node:sqlite` — so every entry point (the `ocr` bin, the
- * `@open-code-review/cli/db` subpath, the bundled dashboard server) is covered
+ * `@open-code-review/persistence` subpath, the bundled dashboard server) is covered
  * by construction, not by who imported the bin's runtime-guard first.
  */
 
@@ -135,7 +135,7 @@ export type ExecResult = ExecResultRow[];
  *
  * Deliberately does NOT expose the underlying `node:sqlite` handle: keeping the
  * raw connection off the interface is what makes "engine.ts is the only seam"
- * an INVARIANT, not a convention — no consumer of `@open-code-review/cli/db`
+ * an INVARIANT, not a convention — no consumer of `@open-code-review/persistence`
  * (the dashboard, any third party) can reach past the adapter and couple to the
  * engine. The adapter still holds the raw handle internally.
  */

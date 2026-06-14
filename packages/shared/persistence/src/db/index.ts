@@ -152,7 +152,7 @@ export type { WorkflowType, SessionStatus } from "../state/types.js";
 
 // Canonical exit-code taxonomy, error class, and the negative process
 // sentinels — surfaced through the db barrel so the dashboard (which imports
-// from `@open-code-review/cli/db`) can branch on them without reaching into
+// from `@open-code-review/persistence`) can branch on them without reaching into
 // the state module's internals.
 export {
   STATE_EXIT,
@@ -168,7 +168,7 @@ export { runMigrations, MIGRATIONS } from "./migrations.js";
 export { resultToRows, resultToRow } from "./result-mapper.js";
 
 // `Database` carries no `raw` handle (see engine.ts) — the published
-// `@open-code-review/cli/db` contract cannot leak the node:sqlite type.
+// `@open-code-review/persistence` contract cannot leak the node:sqlite type.
 export type { Database, ExecResult, ExecResultRow, SqlValue, BindParams } from "./engine.js";
 export { probeEngine, isBusyError } from "./engine.js";
 export { reconcileLegacyState, hasInFlightDependents } from "./reconcile.js";

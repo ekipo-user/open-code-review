@@ -8,8 +8,8 @@
 
 import { Router } from 'express'
 import type { Server as SocketIOServer } from 'socket.io'
-import type { Database } from '@open-code-review/cli/db'
-import { listAgentSessionsForWorkflow } from '@open-code-review/cli/db'
+import type { Database } from '@open-code-review/persistence'
+import { listAgentSessionsForWorkflow } from '@open-code-review/persistence'
 
 /**
  * Pull-on-read notification hook. The route invokes this before each read so

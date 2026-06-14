@@ -4,7 +4,7 @@
 
 // Import for local use below AND re-export for existing consumers — a bare
 // `export type { … } from` re-exports without binding the names locally.
-import type { WorkflowType, SessionStatus } from "../state/types.js";
+import type { WorkflowType, SessionStatus } from "@open-code-review/persistence/state";
 export type { WorkflowType, SessionStatus };
 
 export type PhaseStatus = "pending" | "in_progress" | "complete";

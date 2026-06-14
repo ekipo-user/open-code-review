@@ -12,48 +12,6 @@
       "source": "./src/index.ts",
       "import": "./dist/index.js",
       "default": "./dist/index.js"
-    },
-    "./db": {
-      "types": "./src/lib/db/index.ts",
-      "source": "./src/lib/db/index.ts",
-      "import": "./dist/lib/db/index.js",
-      "default": "./dist/lib/db/index.js"
-    },
-    "./test-support": {
-      "types": "./src/lib/db/test-support.ts",
-      "source": "./src/lib/db/test-support.ts",
-      "import": "./dist/lib/db/test-support.js",
-      "default": "./dist/lib/db/test-support.js"
-    },
-    "./runtime-config": {
-      "types": "./src/lib/runtime-config.ts",
-      "source": "./src/lib/runtime-config.ts",
-      "import": "./dist/lib/runtime-config.js",
-      "default": "./dist/lib/runtime-config.js"
-    },
-    "./team-config": {
-      "types": "./src/lib/team-config.ts",
-      "source": "./src/lib/team-config.ts",
-      "import": "./dist/lib/team-config.js",
-      "default": "./dist/lib/team-config.js"
-    },
-    "./models": {
-      "types": "./src/lib/models.ts",
-      "source": "./src/lib/models.ts",
-      "import": "./dist/lib/models.js",
-      "default": "./dist/lib/models.js"
-    },
-    "./vendor-resume": {
-      "types": "./src/lib/vendor-resume.ts",
-      "source": "./src/lib/vendor-resume.ts",
-      "import": "./dist/lib/vendor-resume.js",
-      "default": "./dist/lib/vendor-resume.js"
-    },
-    "./state": {
-      "types": "./src/lib/state/index.ts",
-      "source": "./src/lib/state/index.ts",
-      "import": "./dist/lib/state/index.js",
-      "default": "./dist/lib/state/index.js"
     }
   },
   "files": [
@@ -93,6 +51,8 @@
     "access": "public"
   },
   "devDependencies": {
+    "@open-code-review/config": "workspace:*",
+    "@open-code-review/persistence": "workspace:*",
     "@open-code-review/platform": "workspace:*"
   }
 }

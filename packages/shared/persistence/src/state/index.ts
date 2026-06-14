@@ -97,6 +97,9 @@ export type {
   MapMetaSection,
   MapMetaFile,
   MapMetaDependency,
+  ReviewerTier,
+  ReviewerMeta,
+  ReviewersMeta,
 } from "./types.js";
 
 // Exit-code taxonomy, error class, and the negative process sentinels live in
@@ -874,22 +877,33 @@ export async function stateCompleteRound(
 
   const resolved = resolveSession(db, params.sessionId);
   const roundNumber = params.round ?? resolved.current_round;
-  const roundMetaPath = join(
-    resolved.session_dir,
-    "rounds",
-    `round-${roundNumber}`,
-    "round-meta.json",
-  );
+  const roundDir = join(resolved.session_dir, "rounds", `round-${roundNumber}`);
+  const roundMetaPath = join(roundDir, "round-meta.json");
+
+  // Materialize the validated metadata at the canonical round path. Writing the
+  // validated (normalized) `meta` makes this source-agnostic: a `--file` payload
+  // staged elsewhere is copied to the canonical path, and a `--file` that already
+  // IS the canonical path becomes a validated identity write. This is the
+  // post-condition that keeps the DB from ever reporting a round `complete` while
+  // its on-disk artifact is absent (defect D2).
+  const materializeArtifact = (): void => {
+    mkdirSync(roundDir, { recursive: true });
+    writeFileSync(roundMetaPath, JSON.stringify(meta, null, 2));
+  };
 
   // Idempotent: already finalized → no-op success. Return the stable
   // round-meta.json path so callers can't tell an idempotent retry apart
-  // from the first write by the absence of metaPath.
+  // from the first write by the absence of metaPath. If the terminal event is
+  // present but the on-disk artifact is missing (a crash between the DB commit
+  // and the write, or a deleted file), re-materialize it from the recorded
+  // metadata — WITHOUT appending a duplicate event or re-advancing the round.
   const already = db.exec(
     `SELECT 1 FROM orchestration_events
        WHERE session_id = ? AND event_type = 'round_completed' AND round = ? LIMIT 1`,
     [resolved.id, roundNumber],
   );
   if ((already[0]?.values.length ?? 0) > 0) {
+    if (!existsSync(roundMetaPath)) materializeArtifact();
     return { sessionId: resolved.id, round: roundNumber, metaPath: roundMetaPath, schema_version: 1 };
   }
 
@@ -904,7 +918,7 @@ export async function stateCompleteRound(
   }
 
   if (params.requireFinal) {
-    const finalPath = join(resolved.session_dir, "rounds", `round-${roundNumber}`, "final.md");
+    const finalPath = join(roundDir, "final.md");
     if (!existsSync(finalPath)) {
       throw new StateError(
         STATE_EXIT.INVARIANT_UNMET,
@@ -913,14 +927,11 @@ export async function stateCompleteRound(
     }
   }
 
-  // Write round-meta.json (stdin mode) before the DB transaction.
-  let metaPath: string | undefined;
-  if (params.source === "stdin") {
-    const roundDir = join(resolved.session_dir, "rounds", `round-${roundNumber}`);
-    mkdirSync(roundDir, { recursive: true });
-    metaPath = roundMetaPath;
-    writeFileSync(metaPath, JSON.stringify(meta, null, 2));
-  }
+  // Write round-meta.json before the DB transaction, for BOTH --stdin and --file.
+  // The write precedes the event/transition commit, so the terminal event can
+  // never be committed while the artifact is absent.
+  materializeArtifact();
+  const metaPath = roundMetaPath;
 
   db.transaction(() => {
     insertEvent(db, {
@@ -985,22 +996,29 @@ export async function stateCompleteMap(
 
   const resolved = resolveSession(db, params.sessionId);
   const mapRunNumber = params.mapRun ?? resolved.current_map_run;
-  const mapMetaPath = join(
-    resolved.session_dir,
-    "map",
-    "runs",
-    `run-${mapRunNumber}`,
-    "map-meta.json",
-  );
+  const runDir = join(resolved.session_dir, "map", "runs", `run-${mapRunNumber}`);
+  const mapMetaPath = join(runDir, "map-meta.json");
+
+  // Materialize the validated map metadata at the canonical run path. Like
+  // complete-round (defect D2), the artifact is the source-agnostic post-condition
+  // of a successful completion, so the DB can never report a map run `complete`
+  // while its on-disk `map-meta.json` is absent.
+  const materializeArtifact = (): void => {
+    mkdirSync(runDir, { recursive: true });
+    writeFileSync(mapMetaPath, JSON.stringify(meta, null, 2));
+  };
 
   // Idempotent: already finalized → no-op success. Return the stable
-  // map-meta.json path so an idempotent retry looks identical to the first.
+  // map-meta.json path so an idempotent retry looks identical to the first. If
+  // the terminal event is present but the artifact is missing, re-materialize it
+  // WITHOUT appending a duplicate event or re-transitioning.
   const already = db.exec(
     `SELECT 1 FROM orchestration_events
        WHERE session_id = ? AND event_type = 'map_completed' AND round = ? LIMIT 1`,
     [resolved.id, mapRunNumber],
   );
   if ((already[0]?.values.length ?? 0) > 0) {
+    if (!existsSync(mapMetaPath)) materializeArtifact();
     return { sessionId: resolved.id, mapRun: mapRunNumber, metaPath: mapMetaPath, schema_version: 1 };
   }
 
@@ -1011,13 +1029,10 @@ export async function stateCompleteMap(
     );
   }
 
-  let metaPath: string | undefined;
-  if (params.source === "stdin") {
-    const runDir = join(resolved.session_dir, "map", "runs", `run-${mapRunNumber}`);
-    mkdirSync(runDir, { recursive: true });
-    metaPath = mapMetaPath;
-    writeFileSync(metaPath, JSON.stringify(meta, null, 2));
-  }
+  // Write map-meta.json before the DB transaction, for BOTH --stdin and --file,
+  // so the terminal event is never committed while the artifact is absent.
+  materializeArtifact();
+  const metaPath = mapMetaPath;
 
   db.transaction(() => {
     insertEvent(db, {

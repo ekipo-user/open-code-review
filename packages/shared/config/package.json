@@ -1,0 +1,28 @@
+{
+  "name": "@open-code-review/config",
+  "version": "0.0.0",
+  "private": true,
+  "description": "Shared runtime/team/model configuration layer for Open Code Review (source-only, non-buildable)",
+  "type": "module",
+  "exports": {
+    "./models": {
+      "types": "./src/models.ts",
+      "source": "./src/models.ts",
+      "default": "./src/models.ts"
+    },
+    "./runtime-config": {
+      "types": "./src/runtime-config.ts",
+      "source": "./src/runtime-config.ts",
+      "default": "./src/runtime-config.ts"
+    },
+    "./team-config": {
+      "types": "./src/team-config.ts",
+      "source": "./src/team-config.ts",
+      "default": "./src/team-config.ts"
+    }
+  },
+  "dependencies": {
+    "@open-code-review/platform": "workspace:*",
+    "yaml": "^2.8.3"
+  }
+}

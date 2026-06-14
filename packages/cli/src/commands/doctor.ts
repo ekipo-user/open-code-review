@@ -9,7 +9,7 @@ import {
   printDepChecks,
   printCapabilities,
 } from "../lib/deps.js";
-import { probeEngine, probeWrite } from "../lib/db/index.js";
+import { probeEngine, probeWrite } from "@open-code-review/persistence";
 
 /**
  * Print the Storage Engine section and return whether the engine is healthy.

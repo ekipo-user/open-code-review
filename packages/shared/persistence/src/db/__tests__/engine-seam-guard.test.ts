@@ -18,13 +18,30 @@ import { dirname, join, relative, sep } from "node:path";
 import { fileURLToPath } from "node:url";
 
 const here = dirname(fileURLToPath(import.meta.url));
-// __tests__ → db → lib → src → cli → packages
-const cliSrc = dirname(dirname(dirname(here)));
-const packagesRoot = dirname(dirname(cliSrc));
-const dashboardSrc = join(packagesRoot, "dashboard", "src");
+// __tests__ → db → src → persistence → shared → packages
+const persistenceSrc = dirname(dirname(here));
+const packagesRoot = dirname(dirname(dirname(persistenceSrc)));
+
+// The engine now lives in the source-only `persistence` package; every app
+// (cli, dashboard) and shared library reaches SQLite through its `Database`
+// adapter. Scan all first-party source so the one-seam invariant holds across
+// the whole monorepo, not just one package.
+const scanRoots = [
+  persistenceSrc,
+  join(packagesRoot, "cli", "src"),
+  join(packagesRoot, "dashboard", "src"),
+  join(packagesRoot, "shared", "config", "src"),
+  join(packagesRoot, "shared", "platform", "src"),
+];
 
 /** The ONE file allowed to load node:sqlite (relative to packages/). */
-const NODE_SQLITE_OWNER = join("cli", "src", "lib", "db", "engine.ts");
+const NODE_SQLITE_OWNER = join(
+  "shared",
+  "persistence",
+  "src",
+  "db",
+  "engine.ts",
+);
 
 // Match IMPORT shapes only (not comments) — engine.ts keeps valuable historical
 // references to better-sqlite3 in its comments, and tests legitimately load
@@ -65,7 +82,7 @@ function collectTsFiles(dir: string): string[] {
   return out;
 }
 
-const files = [...collectTsFiles(cliSrc), ...collectTsFiles(dashboardSrc)];
+const files = scanRoots.flatMap((root) => collectTsFiles(root));
 
 describe("engine seam invariant", () => {
   it("finds source files to scan", () => {

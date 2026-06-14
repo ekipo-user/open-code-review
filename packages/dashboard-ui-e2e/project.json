@@ -7,10 +7,17 @@
   "targets": {
     "e2e": {
       "executor": "@nx/playwright:playwright",
-      "dependsOn": ["cli:build"],
+      "dependsOn": ["typecheck", "cli:build"],
       "outputs": ["{workspaceRoot}/dist/.playwright/{projectRoot}"],
       "options": {
         "config": "packages/dashboard-ui-e2e/playwright.config.ts"
+      }
+    },
+    "typecheck": {
+      "executor": "nx:run-commands",
+      "options": {
+        "command": "tsc -p tsconfig.typecheck.json",
+        "cwd": "{projectRoot}"
       }
     }
   }

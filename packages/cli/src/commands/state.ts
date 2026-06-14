@@ -20,7 +20,7 @@
 
 import { Command } from "commander";
 import chalk from "chalk";
-import { existsSync, mkdirSync, readFileSync } from "node:fs";
+import { existsSync, mkdirSync, readFileSync, readdirSync } from "node:fs";
 import { join } from "node:path";
 import { requireOcrSetup } from "../lib/guards.js";
 import {
@@ -35,15 +35,15 @@ import {
   resolveActiveSession,
   StateError,
   STATE_EXIT,
-} from "../lib/state/index.js";
-import type { WorkflowType } from "../lib/state/types.js";
-import { replayCommandLog } from "../lib/db/command-log.js";
-import { ensureDatabase, reconcileLegacyState } from "../lib/db/index.js";
+} from "@open-code-review/persistence/state";
+import type { WorkflowType } from "@open-code-review/persistence/state";
+import { replayCommandLog } from "@open-code-review/persistence";
+import { ensureDatabase, reconcileLegacyState } from "@open-code-review/persistence";
 import {
   getDb,
   isBusyError,
   linkDashboardInvocationToWorkflow,
-} from "../lib/db/index.js";
+} from "@open-code-review/persistence";
 
 // ── Helpers ──
 
@@ -63,8 +63,17 @@ type DashboardSpawnMarker = {
   started_at: string;
 };
 
-function readDashboardSpawnMarker(ocrDir: string): DashboardSpawnMarker | null {
-  const path = join(ocrDir, "data", "dashboard-active-spawn.json");
+/**
+ * Parse + liveness-check one marker file. Returns null on unreadable
+ * file, malformed JSON, missing fields, or a dead PID.
+ *
+ * Liveness check: a stale marker (dashboard crashed mid-spawn) must not
+ * be consumed. `process.kill(pid, 0)` throws ESRCH when the PID is gone —
+ * we treat that as "no live dashboard" and ignore the marker. This
+ * prevents a crashed dashboard's leftover marker from mis-linking a
+ * future CLI-only `state begin` invocation.
+ */
+function readMarkerFile(path: string): DashboardSpawnMarker | null {
   let raw: string;
   try {
     raw = readFileSync(path, "utf-8");
@@ -86,17 +95,55 @@ function readDashboardSpawnMarker(ocrDir: string): DashboardSpawnMarker | null {
     return null;
   }
   const marker = parsed as DashboardSpawnMarker;
-  // Liveness check: a stale marker (dashboard crashed mid-spawn) must
-  // not be consumed. `process.kill(pid, 0)` throws ESRCH when the PID
-  // is gone — we treat that as "no live dashboard" and ignore the
-  // marker. This prevents a crashed dashboard's leftover marker from
-  // mis-linking a future CLI-only `state begin` invocation.
   try {
     process.kill(marker.pid, 0);
   } catch {
     return null;
   }
   return marker;
+}
+
+/**
+ * Resolve the dashboard spawn marker for fallback linkage.
+ *
+ * Per-execution markers live in `data/dashboard-active-spawn/{uid}.json`
+ * (round-1 S25 — replaces the former single last-write-wins file). The
+ * fallback only makes sense when there is a SINGLE live spawn: if exactly
+ * one live marker exists, consume it; if several do, decline to guess
+ * (the concurrent-review case — the AI is expected to pass the explicit
+ * `--dashboard-uid` flag the spawn prompt mandates, so guessing here
+ * would risk a silent mislink). Falls back to the legacy single-file
+ * marker when the directory yields nothing (dashboard mid-upgrade).
+ *
+ * Exported for unit testing of the resolution policy (round-1 S25).
+ */
+export function readDashboardSpawnMarker(ocrDir: string): DashboardSpawnMarker | null {
+  const dir = join(ocrDir, "data", "dashboard-active-spawn");
+  let entries: string[] = [];
+  try {
+    entries = readdirSync(dir).filter((f) => f.endsWith(".json"));
+  } catch {
+    entries = [];
+  }
+  const live: DashboardSpawnMarker[] = [];
+  for (const entry of entries) {
+    const marker = readMarkerFile(join(dir, entry));
+    if (marker) live.push(marker);
+  }
+  if (live.length === 1) return live[0] ?? null;
+  if (live.length > 1) {
+    // Ambiguous: more than one concurrent spawn is live. Refuse to guess —
+    // an explicit `--dashboard-uid` flag is the unambiguous linkage path.
+    console.error(
+      chalk.gray(
+        `[state] ${live.length} concurrent dashboard spawns live; marker fallback is ambiguous — pass --dashboard-uid for linkage`,
+      ),
+    );
+    return null;
+  }
+  // No per-execution markers — fall back to the legacy single-file marker
+  // for compatibility with a dashboard that predates per-execution markers.
+  return readMarkerFile(join(ocrDir, "data", "dashboard-active-spawn.json"));
 }
 
 async function readStdin(): Promise<string> {

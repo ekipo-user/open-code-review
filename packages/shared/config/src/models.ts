@@ -17,7 +17,7 @@
  * vendor CLI accepts; listed models are convenience, never a gate.
  */
 
-import { execBinaryAsync } from "@open-code-review/platform";
+import { execBinaryAsync, type ExecError } from "@open-code-review/platform";
 
 export type ModelDescriptor = {
   id: string;
@@ -167,11 +167,10 @@ function describeProbeFailure(
   err: unknown,
 ): string {
   const command = `${vendor} ${args.join(" ")}`;
-  const e = err as {
-    code?: number | string;
-    killed?: boolean;
-    stderr?: string;
-  };
+  // The canonical narrowing of execBinaryAsync's rejection (spawn.ts names this
+  // consumer): cast to the shared ExecError rather than re-declaring the shape,
+  // so a future field (e.g. richer probe diagnostics) is picked up here for free.
+  const e = err as ExecError;
   if (e.code === "ENOENT") {
     return `\`${vendor}\` is not installed or not on PATH`;
   }
