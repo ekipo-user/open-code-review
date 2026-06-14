@@ -336,7 +336,7 @@ dashboard process accepts client connections, so that a stale or unbounded
 
 The engine is Node's built-in `node:sqlite` (WAL mode), so the dashboard issues
 the checkpoint **directly against its own connection** (`walCheckpointTruncate`
-in `packages/cli/src/lib/db/index.ts`) — no external `sqlite3` shellout is
+in `packages/shared/persistence/src/db/index.ts`) — no external `sqlite3` shellout is
 required.
 
 #### Scenario: Dashboard checkpoints the WAL at startup
