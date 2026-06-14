@@ -290,7 +290,7 @@ The dashboard SHALL support light, dark, and system-preference themes with an ae
 
 ### Requirement: CLI Command Execution
 
-The dashboard SHALL allow users to execute OCR CLI commands from the browser with real-time output streaming via Socket.IO, SHALL derive a command's reported outcome from the workflow's completeness rather than the process exit code alone, and SHALL mutate workflow lifecycle only by invoking the `ocr state` CLI (never by writing lifecycle tables directly).
+The dashboard SHALL allow users to execute OCR CLI commands from the browser with real-time output streaming via Socket.IO, SHALL derive a command's reported outcome from the workflow's completeness rather than the process exit code alone, and SHALL mutate workflow lifecycle only by invoking the `ocr state` CLI (never by writing lifecycle tables directly). The dashboard read/sync path SHALL NOT originate terminal workflow completion: the presence of a `final.md` artifact on disk is evidence of the **synthesis** phase only, and terminal completion SHALL be recognized solely from the CLI-produced evidence (a `round_completed` event together with a validated `round-meta.json`).
 
 #### Scenario: Run a CLI command
 
@@ -312,6 +312,22 @@ The dashboard SHALL allow users to execute OCR CLI commands from the browser wit
 - **THEN** it SHALL mutate lifecycle only through the CLI-published `commitReasonClose` helper (a single transactional reason-event-then-status commit) — or, equivalently, a child-process `ocr state` invocation
 - **AND** the dashboard SHALL NOT issue ad-hoc `INSERT INTO sessions`, `INSERT INTO orchestration_events`, or `UPDATE sessions SET status` outside that helper
 - **AND** the dashboard SHALL write directly only to its owned tables (process-supervision journal and UX state)
+
+#### Scenario: Final artifact alone does not constitute terminal completion
+
+- **GIVEN** a session directory whose latest round contains a `final.md` but no validated `round-meta.json` and no `round_completed` event
+- **WHEN** the dashboard's filesystem-sync reconciler processes it
+- **THEN** it SHALL derive the `synthesis` phase, not `complete`
+- **AND** it SHALL NOT backfill-close the session (SHALL NOT emit a `session_synced`-or-other reason-event close on the strength of `final.md` presence)
+- **AND** the `session_completeness` view SHALL NOT report the session `complete`
+- **AND** healing such a legacy round into a completed state SHALL be left to the CLI-side `ocr state reconcile` / migration path, which records its own reconciliation audit event
+
+#### Scenario: Discovered session with a terminal artifact event backfill-closes normally
+
+- **GIVEN** a session discovered on disk whose current round has a `round_completed` event and a validated `round-meta.json`
+- **WHEN** the reconciler backfill-closes it
+- **THEN** it SHALL close through the CLI-published `commitReasonClose` helper
+- **AND** the close SHALL satisfy the completion invariant via the terminal artifact event
 
 #### Scenario: Available commands
 
@@ -1561,4 +1577,114 @@ The dashboard periodically reclaims `command_executions` rows whose supervised p
 - **GIVEN** a supervisor died but the OS recycled its PID onto an unrelated live process within the 24h window
 - **WHEN** the sweep probes the PID and finds it alive
 - **THEN** the sweep SHALL decline to orphan the row (it cannot prove the original process is dead) — leaning toward leaving an alive-named row in-flight rather than risk a false terminal verdict; the row is reclaimed at the coarse session-level sweep
+
+### Requirement: Verdict Badge Renders the Merge Gate with a Subordinate Residual-Work Chip
+
+The round view SHALL render the verdict as a single headline badge representing
+the **merge gate** (`APPROVE` / `REQUEST CHANGES` / `NEEDS DISCUSSION`), with
+non-blocking residual work surfaced as a **subordinate chip derived at render
+time from the per-round counts** (`should_fix_count`, `suggestion_count`) — never
+stored in or inferred from the verdict string. The badge and the chip SHALL be
+visually distinct so the merge decision is not confused with the amount of
+leftover work. The three status axes — round **verdict** (the decision),
+round-level **triage** aggregate, and per-**finding** triage — SHALL each use a
+distinct visual treatment so they are not mistaken for one another.
+
+#### Scenario: Approve with residual work shows a chip, not a different verdict
+- **GIVEN** a round whose verdict is `APPROVE` with `should_fix_count = 2` and `suggestion_count = 3`
+- **WHEN** the round view renders
+- **THEN** a single `APPROVE` verdict badge SHALL be shown
+- **AND** a subordinate residual-work chip SHALL summarize the counts (e.g. "2 follow-ups · 3 suggestions"), with follow-ups visually weighted over suggestions
+- **AND** the residual work SHALL NOT alter or replace the `APPROVE` headline
+
+#### Scenario: Clean approve shows no residual chip
+- **GIVEN** a round whose verdict is `APPROVE` with zero should-fix and zero suggestion findings
+- **WHEN** the round view renders
+- **THEN** the `APPROVE` badge SHALL be shown with no residual-work chip (or an explicit "clean" affordance)
+
+#### Scenario: Status axes are visually separated
+- **WHEN** a round view shows the verdict, the round-level triage aggregate, and the per-finding triage in the findings table
+- **THEN** the verdict SHALL render as one bold headline badge, the round-level triage as a subordinate aggregate, and per-finding triage as per-row indicators
+- **AND** the three SHALL be distinguishable at a glance and not share an identical badge style
+
+### Requirement: Verdict Read-Time Normalization
+
+When ingesting orchestrator round metadata, the dashboard SHALL normalize the
+verdict through the shared `@open-code-review/platform` `normalizeVerdict`
+function before storing and before emitting socket updates, so legacy and
+aliased values map to a canonical state. A value that cannot be normalized SHALL
+be stored as-is and SHALL render via the neutral graceful-degradation fallback
+rather than as a raw, unstyled token.
+
+#### Scenario: Legacy composite verdict normalizes to a canonical state
+- **GIVEN** a `round-meta.json` whose `verdict` is a retired/aliased value such as `accept_with_followups`
+- **WHEN** FilesystemSync processes it
+- **THEN** the stored verdict SHALL be the canonical mapping (`APPROVE`)
+- **AND** the round's residual work SHALL continue to be conveyed by its finding counts
+
+#### Scenario: Unknown verdict degrades gracefully
+- **WHEN** a verdict value cannot be mapped to any canonical state or alias
+- **THEN** the raw value SHALL be stored and the badge SHALL render via the neutral fallback (no crash, no raw "?" as the sole content)
+
+### Requirement: Findings Table Has Loading, Empty, and Degraded States
+
+The findings table SHALL render explicit loading, empty, and degraded states
+instead of an indefinite blank region, and its severity sort SHALL be robust to
+unrecognized severity values (an unknown severity SHALL sort to a defined
+position rather than poisoning the comparison with `NaN`).
+
+#### Scenario: Loading state
+- **WHEN** a round's findings have not yet been loaded
+- **THEN** the table SHALL show a loading affordance rather than an empty region
+
+#### Scenario: Empty state
+- **WHEN** a round has zero findings
+- **THEN** the table SHALL show an explicit empty state (e.g. "No findings")
+
+#### Scenario: Unknown severity sorts deterministically
+- **GIVEN** a finding whose severity is not one of the recognized values
+- **WHEN** findings are sorted by severity
+- **THEN** the unknown-severity row SHALL sort to a defined position and the sort SHALL NOT throw or produce a `NaN`-driven nondeterministic order
+
+### Requirement: Full Process-Tree Reaping
+
+When the dashboard terminates a spawned workflow (cancel, watchdog, shutdown, or singleton takeover), it SHALL terminate the entire descendant process tree, robust to children that escaped the root's process group via `setsid()` (e.g. a leaked MCP daemon). Detached workflow processes SHALL be `unref`'d so a wedged child never holds the dashboard's event loop open, and finalization SHALL be driven by the vendor `result` event and the watchdog rather than stdio EOF.
+
+#### Scenario: Cancel reaps an escaped daemon
+
+- **GIVEN** a detached review whose child spawned a daemon in its own process group
+- **WHEN** the review is cancelled
+- **THEN** the dashboard SHALL reap the whole descendant tree (SIGTERM → grace → SIGKILL), including the escaped daemon
+
+### Requirement: Single Dashboard Instance
+
+The dashboard SHALL run as a single instance. On startup, if a prior OCR-dashboard process is alive (identified by its command line, not just a PID file), the new server SHALL reap that prior process's tree and take over, rather than warning and coexisting on an incremented port. A PID that is not positively identified as an OCR dashboard SHALL NOT be reaped.
+
+#### Scenario: Takeover of a prior live server
+
+- **GIVEN** a prior OCR-dashboard process is alive when a new one starts
+- **WHEN** the new server initializes
+- **THEN** it SHALL reap the prior server's process tree (clearing any review subtree it leaked) and claim the port
+
+#### Scenario: A recycled PID is not reaped
+
+- **GIVEN** the dashboard PID file points at a live process that is not an OCR dashboard
+- **THEN** the new server SHALL NOT reap it
+
+### Requirement: File-Stdio Process Isolation
+
+A detached workflow agent's stdout and stderr SHALL be redirected to a per-execution log file rather than OS pipes the dashboard holds. This removes the wedge at its root: a leaked grandchild that inherits the agent's file descriptors holds no pipe whose EOF the dashboard waits on, so `proc.on('close')` fires on the *direct* child's exit and finalization can never hang on stdio EOF. The dashboard SHALL stream the live output by tailing that log file through the same parser path used for pipe output, preserving multi-byte UTF-8 codepoints that straddle a read boundary, and SHALL drain the tail on close so no trailing output is lost. The tailer SHALL be released on every finalization path.
+
+#### Scenario: A leaked grandchild cannot hold the output open
+
+- **GIVEN** a detached workflow whose child spawned a daemon that inherits fd 1/2
+- **WHEN** the direct agent process exits
+- **THEN** the dashboard SHALL observe `close` and finalize, regardless of the still-living daemon
+
+#### Scenario: Tailed output matches pipe output
+
+- **GIVEN** a workflow streaming structured output (including non-ASCII) to its log file
+- **WHEN** the dashboard tails the file
+- **THEN** the parsed event stream SHALL be byte-equivalent to the pipe path, with no replacement characters at read boundaries
+- **AND** the final bytes written just before exit SHALL be drained and parsed
 
