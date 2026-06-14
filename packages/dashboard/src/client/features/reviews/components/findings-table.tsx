@@ -16,6 +16,17 @@ const SEVERITY_ORDER: Record<FindingSeverity, number> = {
   info: 4,
 }
 
+/**
+ * Rank a finding's severity for sorting. An unrecognized severity (a degraded
+ * row from a malformed or future-schema finding) sorts deterministically last
+ * instead of producing `NaN` — which would make the comparator return `NaN` and
+ * leave the table in an arbitrary, unstable order.
+ */
+const UNKNOWN_SEVERITY_RANK = Number.MAX_SAFE_INTEGER
+function severityRank(severity: string): number {
+  return SEVERITY_ORDER[severity as FindingSeverity] ?? UNKNOWN_SEVERITY_RANK
+}
+
 const SEVERITY_FILTER_OPTIONS: { value: FindingSeverity | 'all'; label: string }[] = [
   { value: 'all', label: 'All' },
   { value: 'critical', label: 'Critical' },
@@ -36,9 +47,12 @@ const TRIAGE_FILTER_OPTIONS: { value: FindingTriage | 'all'; label: string }[] =
 
 type FindingsTableProps = {
   findings: Finding[]
+  /** While the findings query is in flight, render a loading affordance instead
+   *  of an ambiguous "no findings" empty state. */
+  isLoading?: boolean
 }
 
-export function FindingsTable({ findings }: FindingsTableProps) {
+export function FindingsTable({ findings, isLoading = false }: FindingsTableProps) {
   const [sortField, setSortField] = useState<SortField>('severity')
   const [sortDir, setSortDir] = useState<SortDir>('asc')
   const [severityFilter, setSeverityFilter] = useState<FindingSeverity | 'all'>('all')
@@ -73,7 +87,7 @@ export function FindingsTable({ findings }: FindingsTableProps) {
     const multiplier = sortDir === 'asc' ? 1 : -1
     return [...filtered].sort((a, b) => {
       if (sortField === 'severity') {
-        return (SEVERITY_ORDER[a.severity] - SEVERITY_ORDER[b.severity]) * multiplier
+        return (severityRank(a.severity) - severityRank(b.severity)) * multiplier
       }
       if (sortField === 'title') {
         return a.title.localeCompare(b.title) * multiplier
@@ -85,8 +99,35 @@ export function FindingsTable({ findings }: FindingsTableProps) {
     })
   }, [filtered, sortField, sortDir])
 
+  // A finding whose severity isn't in the known vocabulary is a degraded row —
+  // surface it so an unrecognized severity reads as "sorted last" rather than a
+  // silent ordering glitch.
+  const degradedCount = useMemo(
+    () => findings.filter((f) => !(f.severity in SEVERITY_ORDER)).length,
+    [findings],
+  )
+
   function handleTriageChange(findingId: number, status: FindingTriage) {
     updateStatus.mutate({ findingId, status })
+  }
+
+  // Loading: the query is still in flight. Distinct from a genuinely empty round.
+  if (isLoading) {
+    return (
+      <p className="py-8 text-center text-sm text-zinc-500 dark:text-zinc-400">
+        Loading findings…
+      </p>
+    )
+  }
+
+  // Genuinely empty: the round completed with no findings recorded. This is a
+  // legitimate, often-good outcome (a clean APPROVE), not a filter mismatch.
+  if (findings.length === 0) {
+    return (
+      <p className="py-8 text-center text-sm text-zinc-500 dark:text-zinc-400">
+        No findings were recorded for this round.
+      </p>
+    )
   }
 
   return (
@@ -129,6 +170,13 @@ export function FindingsTable({ findings }: FindingsTableProps) {
           {sorted.length} of {findings.length} findings
         </span>
       </div>
+
+      {degradedCount > 0 && (
+        <p className="mb-3 rounded-md border border-amber-500/30 bg-amber-500/10 px-3 py-2 text-xs text-amber-700 dark:text-amber-400">
+          {degradedCount} finding{degradedCount === 1 ? '' : 's'} have an
+          unrecognized severity and are sorted last.
+        </p>
+      )}
 
       {sorted.length === 0 ? (
         <p className="py-8 text-center text-sm text-zinc-500 dark:text-zinc-400">

@@ -1,11 +1,13 @@
 import { CheckCircle2, XCircle, MessageCircle, HelpCircle } from 'lucide-react'
+import { normalizeVerdict, type CanonicalVerdict } from '@open-code-review/platform/verdict'
 import { cn } from '../../lib/utils'
 
 type VerdictBannerProps = {
-  /** Free-form verdict string from the parser. May be a known label
-   *  (`APPROVE`, `REQUEST CHANGES`, `NEEDS DISCUSSION`) or an unfamiliar
-   *  phrasing — the banner falls back to a neutral style for unknowns
-   *  rather than crashing. */
+  /** Free-form verdict string from the store. Normalized through the shared
+   *  {@link normalizeVerdict} to the canonical merge-gate vocabulary
+   *  (`APPROVE` / `REQUEST CHANGES` / `NEEDS DISCUSSION`); anything that cannot
+   *  be confidently mapped renders a neutral fallback rather than crashing or
+   *  inventing a gate. */
   verdict: string
   blockerCount?: number
   suggestionCount?: number
@@ -21,41 +23,26 @@ type VerdictConfig = {
   label: string
 }
 
-const VERDICT_CONFIG: Record<string, VerdictConfig> = {
+/**
+ * The verdict is exactly one axis: the **merge gate**. Three canonical states,
+ * keyed verbatim by the shared {@link CanonicalVerdict} union. Residual work
+ * (follow-ups, suggestions) is a separate axis carried by the finding counts
+ * and rendered as a subordinate chip — never folded into the gate label.
+ */
+const VERDICT_CONFIG: Record<CanonicalVerdict, VerdictConfig> = {
   APPROVE: {
     icon: CheckCircle2,
     bg: 'bg-emerald-500/10',
     border: 'border-emerald-500/30',
     text: 'text-emerald-700 dark:text-emerald-400',
-    label: 'Approved',
-  },
-  APPROVED: {
-    icon: CheckCircle2,
-    bg: 'bg-emerald-500/10',
-    border: 'border-emerald-500/30',
-    text: 'text-emerald-700 dark:text-emerald-400',
-    label: 'Approved',
-  },
-  LGTM: {
-    icon: CheckCircle2,
-    bg: 'bg-emerald-500/10',
-    border: 'border-emerald-500/30',
-    text: 'text-emerald-700 dark:text-emerald-400',
-    label: 'LGTM',
+    label: 'Approve',
   },
   'REQUEST CHANGES': {
     icon: XCircle,
     bg: 'bg-red-500/10',
     border: 'border-red-500/30',
     text: 'text-red-700 dark:text-red-400',
-    label: 'Changes Requested',
-  },
-  'CHANGES REQUESTED': {
-    icon: XCircle,
-    bg: 'bg-red-500/10',
-    border: 'border-red-500/30',
-    text: 'text-red-700 dark:text-red-400',
-    label: 'Changes Requested',
+    label: 'Request Changes',
   },
   'NEEDS DISCUSSION': {
     icon: MessageCircle,
@@ -63,13 +50,6 @@ const VERDICT_CONFIG: Record<string, VerdictConfig> = {
     border: 'border-amber-500/30',
     text: 'text-amber-700 dark:text-amber-400',
     label: 'Needs Discussion',
-  },
-  'NEEDS WORK': {
-    icon: MessageCircle,
-    bg: 'bg-amber-500/10',
-    border: 'border-amber-500/30',
-    text: 'text-amber-700 dark:text-amber-400',
-    label: 'Needs Work',
   },
 }
 
@@ -82,22 +62,16 @@ const UNKNOWN_VERDICT_CONFIG: VerdictConfig = {
 }
 
 /**
- * Resolves the verdict config. Tolerates verdicts that haven't been
- * normalized yet (legacy rows from before the parser whitelist landed) —
- * if the raw string starts with a known keyword we treat it as that
- * keyword, otherwise we fall back to a neutral "Verdict" badge with the
- * raw text as the label.
+ * Resolve the gate config from a raw verdict by routing through the shared
+ * normalizer. A canonical state gets its dedicated style; an unmappable value
+ * falls back to a neutral "Verdict" badge that echoes the raw text (capped) so
+ * a legacy or malformed row degrades gracefully instead of misrepresenting the
+ * gate.
  */
 function resolveConfig(verdict: string): VerdictConfig {
+  const canonical = normalizeVerdict(verdict)
+  if (canonical) return VERDICT_CONFIG[canonical]
   const trimmed = verdict.trim()
-  const upper = trimmed.toUpperCase()
-  if (VERDICT_CONFIG[upper]) return VERDICT_CONFIG[upper]
-  for (const [key, cfg] of Object.entries(VERDICT_CONFIG)) {
-    if (upper.startsWith(key)) return cfg
-  }
-  // Show the raw verdict text as the label for unknown phrasings, but
-  // cap at 60 chars so a paragraph-long verdict doesn't blow out the
-  // banner layout.
   const label = trimmed.length > 60 ? `${trimmed.slice(0, 60).trim()}…` : trimmed
   return { ...UNKNOWN_VERDICT_CONFIG, label: label || 'Verdict' }
 }
@@ -115,38 +89,78 @@ export function VerdictBanner({
   return (
     <div
       className={cn(
-        'flex items-center justify-between rounded-lg border p-4',
+        'flex items-center justify-between gap-4 rounded-lg border p-4',
         config.bg,
         config.border,
         className,
       )}
     >
+      {/* Axis 1 — the merge gate. */}
       <div className="flex items-center gap-3">
-        <Icon className={cn('h-6 w-6', config.text)} />
+        <Icon className={cn('h-6 w-6 shrink-0', config.text)} />
         <span className={cn('text-lg font-semibold', config.text)}>
           {config.label}
         </span>
       </div>
 
-      <div className="flex items-center gap-4 text-sm">
-        {blockerCount != null && (
-          <Stat
-            label="Blockers"
-            value={blockerCount}
-            className={blockerCount > 0 ? 'text-red-600 dark:text-red-400' : undefined}
-          />
-        )}
-        {shouldFixCount != null && (
-          <Stat
-            label="Should Fix"
-            value={shouldFixCount}
-            className={shouldFixCount > 0 ? 'text-amber-600 dark:text-amber-400' : undefined}
-          />
-        )}
-        {suggestionCount != null && (
-          <Stat label="Suggestions" value={suggestionCount} />
-        )}
+      {/* Axis 2 — residual work, visually subordinate to the gate. */}
+      <ResidualChip
+        blockerCount={blockerCount}
+        shouldFixCount={shouldFixCount}
+        suggestionCount={suggestionCount}
+      />
+    </div>
+  )
+}
+
+/**
+ * The residual-work chip: what is left to do, regardless of the gate. Blockers
+ * (when present) read first and loudest — they are why a gate is closed.
+ * Follow-ups (`should_fix`) are weighted over suggestions. When nothing remains,
+ * a quiet "Clean" affordance confirms there is no outstanding work rather than
+ * rendering an ambiguous row of zeros.
+ */
+function ResidualChip({
+  blockerCount,
+  shouldFixCount,
+  suggestionCount,
+}: {
+  blockerCount?: number
+  shouldFixCount?: number
+  suggestionCount?: number
+}) {
+  const blockers = blockerCount ?? 0
+  const shouldFix = shouldFixCount ?? 0
+  const suggestions = suggestionCount ?? 0
+
+  // "Clean" only when every count is both present and zero. If a count is
+  // undefined we simply omit it rather than asserting cleanliness we can't know.
+  const allKnown =
+    blockerCount != null && shouldFixCount != null && suggestionCount != null
+  if (allKnown && blockers === 0 && shouldFix === 0 && suggestions === 0) {
+    return (
+      <div className="flex items-center gap-1.5 text-sm text-emerald-600 dark:text-emerald-400">
+        <CheckCircle2 className="h-4 w-4" />
+        <span className="font-medium">Clean</span>
       </div>
+    )
+  }
+
+  return (
+    <div className="flex items-center gap-4 text-sm">
+      {blockerCount != null && blockers > 0 && (
+        <Stat label="Blockers" value={blockers} className="text-red-600 dark:text-red-400" />
+      )}
+      {shouldFixCount != null && (
+        <Stat
+          label="Follow-ups"
+          value={shouldFix}
+          className={shouldFix > 0 ? 'text-amber-600 dark:text-amber-400' : undefined}
+        />
+      )}
+      {suggestionCount != null && (
+        <Stat label="Suggestions" value={suggestions} />
+      )}
     </div>
   )
 }

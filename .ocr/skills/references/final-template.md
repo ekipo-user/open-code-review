@@ -198,6 +198,8 @@ The Tech Lead determines the verdict based on simple rules:
 
 **Important**: The Tech Lead does NOT override blockers. If any reviewer flags a blocker, the verdict is REQUEST CHANGES regardless of other opinions.
 
+**The verdict is the merge gate — one axis, three values.** It answers only "can this land?" Residual work is a *separate* axis: follow-ups (`should_fix`) and suggestions are finding **categories**, never verdict states. An `APPROVE` with open should-fix items is the normal, correct outcome — the work is tracked in the counts, not by bending the verdict into a composite like "approve with suggestions". Never emit a verdict outside the three canonical values.
+
 ---
 
 ## Final Review Template

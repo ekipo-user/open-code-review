@@ -14,6 +14,27 @@ import { execFileSync } from "node:child_process";
 export { execBinary, execBinaryAsync, spawnBinary } from "./spawn.js";
 export type { ExecBinaryAsyncOptions, ExecError } from "./spawn.js";
 
+export {
+  CANONICAL_VERDICTS,
+  isCanonicalVerdict,
+  normalizeVerdict,
+} from "./verdict.js";
+export type { CanonicalVerdict } from "./verdict.js";
+
+export {
+  FINDING_CATEGORIES,
+  deriveCounts,
+  resolveRoundCounts,
+} from "./counts.js";
+export type {
+  FindingCategory,
+  CategoryCounts,
+  CountableFinding,
+  CountableSynthesisCounts,
+  CountableRoundMeta,
+  ResolvedRoundCounts,
+} from "./counts.js";
+
 const isWindows = process.platform === "win32";
 
 /**
@@ -89,14 +110,15 @@ function walkDescendants(rootPid: number): {
     if (!m) continue;
     const pid = Number(m[1]);
     const ppid = Number(m[2]);
-    if (!children.has(ppid)) children.set(ppid, []);
-    children.get(ppid)!.push(pid);
+    const siblings = children.get(ppid) ?? [];
+    siblings.push(pid);
+    children.set(ppid, siblings);
   }
   const acc: number[] = [];
   const queue = [rootPid];
   const seen = new Set<number>([rootPid]);
-  while (queue.length) {
-    const p = queue.shift()!;
+  let p: number | undefined;
+  while ((p = queue.shift()) !== undefined) {
     for (const c of children.get(p) ?? []) {
       if (seen.has(c)) continue;
       seen.add(c);

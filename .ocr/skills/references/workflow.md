@@ -799,12 +799,16 @@ See `references/discourse.md` for detailed instructions.
 
    **`synthesis_counts`**: Count the actual numbered items (`### 1.`, `### 2.`, etc.) under each section of `final.md`. This is the **deduplicated** count after merging cross-reviewer duplicates.
 
+   **`verdict`** — the **merge gate**, exactly one of three values (uppercase, verbatim): `"APPROVE"` | `"REQUEST CHANGES"` | `"NEEDS DISCUSSION"`. The verdict expresses **one** thing — can this land? — and nothing else. Do **not** invent composite verdicts like `accept_with_followups` or `approve_with_suggestions`: residual work is **not** a gate state. Follow-ups and suggestions are carried by finding `category` and surfaced as counts; an APPROVE with open `should_fix` items is normal and correct. The CLI **rejects** any off-vocabulary verdict (exit 7, writes nothing) so you must re-emit a canonical value.
+
    **Finding categories**: `"blocker"` | `"should_fix"` | `"suggestion"` | `"style"`
    **Finding severity**: `"critical"` | `"high"` | `"medium"` | `"low"` | `"info"`
 
    Optional flags: `--session-id <id>` (auto-detects active session), `--round <number>` (auto-detects current round).
 
    > **Do NOT write `round-meta.json` directly** — always pipe through the CLI so the schema is validated and the event is recorded atomically.
+
+   > **The CLI fails fast (exit 7, nothing written) — self-correct and re-pipe** if: the `verdict` is not one of the three canonical values; any finding `title` is shorter than 8 characters (a degenerate title like `"s"` carries no information); or a `synthesis_counts` value **exceeds** the number of findings of that category present (you cannot dedup to *more* than you started with — a count ≤ the tally is fine, that's the legitimate cross-reviewer dedup case).
 
 8. **Write the final review file**:
    ```bash
