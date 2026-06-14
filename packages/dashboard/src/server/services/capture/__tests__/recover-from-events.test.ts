@@ -9,7 +9,7 @@
 import { afterEach, beforeEach, describe, expect, it } from 'vitest'
 import { mkdirSync, writeFileSync } from 'node:fs'
 import { join, resolve } from 'node:path'
-import { insertSession } from '@open-code-review/cli/db'
+import { insertSession } from '@open-code-review/persistence'
 import { openDb } from '../../../db.js'
 import {
   EventJournalAppender,

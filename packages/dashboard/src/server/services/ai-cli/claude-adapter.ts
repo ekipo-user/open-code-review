@@ -23,7 +23,7 @@ import { cleanEnv } from '../../socket/env.js'
 import {
   buildResumeArgs as buildResumeArgsShared,
   buildResumeCommand as buildResumeCommandShared,
-} from '@open-code-review/cli/vendor-resume'
+} from '@open-code-review/persistence/vendor-resume'
 
 // ── Default Tool Sets ──
 

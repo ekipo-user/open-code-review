@@ -1,5 +1,5 @@
 import { describe, it, expect } from 'vitest'
-import { isModelVendor } from '@open-code-review/cli/models'
+import { isModelVendor } from '@open-code-review/config/models'
 import { createRegisteredAdapters } from '../index.js'
 
 /**

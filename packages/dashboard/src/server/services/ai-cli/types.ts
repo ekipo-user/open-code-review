@@ -45,6 +45,14 @@ export type NormalizedEvent =
   | { type: 'tool_result'; toolId: string; output: string; isError: boolean }
   /** A structured error from the agent or its process layer (distinct from process stderr). */
   | { type: 'error'; source: 'agent' | 'process'; message: string; detail?: string }
+  /**
+   * A runner-originated operational notice — NOT agent output. Used for
+   * conditions the command-runner itself surfaces (e.g. a per-instance model
+   * dropped because the adapter lacks per-subagent model support, or a run
+   * force-finalized at the hard deadline). Carries a stable `code` so the
+   * timeline UI and history replay can render/filter it; routed through the
+   * typed stream so it lands in the per-execution JSONL journal. */
+  | { type: 'notice'; level: 'info' | 'warning'; code: string; message: string }
   /** Vendor session id captured from the stream — used for resume bookmarking. */
   | { type: 'session_id'; id: string }
   /**

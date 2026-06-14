@@ -18,7 +18,8 @@
  *      the same toolId append to that block's `inputPartial`. The matching
  *      `tool_result` flips it to done/error and supplies output text.
  *   5. `error` events render as ErrorEntry inline at their seq position.
- *   6. `session_id` events are journal-only — they don't render anything.
+ *   6. `notice` events (runner-originated warnings/info) render as NoticeEntry.
+ *   7. `session_id` events are journal-only — they don't render anything.
  *
  * Provenance:
  *   - Each block carries its `agentId`. The renderer wraps blocks in
@@ -35,6 +36,7 @@ import { MessageEntry } from './message-entry'
 import { ThinkingEntry } from './thinking-entry'
 import { ToolEntry } from './tool-entry'
 import { ErrorEntry } from './error-entry'
+import { NoticeEntry } from './notice-entry'
 import { useStickToBottom } from './use-stick-to-bottom'
 
 type EventStreamRendererProps = {
@@ -86,7 +88,15 @@ type ErrorBlock = {
   detail?: string
 }
 
-type Block = MessageBlock | ThinkingBlock | ToolBlock | ErrorBlock
+type NoticeBlock = {
+  kind: 'notice'
+  key: string
+  agentId: string
+  level: 'info' | 'warning'
+  message: string
+}
+
+type Block = MessageBlock | ThinkingBlock | ToolBlock | ErrorBlock | NoticeBlock
 
 /**
  * Reduce a StreamEvent[] into a Block[]. Pure function — no React hooks —
@@ -222,6 +232,19 @@ export function reduceEventsToBlocks(events: StreamEvent[]): Block[] {
         }
         if (evt.detail) block.detail = evt.detail
         blocks.push(block)
+        break
+      }
+      case 'notice': {
+        // Runner-originated operational notice (capability warning,
+        // hard-deadline reap). Renders as its own block so it's visible in
+        // the timeline and history replay (round-1 S10).
+        blocks.push({
+          kind: 'notice',
+          key: `notice-${evt.seq}`,
+          agentId: evt.agentId,
+          level: evt.level,
+          message: evt.message,
+        })
         break
       }
       case 'session_id':
@@ -438,5 +461,7 @@ function BlockEntry({ block }: { block: Block }) {
       if (block.detail) props.detail = block.detail
       return <ErrorEntry {...props} />
     }
+    case 'notice':
+      return <NoticeEntry level={block.level} message={block.message} />
   }
 }

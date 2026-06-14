@@ -8,12 +8,12 @@
  */
 
 import type { Server as SocketIOServer } from 'socket.io'
-import type { Database } from '@open-code-review/cli/db'
+import type { Database } from '@open-code-review/persistence'
 import {
   generateCommandUid,
   appendCommandLog,
   type CommandLogEntry,
-} from '@open-code-review/cli/db'
+} from '@open-code-review/persistence'
 
 export type TrackedExecution = {
   executionId: number

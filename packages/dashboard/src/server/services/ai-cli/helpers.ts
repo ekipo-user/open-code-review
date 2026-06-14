@@ -69,9 +69,10 @@ export function assertNonEmptyPrompt(prompt: string): void {
  * now would orphan it.
  */
 export function deliverPrompt(proc: ChildProcess, prompt: string): void {
-  if (prompt.length === 0) {
-    throw new Error('deliverPrompt: refusing to write an empty prompt')
-  }
+  // Defense-in-depth, but route through the SAME predicate as the pre-spawn
+  // gate so a future relaxation of "what counts as empty" can't drift between
+  // the two call sites.
+  assertNonEmptyPrompt(prompt)
   proc.stdin?.on('error', () => {
     /* EPIPE etc. — the close/watchdog path owns failure reporting */
   })

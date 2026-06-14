@@ -2,8 +2,8 @@ import { describe, it, expect, vi, beforeEach, afterEach } from "vitest";
 import { mkdirSync, existsSync } from "node:fs";
 import { join } from "node:path";
 import { dashboardCommand, resolveServerPath } from "../dashboard.js";
-import { closeAllDatabases } from "../../lib/db/index.js";
-import { makeTempWorkspace, removeTempWorkspace } from "../../lib/db/test-support.js";
+import { closeAllDatabases } from "@open-code-review/persistence";
+import { makeTempWorkspace, removeTempWorkspace } from "@open-code-review/persistence/test-support";
 
 let tmpDir: string;
 
@@ -150,8 +150,10 @@ describe("dashboardCommand (Task 18)", () => {
       const ocrDir = setupOcr();
 
       // Pre-create the DB with migrations
-      const { ensureDatabase } = await import("../../lib/db/index.js");
+      const { ensureDatabase } = await import("@open-code-review/persistence");
       await ensureDatabase(ocrDir);
+      // Not teardown — simulating a process restart so runDashboard re-opens an
+      // already-migrated DB on disk. Intentional mid-test drain, not SF3 dead code.
       closeAllDatabases();
 
       const dbPath = join(ocrDir, "data", "ocr.db");
@@ -170,7 +172,7 @@ describe("dashboardCommand (Task 18)", () => {
       await runDashboard();
 
       // Re-open the created database and check schema
-      const { openDatabase } = await import("../../lib/db/index.js");
+      const { openDatabase } = await import("@open-code-review/persistence");
       const dbPath = join(ocrDir, "data", "ocr.db");
       const db = await openDatabase(dbPath);
 

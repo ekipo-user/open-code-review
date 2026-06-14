@@ -16,8 +16,8 @@ import {
   insertSession,
   updateSession,
   type Database,
-} from '@open-code-review/cli/db'
-import { makeTempWorkspace, removeTempWorkspace } from '@open-code-review/cli/test-support'
+} from '@open-code-review/persistence'
+import { makeTempWorkspace, removeTempWorkspace } from '@open-code-review/persistence/test-support'
 import type { Server as SocketIOServer } from 'socket.io'
 import { DbSyncWatcher } from '../db-sync-watcher.js'
 

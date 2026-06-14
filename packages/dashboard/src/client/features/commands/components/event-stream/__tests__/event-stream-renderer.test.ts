@@ -140,6 +140,35 @@ describe('reduceEventsToBlocks', () => {
     })
   })
 
+  it('emits a notice block from runner notice events (S10)', () => {
+    nextSeq = 0
+    const events: StreamEvent[] = [
+      makeEvent('notice', {
+        level: 'warning',
+        code: 'per_instance_model_unsupported',
+        message: 'per-instance models will be ignored',
+      }),
+    ]
+    const blocks = reduceEventsToBlocks(events)
+    expect(blocks).toHaveLength(1)
+    expect(blocks[0]).toMatchObject({
+      kind: 'notice',
+      level: 'warning',
+      message: 'per-instance models will be ignored',
+    })
+  })
+
+  it('a notice between text_deltas closes the streaming text block', () => {
+    nextSeq = 0
+    const events: StreamEvent[] = [
+      makeEvent('text_delta', { text: 'before' }),
+      makeEvent('notice', { level: 'info', code: 'x', message: 'heads up' }),
+      makeEvent('text_delta', { text: 'after' }),
+    ]
+    const blocks = reduceEventsToBlocks(events)
+    expect(blocks.map((b) => b.kind)).toEqual(['message', 'notice', 'message'])
+  })
+
   it('drops session_id events from the rendered feed', () => {
     nextSeq = 0
     const events: StreamEvent[] = [

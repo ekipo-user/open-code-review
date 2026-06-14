@@ -318,7 +318,9 @@ export type NormalizedStreamEvent =
   | { type: 'tool_input_delta'; toolId: string; deltaJson: string }
   | { type: 'tool_result'; toolId: string; output: string; isError: boolean }
   | { type: 'error'; source: 'agent' | 'process'; message: string; detail?: string }
+  | { type: 'notice'; level: 'info' | 'warning'; code: string; message: string }
   | { type: 'session_id'; id: string }
+  | { type: 'result'; isError: boolean; subtype?: string }
 
 export type StreamEvent = NormalizedStreamEvent & {
   executionId: number

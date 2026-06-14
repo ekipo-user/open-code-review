@@ -19,14 +19,14 @@
  * `docs/architecture/agent-lifecycle-and-resume.md`) swap the internals
  * without touching call sites.
  */
-import type { Database } from '@open-code-review/cli/db'
+import type { Database } from '@open-code-review/persistence'
 import {
   getLatestAgentSessionWithVendorId,
   getSession,
   isSafeVendorSessionId,
   linkDashboardInvocationToWorkflow,
   recordVendorSessionIdForExecution,
-} from '@open-code-review/cli/db'
+} from '@open-code-review/persistence'
 import type { AiCliService } from '../ai-cli/index.js'
 import { microcopyFor } from './unresumable-microcopy.js'
 import { recoverFromEventsJsonl } from './recover-from-events.js'

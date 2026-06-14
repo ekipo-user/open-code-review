@@ -35,7 +35,7 @@ import { AiCliService } from './services/ai-cli/index.js'
 import { createSessionCaptureService } from './services/capture/session-capture-service.js'
 import { FilesystemSync } from './services/filesystem-sync.js'
 import { DbSyncWatcher } from './services/db-sync-watcher.js'
-import { registerCommandHandlers, clearSpawnMarker } from './socket/command-runner.js'
+import { registerCommandHandlers, clearAllSpawnMarkers } from './socket/command-runner.js'
 import { registerChatHandlers, cleanupAllChats } from './socket/chat-handler.js'
 import { registerPostHandlers, cleanupAllPostGenerations } from './socket/post-handler.js'
 import {
@@ -49,9 +49,9 @@ import {
   PID_REUSE_GUARD_MS,
   sqliteUtcMs,
   CANCELLED_EXIT_CODE,
-} from '@open-code-review/cli/db'
-import { getAgentHeartbeatSeconds } from '@open-code-review/cli/runtime-config'
-import { reconcileCompletedSessions } from '@open-code-review/cli/state'
+} from '@open-code-review/persistence'
+import { getAgentHeartbeatSeconds } from '@open-code-review/config/runtime-config'
+import { reconcileCompletedSessions } from '@open-code-review/persistence/state'
 
 import { homedir } from 'node:os'
 
@@ -637,11 +637,12 @@ export async function startServer(options: StartServerOptions = {}): Promise<voi
     // Remove PID and port tracking files
     try { unlinkSync(pidFilePath) } catch { /* ignore */ }
     try { unlinkSync(portFilePath) } catch { /* ignore */ }
-    // Remove the dashboard spawn marker (used by CLI's `ocr state begin`
+    // Remove all dashboard spawn markers (used by CLI's `ocr state begin`
     // for durable workflow_id linkage). Cleared here so a crash-mid-spawn
     // doesn't leave a stale marker pointing at a dead PID. Shared helper so the
-    // marker path is defined in exactly one place (round-1 S22).
-    clearSpawnMarker(ocrDir)
+    // marker path is defined in exactly one place (round-1 S22); clears the
+    // whole per-execution marker dir + legacy single file (round-1 S25).
+    clearAllSpawnMarkers(ocrDir)
 
     // Kill all child processes tracked in the database.
     // This is more robust than the in-memory Maps (which are lost on hot-reload).

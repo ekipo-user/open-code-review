@@ -16,7 +16,7 @@ import { fileURLToPath } from "node:url";
 import chalk from "chalk";
 import { importModule } from "@open-code-review/platform";
 import { requireOcrSetup } from "../lib/guards.js";
-import { ensureDatabase, closeAllDatabases } from "../lib/db/index.js";
+import { ensureDatabase, closeAllDatabases } from "@open-code-review/persistence";
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = dirname(__filename);
