@@ -29,15 +29,13 @@ export function createTempProject(): TempProject {
     mkdtempSync(resolve(tmpdir(), "ocr-e2e-")),
   );
 
-  // Initialize git repo — many commands require this
-  execFileSync("git", ["init"], { cwd: dir, stdio: "ignore" });
-  // Set identity for the temp repo (CI runners don't have global git config)
-  execFileSync("git", ["config", "user.email", "test@ocr.dev"], { cwd: dir, stdio: "ignore" });
-  execFileSync("git", ["config", "user.name", "OCR Test"], { cwd: dir, stdio: "ignore" });
-  execFileSync("git", ["commit", "--allow-empty", "-m", "init"], {
-    cwd: dir,
-    stdio: "ignore",
-  });
+  // A bare repo is the whole arrangement: `requireOcrSetup` checks `.ocr/`, not
+  // git, and the CLI never reads HEAD (it takes --branch/--session-id
+  // explicitly — only the dashboard server resolves the branch via `rev-parse`,
+  // and that path has its own harness). So no identity config and no initial
+  // commit are needed; `git init` alone is enough. One spawn, not four — fewer
+  // cold subprocesses per test is the point (this is per-test arrange cost).
+  execFileSync("git", ["init", "-q"], { cwd: dir, stdio: "ignore" });
 
   return {
     dir,
