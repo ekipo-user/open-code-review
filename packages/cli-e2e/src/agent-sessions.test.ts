@@ -847,11 +847,13 @@ describe("ocr review --resume", () => {
     expect(result.stderr).toMatch(/workflow.*not found/i);
   });
 
-  it("rejects a workflow with no captured vendor session id", async () => {
+  it("hands off to the baseline skill path when no vendor session id was captured", async () => {
     const project = tracked(createInitializedProject());
     const workflowId = await initWorkflow(project);
-    // Start an agent session BUT do not bind a vendor id
-    await spawnCli(
+    // Start an agent session BUT do not bind a vendor id, then end it so the
+    // owning turn is dead → the run is a stranded, forward-resumable mid-pipeline
+    // run with no resumable vendor conversation.
+    const start = await spawnCli(
       [
         "session",
         "start-instance",
@@ -866,12 +868,19 @@ describe("ocr review --resume", () => {
       ],
       { cwd: project.dir },
     );
+    const agentId = start.stdout.trim();
+    await spawnCli(["session", "end-instance", agentId, "--exit-code", "0"], {
+      cwd: project.dir,
+    });
 
     const result = await spawnCli(["review", "--resume", workflowId], {
       cwd: project.dir,
     });
-    expect(result.exitCode).not.toBe(0);
-    expect(result.stderr).toMatch(/no vendor session id/i);
+    // Intentional behavior change: rather than erroring, `--resume` with no
+    // captured vendor id now performs the honest baseline handoff (exit 0) —
+    // re-invoke the review skill, which forward-resumes with no adapter.
+    expect(result.exitCode).toBe(0);
+    expect(result.stderr).toMatch(/no resumable vendor session|re-invoking the review skill/i);
   });
 });
 
