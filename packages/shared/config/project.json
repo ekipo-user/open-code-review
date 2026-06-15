@@ -1,0 +1,23 @@
+{
+  "name": "config",
+  "$schema": "../../../node_modules/nx/schemas/project-schema.json",
+  "sourceRoot": "packages/shared/config/src",
+  "projectType": "library",
+  "tags": ["scope:shared", "type:util"],
+  "targets": {
+    "test": {
+      "executor": "@nx/vitest:test",
+      "outputs": ["{workspaceRoot}/coverage/packages/shared/config"],
+      "options": {
+        "config": "packages/shared/config/vitest.config.ts"
+      }
+    },
+    "typecheck": {
+      "executor": "nx:run-commands",
+      "options": {
+        "command": "tsc -p tsconfig.typecheck.json",
+        "cwd": "{projectRoot}"
+      }
+    }
+  }
+}

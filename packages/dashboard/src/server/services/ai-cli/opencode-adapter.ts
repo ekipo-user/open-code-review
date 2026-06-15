@@ -28,7 +28,7 @@ import { cleanEnv } from '../../socket/env.js'
 import {
   buildResumeArgs as buildResumeArgsShared,
   buildResumeCommand as buildResumeCommandShared,
-} from '@open-code-review/cli/vendor-resume'
+} from '@open-code-review/persistence/vendor-resume'
 
 // ── Helpers ──
 
@@ -105,7 +105,8 @@ export class OpenCodeAdapter implements AiCliAdapter {
     //
     // This argv shape is intentionally DIFFERENT from the user-facing
     // resume command (`opencode --session <id>`) emitted by
-    // `cli/src/lib/vendor-resume.ts`. The two operational contexts:
+    // `@open-code-review/persistence/vendor-resume`. The two operational
+    // contexts:
     //
     //   - Spawn (here): programmatic, prompt is non-empty (we're
     //     piping a workflow turn). `run "<prompt>" --session <id>

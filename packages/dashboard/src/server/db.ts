@@ -38,7 +38,7 @@ import {
   type Database,
   type WorkflowType,
   type SessionStatus,
-} from '@open-code-review/cli/db'
+} from '@open-code-review/persistence'
 import { join } from 'node:path'
 
 // ── Types ──

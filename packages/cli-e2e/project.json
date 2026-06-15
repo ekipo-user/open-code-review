@@ -7,10 +7,17 @@
   "targets": {
     "e2e": {
       "executor": "nx:run-commands",
-      "dependsOn": ["cli:build"],
+      "dependsOn": ["typecheck", "cli:build"],
       "options": {
         "command": "vitest run --config packages/cli-e2e/vitest.config.ts",
         "cwd": "{workspaceRoot}"
+      }
+    },
+    "typecheck": {
+      "executor": "nx:run-commands",
+      "options": {
+        "command": "tsc -p tsconfig.typecheck.json",
+        "cwd": "{projectRoot}"
       }
     }
   }

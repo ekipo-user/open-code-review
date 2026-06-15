@@ -121,12 +121,33 @@ function stripComments(src: string): string {
 }
 
 /**
+ * Blank the CONTENTS of single- and double-quoted string literals so
+ * code-shaped text living inside a string — e.g. `const tag =
+ * "require('child_process')"` — can't trip a shape matcher. A literal whose
+ * content is exactly the `child_process` module specifier is PRESERVED: that
+ * string is the genuine acquisition target the SHAPES regexes key on
+ * (`require('child_process')`, `from 'child_process'`), so blanking it would
+ * erase the specifier from real call sites and the matcher would go blind.
+ * (Template literals are out of scope — the matcher has never claimed them.)
+ */
+function stripStringLiterals(src: string): string {
+  return src.replace(/'(?:[^'\\]|\\.)*'|"(?:[^"\\]|\\.)*"/g, (lit) => {
+    const inner = lit.slice(1, -1);
+    if (/^(?:node:)?child_process$/.test(inner)) return lit;
+    const quote = lit[0]!;
+    return `${quote}${quote}`;
+  });
+}
+
+/**
  * Find the first raw-`child_process` VALUE acquisition in a source string, or
  * `null` if the module only uses it type-only (or not at all). Exported for
  * direct unit testing (positive controls below).
  */
 export function findViolation(source: string): { shape: string; matched: string } | null {
-  const content = stripComments(source);
+  // Strip comments first, then blank string-literal contents (a `{`/`}` inside
+  // a string would otherwise confuse the brace-collapse below).
+  const content = stripStringLiterals(stripComments(source));
   // Collapse multi-line braced lists so `import {\n  spawn,\n} from …` becomes
   // single-line and the line-scoped import/export regexes see it.
   const normalized = content.replace(/\{[\s\S]*?\}/g, (block) => block.replace(/\s+/g, " "));
@@ -185,6 +206,8 @@ describe("findViolation — positive controls (the matcher can actually fail)", 
     ["unrelated module", `import { readFileSync } from 'node:fs'`],
     ["child_process only in a comment", `// historically we used require('child_process') here\nimport { execBinary } from '@open-code-review/platform'`],
     ["child_process in a string literal", `const label = 'child_process'`],
+    ["require() shape embedded in a string literal", `const tag = "require('child_process')"`],
+    ["dynamic import() shape embedded in a string literal", `const doc = 'await import("child_process")'`],
     ["platform wrapper import", `import { spawnBinary } from '@open-code-review/platform'`],
   ])("does NOT flag %s", (_shape, snippet) => {
     expect(findViolation(snippet)).toBeNull();

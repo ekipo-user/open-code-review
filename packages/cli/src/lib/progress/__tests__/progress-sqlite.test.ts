@@ -8,14 +8,14 @@
 import { mkdirSync } from "node:fs";
 import { join } from "node:path";
 import { describe, it, expect, beforeEach, afterEach } from "vitest";
-import { openDatabase } from "../../db/index.js";
-import { makeTempWorkspace, removeTempWorkspace } from "../../db/test-support.js";
+import { openDatabase } from "@open-code-review/persistence";
+import { makeTempWorkspace, removeTempWorkspace } from "@open-code-review/persistence/test-support";
 import {
   stateInit,
   stateTransition,
   type ReviewPhase,
   type MapPhase,
-} from "../../state/index.js";
+} from "@open-code-review/persistence/state";
 import { setProgressDb } from "../session-reader.js";
 import { reviewStrategy } from "../review-strategy.js";
 import { mapStrategy } from "../map-strategy.js";
@@ -221,7 +221,7 @@ describe("Waiting state", () => {
       ocrDir,
     });
 
-    const { stateClose } = await import("../../state/index.js");
+    const { stateClose } = await import("@open-code-review/persistence/state");
     // No completed round — abort is the legitimate close for this fixture.
     await stateClose({
       sessionId: "closed-session",

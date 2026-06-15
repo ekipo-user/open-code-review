@@ -296,6 +296,10 @@ The system SHALL facilitate a discourse phase where reviewers respond to each ot
 
 The system SHALL synthesize individual reviews and discourse into a prioritized final review.
 
+The review verdict SHALL be drawn from a closed, canonical 3-state vocabulary representing the **merge gate** only: `APPROVE` (mergeable), `REQUEST CHANGES` (blocked on required work), or `NEEDS DISCUSSION` (undecided pending a human question). Residual work — follow-ups and suggestions — SHALL NOT be expressed as verdict states; it is carried by finding **category** (`blocker / should_fix / suggestion / style`) and the derived per-round counts. The synthesizer SHALL NOT emit composite or off-vocabulary verdicts (e.g. `accept_with_followups`, `approve_with_suggestions`).
+
+The synthesizer SHALL choose the verdict and the `blocker`-category findings **together** so they point the same direction, measured by the deduplicated blocker count (`resolveRoundCounts().blockerCount`, which honors `synthesis_counts.blockers`): it SHALL emit `REQUEST CHANGES` only when the blocker count is ≥ 1, SHALL emit `APPROVE` only when the blocker count is 0, and MAY emit `NEEDS DISCUSSION` regardless of blocker count. "Blocker" is exactly the canonical `blocker` category; `should_fix`/`suggestion`/`style` are residual work and never force `REQUEST CHANGES`. This keeps the merge gate and the findings as one consistent view, so the CLI's directional verdict ↔ blocker-count check is a backstop rather than the first line of defense.
+
 #### Scenario: Confidence weighting
 - **GIVEN** findings from multiple sources
 - **WHEN** synthesis occurs
@@ -321,6 +325,20 @@ The system SHALL synthesize individual reviews and discourse into a prioritized 
   - Consider (Low/Note severity)
   - What's Working Well
   - Discussion Notes
+
+#### Scenario: Verdict is a closed merge-gate vocabulary
+- **GIVEN** synthesis is complete and an outcome must be recorded
+- **WHEN** the verdict is chosen
+- **THEN** it SHALL be exactly one of `APPROVE`, `REQUEST CHANGES`, or `NEEDS DISCUSSION`
+- **AND** the presence of non-blocking residual work (follow-ups, suggestions) SHALL NOT change the verdict away from `APPROVE`
+- **AND** that residual work SHALL be represented as findings with category `should_fix`, `suggestion`, or `style`
+
+#### Scenario: Verdict and blocker findings are chosen consistently
+- **GIVEN** synthesis has produced the final finding set
+- **WHEN** the verdict is chosen
+- **THEN** `REQUEST CHANGES` SHALL be emitted only if the deduplicated blocker count is ≥ 1
+- **AND** `APPROVE` SHALL be emitted only if the deduplicated blocker count is 0
+- **AND** `NEEDS DISCUSSION` MAY be emitted regardless of the blocker count
 
 ### Requirement: Existing Map Reference
 
@@ -477,6 +495,12 @@ Phase 4 SHALL be expressed host-neutrally so that a review runs on any supported
 
 The orchestrating Tech Lead SHALL finalize rounds and close sessions exclusively through the atomic state porcelain (`ocr state complete-round` / `complete-map` / `finish`), so that completion is always invariant-checked and a workflow can never be reported complete before its work is done.
 
+To reduce the rate of mid-pipeline strands (a vendor-neutral failure: any turn-ending event between phases leaves the run incomplete), the orchestrator SHOULD drive the pipeline to `complete-round` within the same turn that produced the reviews and SHOULD NOT voluntarily end the turn between phases. This is non-vendor CONTROL guidance; it does not mandate or forbid any host primitive (e.g. background spawning), and recovery via forward-resume remains the backstop for the turn-ending events that cannot be prevented.
+
+**Canonical CONTROL prompt.** The fixed instruction an out-of-turn resumer injects is defined once here (the home of orchestrator behavior) and referenced by name elsewhere (the cli `Resume Flag on Existing Review Command` and the dashboard auto-resume): *"read `ocr state status --json` and act on `next_action`, continuing forward from `current_phase` without redoing completed phases."* It is CONTROL, never injected review context, and is identical across hosts; all per-vendor delivery differences are confined to the adapter.
+
+On resume, the orchestrator SHALL drive the pipeline **forward** from `current_phase` and SHALL behave identically across hosts. It reads `ocr state status --json`, and when `next_action` is `forward_resume` it re-enters `current_phase` and continues through the remaining phases — the workflow's own phase execution reuses already-produced artifacts (e.g. Phase 4 re-spawns only the reviewers whose outputs are absent) rather than re-producing them. This continuation SHALL behave identically on sub-agent-fanout hosts (where Phase 4 fanned out isolated reviewers) and on sequential-shared-context hosts (where reviewers, discourse, and synthesis are co-resident in one long turn): in both cases resume is in-turn forward progress keyed on `next_action`, never a regression of `current_phase` and never a dependency on any background process outliving the turn.
+
 #### Scenario: Round finalized via the atomic command
 
 - **GIVEN** the orchestrator has produced `final.md` and round metadata for the current round
@@ -496,4 +520,18 @@ The orchestrating Tech Lead SHALL finalize rounds and close sessions exclusively
 - **WHEN** it inspects state
 - **THEN** it SHALL call `ocr state status --json` to obtain the `completeness_state` and the unmet obligations
 - **AND** it SHALL act on the reported `next_action` rather than inferring state from filesystem inspection
+
+#### Scenario: Forward-resume continues from current_phase
+
+- **GIVEN** the orchestrator resumes a session whose `status --json` reports `next_action = forward_resume` with `current_phase = reviews`
+- **WHEN** it continues the workflow
+- **THEN** it SHALL re-enter `reviews` and proceed through the remaining phases, the workflow re-spawning only the reviewers whose outputs are absent
+- **AND** it SHALL NOT regress `current_phase`
+
+#### Scenario: Resume continuation is host-identical
+
+- **GIVEN** two resumes of equivalent stranded runs, one on a sub-agent-fanout host and one on a sequential-shared-context host
+- **WHEN** each orchestrator acts on `next_action = forward_resume`
+- **THEN** both SHALL make the same forward progress through the remaining phases driven by the same `ocr state` surface (the `next_action` progression is identical)
+- **AND** neither SHALL depend on a background process or cross-process wait that outlives the agent turn
 

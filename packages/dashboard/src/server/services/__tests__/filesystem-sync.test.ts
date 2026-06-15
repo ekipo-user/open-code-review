@@ -7,8 +7,8 @@ import {
   openDatabase,
   runMigrations,
   type Database,
-} from '@open-code-review/cli/db'
-import { removeTempWorkspace } from '@open-code-review/cli/test-support'
+} from '@open-code-review/persistence'
+import { removeTempWorkspace } from '@open-code-review/persistence/test-support'
 import { FilesystemSync } from '../filesystem-sync.js'
 
 let db: Database
@@ -393,6 +393,45 @@ API updates.
       expect(round?.['source']).toBe('orchestrator')
     })
 
+    it('normalizes a legacy off-vocabulary verdict to the canonical gate (accept_with_followups → APPROVE)', async () => {
+      // The accept_with_followups bug: old rows carry a retired composite
+      // verdict. Read-time normalization collapses it to its merge gate so the
+      // banner renders APPROVE instead of an ambiguous "?".
+      const sessionId = '2026-01-01-legacy-verdict'
+      const roundDir = join(sessionsDir, sessionId, 'rounds', 'round-1')
+      mkdirSync(roundDir, { recursive: true })
+
+      writeFileSync(
+        join(roundDir, 'round-meta.json'),
+        JSON.stringify(makeRoundMeta({ verdict: 'accept_with_followups' })),
+      )
+
+      const sync = new FilesystemSync(db, sessionsDir)
+      await sync.fullScan()
+
+      const round = queryOne(db, 'SELECT * FROM review_rounds WHERE session_id = ?', [sessionId])
+      expect(round?.['verdict']).toBe('APPROVE')
+    })
+
+    it('stores an unmappable verdict verbatim (banner falls back to neutral)', async () => {
+      // A value the normalizer can't confidently map is preserved raw rather
+      // than coerced — the dashboard renders its neutral fallback for it.
+      const sessionId = '2026-01-01-unknown-verdict'
+      const roundDir = join(sessionsDir, sessionId, 'rounds', 'round-1')
+      mkdirSync(roundDir, { recursive: true })
+
+      writeFileSync(
+        join(roundDir, 'round-meta.json'),
+        JSON.stringify(makeRoundMeta({ verdict: 'ship it maybe' })),
+      )
+
+      const sync = new FilesystemSync(db, sessionsDir)
+      await sync.fullScan()
+
+      const round = queryOne(db, 'SELECT * FROM review_rounds WHERE session_id = ?', [sessionId])
+      expect(round?.['verdict']).toBe('ship it maybe')
+    })
+
     it('processRoundMeta populates reviewer_outputs and review_findings', async () => {
       const sessionId = '2026-01-01-findings-meta'
       const roundDir = join(sessionsDir, sessionId, 'rounds', 'round-1')
@@ -540,6 +579,158 @@ Info level.
       // No orchestrator data populated — any row that exists should NOT have source='orchestrator'
       const rounds = queryAll(db, 'SELECT * FROM review_rounds WHERE session_id = ? AND source = ?', [sessionId, 'orchestrator'])
       expect(rounds).toHaveLength(0)
+    })
+  })
+
+  describe('terminal completion is the CLI\'s, never fabricated from artifacts (D1)', () => {
+    // Insert a session row + a round_completed event directly, mirroring what the
+    // CLI's complete-round commits to the shared DB. Used to prove the safety net
+    // closes WHEN (and only when) the CLI's terminal evidence exists.
+    function seedSession(
+      sessionId: string,
+      opts: {
+        status?: 'active' | 'closed'
+        phase?: string
+        phaseNumber?: number
+        workflowType?: 'review' | 'map'
+        round?: number
+      } = {},
+    ): void {
+      const {
+        status = 'active',
+        phase = 'synthesis',
+        phaseNumber = 7,
+        workflowType = 'review',
+        round = 1,
+      } = opts
+      db.run(
+        `INSERT INTO sessions (id, branch, workflow_type, status, current_phase, phase_number, current_round, current_map_run, session_dir)
+         VALUES (?, 'main', ?, ?, ?, ?, ?, ?, ?)`,
+        [sessionId, workflowType, status, phase, phaseNumber, round, round, join(sessionsDir, sessionId)],
+      )
+      db.run(
+        `INSERT INTO orchestration_events (session_id, event_type, phase, phase_number, round)
+         VALUES (?, 'session_created', ?, 1, 1)`,
+        [sessionId, phase],
+      )
+    }
+
+    function addTerminalEvent(sessionId: string, eventType: 'round_completed' | 'map_completed', round = 1): void {
+      db.run(
+        `INSERT INTO orchestration_events (session_id, event_type, phase, phase_number, round)
+         VALUES (?, ?, 'synthesis', 7, ?)`,
+        [sessionId, eventType, round],
+      )
+    }
+
+    it('a backfilled session with final.md but no round_completed event derives synthesis, stays open, and is not complete', async () => {
+      // The accept-too-soon defect: final.md presence alone must NOT be read as
+      // terminal completion. Such a round is at the synthesis phase, the session
+      // stays open, and session_completeness must not report it complete.
+      const sessionId = '2026-01-01-final-only'
+      const roundDir = join(sessionsDir, sessionId, 'rounds', 'round-1')
+      mkdirSync(roundDir, { recursive: true })
+      writeFileSync(join(roundDir, 'final.md'), '# Final Review Synthesis\n\n## Verdict: APPROVE\n')
+
+      const sync = new FilesystemSync(db, sessionsDir)
+      await sync.fullScan()
+
+      const session = queryOne(db, 'SELECT * FROM sessions WHERE id = ?', [sessionId])
+      expect(session).toBeDefined()
+      expect(session?.['current_phase']).toBe('synthesis')
+      expect(session?.['phase_number']).toBe(7)
+      expect(session?.['status']).toBe('active')
+
+      const completeness = queryOne(
+        db,
+        'SELECT completeness_state FROM session_completeness WHERE session_id = ?',
+        [sessionId],
+      )
+      expect(completeness?.['completeness_state']).not.toBe('complete')
+
+      // And no terminal artifact event was fabricated.
+      const events = queryAll(
+        db,
+        "SELECT * FROM orchestration_events WHERE session_id = ? AND event_type = 'round_completed'",
+        [sessionId],
+      )
+      expect(events).toHaveLength(0)
+    })
+
+    it('the final.md safety net does NOT close a session lacking the round_completed event', async () => {
+      // A session stuck at synthesis with final.md on disk but no terminal event:
+      // the reconciler must leave it open for the CLI's reconcile path, not close it.
+      const sessionId = '2026-01-01-safety-net-no-event'
+      seedSession(sessionId, { status: 'active', phase: 'synthesis', phaseNumber: 7 })
+      const roundDir = join(sessionsDir, sessionId, 'rounds', 'round-1')
+      mkdirSync(roundDir, { recursive: true })
+      writeFileSync(join(roundDir, 'final.md'), '# Final\n\n## Verdict: APPROVE\n')
+
+      const sync = new FilesystemSync(db, sessionsDir)
+      await sync.fullScan()
+
+      const session = queryOne(db, 'SELECT status, current_phase FROM sessions WHERE id = ?', [sessionId])
+      expect(session?.['status']).toBe('active')
+      expect(session?.['current_phase']).not.toBe('complete')
+    })
+
+    it('the final.md safety net DOES close a session once the round_completed event exists', async () => {
+      // The legitimate crashed-after-complete-round recovery: the CLI committed
+      // the terminal event but the close never ran. With that evidence present,
+      // the safety net completes the close.
+      const sessionId = '2026-01-01-safety-net-with-event'
+      seedSession(sessionId, { status: 'active', phase: 'synthesis', phaseNumber: 7 })
+      addTerminalEvent(sessionId, 'round_completed', 1)
+      const roundDir = join(sessionsDir, sessionId, 'rounds', 'round-1')
+      mkdirSync(roundDir, { recursive: true })
+      writeFileSync(join(roundDir, 'final.md'), '# Final\n\n## Verdict: APPROVE\n')
+
+      const sync = new FilesystemSync(db, sessionsDir)
+      await sync.fullScan()
+
+      const session = queryOne(db, 'SELECT status, current_phase, phase_number FROM sessions WHERE id = ?', [sessionId])
+      expect(session?.['status']).toBe('closed')
+      expect(session?.['current_phase']).toBe('complete')
+      expect(session?.['phase_number']).toBe(8)
+
+      const completeness = queryOne(
+        db,
+        'SELECT completeness_state FROM session_completeness WHERE session_id = ?',
+        [sessionId],
+      )
+      expect(completeness?.['completeness_state']).toBe('complete')
+    })
+
+    it('the map.md safety net does NOT close a map session lacking the map_completed event', async () => {
+      const sessionId = '2026-01-01-map-no-event'
+      seedSession(sessionId, { status: 'active', phase: 'synthesis', phaseNumber: 5, workflowType: 'map' })
+      const runDir = join(sessionsDir, sessionId, 'map', 'runs', 'run-1')
+      mkdirSync(runDir, { recursive: true })
+      writeFileSync(join(runDir, 'map.md'), '# Code Review Map\n\n## Section 1: Core\n\nCore.\n')
+
+      const sync = new FilesystemSync(db, sessionsDir)
+      await sync.fullScan()
+
+      const session = queryOne(db, 'SELECT status, current_phase FROM sessions WHERE id = ?', [sessionId])
+      expect(session?.['status']).toBe('active')
+      expect(session?.['current_phase']).not.toBe('complete')
+    })
+
+    it('the map.md safety net DOES close a map session once the map_completed event exists', async () => {
+      const sessionId = '2026-01-01-map-with-event'
+      seedSession(sessionId, { status: 'active', phase: 'synthesis', phaseNumber: 5, workflowType: 'map' })
+      addTerminalEvent(sessionId, 'map_completed', 1)
+      const runDir = join(sessionsDir, sessionId, 'map', 'runs', 'run-1')
+      mkdirSync(runDir, { recursive: true })
+      writeFileSync(join(runDir, 'map.md'), '# Code Review Map\n\n## Section 1: Core\n\nCore.\n')
+
+      const sync = new FilesystemSync(db, sessionsDir)
+      await sync.fullScan()
+
+      const session = queryOne(db, 'SELECT status, current_phase, phase_number FROM sessions WHERE id = ?', [sessionId])
+      expect(session?.['status']).toBe('closed')
+      expect(session?.['current_phase']).toBe('complete')
+      expect(session?.['phase_number']).toBe(6)
     })
   })
 

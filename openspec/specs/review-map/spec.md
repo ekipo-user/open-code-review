@@ -1,7 +1,12 @@
 # review-map Specification
 
 ## Purpose
-TBD - created by archiving change add-review-map. Update Purpose after archive.
+
+The review-map capability generates a Code Review Map for large, complex
+changesets: a Map Architect agent analyzes the change topology and coordinates
+specialized agents to produce a navigable map (sections, files, and the routes
+through them) that orients reviewers before the multi-agent review runs.
+
 ## Requirements
 ### Requirement: Map Architect Orchestration
 

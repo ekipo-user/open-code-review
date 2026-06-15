@@ -9,6 +9,16 @@
       "types": "./src/index.ts",
       "source": "./src/index.ts",
       "default": "./src/index.ts"
+    },
+    "./verdict": {
+      "types": "./src/verdict.ts",
+      "source": "./src/verdict.ts",
+      "default": "./src/verdict.ts"
+    },
+    "./counts": {
+      "types": "./src/counts.ts",
+      "source": "./src/counts.ts",
+      "default": "./src/counts.ts"
     }
   },
   "dependencies": {

@@ -19,7 +19,7 @@ import { existsSync } from 'node:fs'
 import { dirname, basename } from 'node:path'
 import { watch, type FSWatcher } from 'chokidar'
 import type { Server as SocketIOServer } from 'socket.io'
-import { resultToRows, type Database } from '@open-code-review/cli/db'
+import { resultToRows, type Database } from '@open-code-review/persistence'
 
 type SqlValue = string | number | null
 type Row = { [key: string]: SqlValue }

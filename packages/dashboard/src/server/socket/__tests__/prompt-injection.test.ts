@@ -273,3 +273,53 @@ describe('buildPrompt — structural ordering', () => {
     expect(prompt).not.toContain('--resume 2026-05-06-test-workflow')
   })
 })
+
+describe('buildPrompt — argument parsing (S15)', () => {
+  // shellSplit collapses a quoted value into a single token before buildPrompt
+  // sees it, so each subArgs element below is exactly what the parser receives.
+  it('treats --requirements as a single-value flag and still honors trailing flags', () => {
+    const { prompt, resumeWorkflowId } = buildPrompt({
+      baseCommand: 'review',
+      subArgs: [
+        'target',
+        '--requirements',
+        'fix the auth bug',
+        '--reviewer',
+        'security',
+        '--team',
+        '[{"model":"opus"}]',
+        '--resume',
+        '2026-05-06-wf',
+      ],
+      commandContent: '# review',
+      executionUid: 'uid',
+      localCli: '/abs/cli.js',
+    })
+    // Requirements captured the single token only — not the trailing flags.
+    expect(prompt).toContain('Requirements: fix the auth bug')
+    // The greedy `slice(i+1).join(' ')` defect previously swallowed these.
+    expect(prompt).toContain('Reviewer: security')
+    expect(prompt).toContain('Team: [{"model":"opus"}]')
+    expect(resumeWorkflowId).toBe('2026-05-06-wf')
+    // The requirements value must not absorb later flags' tokens.
+    expect(prompt).not.toContain('Requirements: fix the auth bug --reviewer')
+  })
+
+  it('captures requirements regardless of flag order', () => {
+    const { prompt } = buildPrompt({
+      baseCommand: 'review',
+      subArgs: [
+        'target',
+        '--reviewer',
+        'architect',
+        '--requirements',
+        'enforce idempotency',
+      ],
+      commandContent: '# review',
+      executionUid: 'uid',
+      localCli: '/abs/cli.js',
+    })
+    expect(prompt).toContain('Reviewer: architect')
+    expect(prompt).toContain('Requirements: enforce idempotency')
+  })
+})

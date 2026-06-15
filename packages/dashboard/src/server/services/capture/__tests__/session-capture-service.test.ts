@@ -9,7 +9,7 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 import { mkdirSync } from 'node:fs'
 import { join, resolve } from 'node:path'
-import { insertSession } from '@open-code-review/cli/db'
+import { insertSession } from '@open-code-review/persistence'
 import { openDb } from '../../../db.js'
 import type { AiCliAdapter, AiCliService } from '../../ai-cli/index.js'
 import { createSessionCaptureService } from '../session-capture-service.js'
@@ -154,6 +154,80 @@ describe('SessionCaptureService — recordSessionId', () => {
       svc.recordSessionId(id, 'sid-x') // same id, repeated
       svc.recordSessionId(id, 'sid-x')
       expect(warnSpy).not.toHaveBeenCalled()
+    } finally {
+      warnSpy.mockRestore()
+    }
+  })
+
+  // Round-1 SF4: a syntactically implausible vendor id is dropped at the
+  // capture boundary (not persisted) and warned about — log-and-drop, never
+  // throw, since this runs in the stream pump. The captured id is sticky and
+  // later rides into spawn argv, so garbage must not be stored.
+  it('drops an implausible vendor session id without persisting it', async () => {
+    const { db, svc } = await setup()
+    const id = seedDashboardRow(db, 'uid-bad')
+    const warnSpy = vi.spyOn(console, 'warn').mockImplementation(() => {})
+    try {
+      svc.recordSessionId(id, 'has spaces and / slashes') // fails the syntax class
+
+      const result = db.exec(
+        'SELECT vendor_session_id FROM command_executions WHERE id = ?',
+        [id],
+      )
+      // Nothing recorded — the column stays NULL.
+      expect(result[0]?.values[0]?.[0]).toBeNull()
+      expect(warnSpy).toHaveBeenCalledTimes(1)
+      expect(warnSpy.mock.calls[0]?.[0]).toMatch(/implausible vendor session id/)
+    } finally {
+      warnSpy.mockRestore()
+    }
+  })
+
+  it('warns at most once per execution for repeated implausible ids', async () => {
+    const { db, svc } = await setup()
+    const id = seedDashboardRow(db, 'uid-bad-repeat')
+    const warnSpy = vi.spyOn(console, 'warn').mockImplementation(() => {})
+    try {
+      svc.recordSessionId(id, 'bad one')
+      svc.recordSessionId(id, 'bad two')
+      svc.recordSessionId(id, 'bad three')
+      expect(warnSpy).toHaveBeenCalledTimes(1)
+    } finally {
+      warnSpy.mockRestore()
+    }
+  })
+
+  it('records a valid id even after an earlier implausible one was dropped', async () => {
+    const { db, svc } = await setup()
+    const id = seedDashboardRow(db, 'uid-bad-then-good')
+
+    svc.recordSessionId(id, 'bad id') // dropped
+    svc.recordSessionId(id, 'ses_realid-123') // valid — should land
+
+    const result = db.exec(
+      'SELECT vendor_session_id FROM command_executions WHERE id = ?',
+      [id],
+    )
+    expect(result[0]?.values[0]?.[0]).toBe('ses_realid-123')
+  })
+
+  // `%` is excluded from the syntax class ON PURPOSE: a captured id rides into
+  // spawn argv, and `%VAR%` is cmd.exe's historically weakest escaping corner
+  // (see spawn.ts's defense-in-depth note). Pin it so a future "widen the
+  // syntax class" PR can't quietly re-admit `%` without this test going red.
+  it('drops a vendor session id containing a cmd.exe %VAR% metacharacter', async () => {
+    const { db, svc } = await setup()
+    const id = seedDashboardRow(db, 'uid-percent')
+    const warnSpy = vi.spyOn(console, 'warn').mockImplementation(() => {})
+    try {
+      svc.recordSessionId(id, 'ses_%PATH%-123') // `%` fails the syntax class
+
+      const result = db.exec(
+        'SELECT vendor_session_id FROM command_executions WHERE id = ?',
+        [id],
+      )
+      expect(result[0]?.values[0]?.[0]).toBeNull()
+      expect(warnSpy).toHaveBeenCalledTimes(1)
     } finally {
       warnSpy.mockRestore()
     }

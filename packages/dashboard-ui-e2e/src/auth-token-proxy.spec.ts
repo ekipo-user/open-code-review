@@ -1,5 +1,13 @@
 import { test, expect } from "@playwright/test";
 
+declare global {
+  interface Window {
+    // Set by the dashboard client once its auth flow resolves; read inside a
+    // page.waitForFunction callback that executes in the browser context.
+    __OCR_TOKEN__?: string;
+  }
+}
+
 /**
  * Regression test for the dev proxy port mismatch bug.
  *
@@ -42,13 +50,20 @@ test.describe("auth proxy", () => {
 
     await page.goto("/");
 
-    // Wait for the app to complete its auth flow
-    await page.waitForFunction(() => window.__OCR_TOKEN__ !== undefined, {
-      timeout: 10_000,
-    }).catch(() => {
-      // Fall back to networkidle if the global is never set
-    });
-    await page.waitForLoadState("networkidle");
+    // Wait for the deterministic "auth resolved" signal — the client sets
+    // window.__OCR_TOKEN__ once it has parsed the /auth/token response. We
+    // deliberately do NOT fall back to `networkidle`: the dashboard holds a
+    // persistent socket.io connection, so the network never goes idle and the
+    // wait would race/time out (a former flake source). If the token never
+    // appears, wait for the DOM-ready state so a real "/auth returned HTML"
+    // failure still surfaces the SyntaxError below rather than hanging.
+    await page
+      .waitForFunction(() => window.__OCR_TOKEN__ !== undefined, {
+        timeout: 10_000,
+      })
+      .catch(async () => {
+        await page.waitForLoadState("domcontentloaded");
+      });
 
     const syntaxErrors = consoleErrors.filter((e) =>
       e.includes("SyntaxError"),

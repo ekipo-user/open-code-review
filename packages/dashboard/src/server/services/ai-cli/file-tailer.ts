@@ -62,10 +62,14 @@ export class FileTailer {
   /** Read everything currently available from `offset` to EOF. */
   private poll(): void {
     if (!this.ensureOpen()) return;
+    // ensureOpen() guarantees an open fd on success, but narrow it locally
+    // rather than asserting non-null (the project bans `!`).
+    const fd = this.fd;
+    if (fd === null) return;
     let bytes: number;
     do {
       try {
-        bytes = readSync(this.fd!, this.buf, 0, this.buf.length, this.offset);
+        bytes = readSync(fd, this.buf, 0, this.buf.length, this.offset);
       } catch {
         return; // transient read error — try again next tick
       }

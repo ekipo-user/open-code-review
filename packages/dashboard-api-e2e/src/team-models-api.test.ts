@@ -2,7 +2,7 @@
  * `GET /api/team/models` end-to-end tests — the dashboard half of the
  * issue-#39 regression net (the CLI half lives in cli-e2e's
  * models-list.test.ts; both resolve through the same strategy table in
- * `@open-code-review/cli/models`, which is the point).
+ * `@open-code-review/config/models`, which is the point).
  *
  * Each test forks a real dashboard server with stub vendor binaries
  * prepended to PATH, so enumeration behavior is deterministic regardless

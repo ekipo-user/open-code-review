@@ -144,6 +144,10 @@ export async function execBinaryAsync(
     const maxBuffer = opts.maxBuffer ?? DEFAULT_MAX_BUFFER;
     let stdout = "";
     let stderr = "";
+    // Load-bearing initial value: `killed` stays false unless OUR timeout /
+    // maxBuffer guard kills the child, which is exactly how consumers
+    // (describeProbeFailure) tell an our-kill timeout from an ENOENT/exit. Do
+    // not initialize it lazily or derive it from the close signal.
     let killed = false;
     let settled = false;
 

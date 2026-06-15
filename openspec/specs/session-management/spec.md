@@ -207,8 +207,9 @@ The system SHALL store discourse and synthesis outputs inside round directories,
 
 #### Scenario: Round metadata output location
 - **GIVEN** the synthesis phase completes for round 1
-- **WHEN** the orchestrator pipes structured data to `ocr state round-complete --stdin`
+- **WHEN** the orchestrator supplies structured round data to `ocr state complete-round` (via `--stdin` or `--file`)
 - **THEN** the CLI SHALL write `rounds/round-1/round-meta.json` with validated structured review data
+- **AND** the write SHALL occur regardless of which input source carried the payload, so a successful completion never leaves the round directory without its metadata artifact
 
 #### Scenario: Shared context remains at root
 - **GIVEN** a multi-round session exists
@@ -582,6 +583,13 @@ Completing a review round SHALL be a single atomic operation that finalizes all 
 - **THEN** the command SHALL refuse with the invariant-unmet code
 - **AND** because reaching `synthesis` requires legal graph transitions through analysis, reviews, aggregation, and discourse, a completed round implies the workflow path was actually walked
 
+#### Scenario: Round completion is the single-writer safety boundary
+
+- **GIVEN** two forward-resume continuations both running the same round's remaining phases (e.g. after a lease TTL lapsed while the first was still alive)
+- **WHEN** both reach `complete-round` and attempt to commit
+- **THEN** exactly one SHALL succeed and exactly one `round_completed` event SHALL be recorded
+- **AND** the second SHALL take the safe no-op / self-heal path of `Re-running complete-round is a safe no-op or self-heals the artifact` — so the forward-resume lease is a throttle, while `complete-round`'s idempotency is the actual correctness boundary
+
 ---
 
 ### Requirement: Invariant-Checked Session Finish
@@ -599,4 +607,182 @@ A session SHALL NOT be marked closed-as-complete unless its current round/run is
 - **WHEN** `ocr state finish --abort` runs
 - **THEN** the session SHALL close with a `session_aborted` event
 - **AND** no consumer SHALL report the aborted session as a successful completion
+
+### Requirement: Parent Execution Heartbeat
+
+A dashboard-spawned workflow's parent `command_executions` row SHALL have its `last_heartbeat_at` refreshed for the duration of the run — not seeded once at spawn — so liveness reflects the running agent and a long review does not drift to "stalled." The heartbeat SHALL be driven by output activity (throttled) and by a supervisor tick while the process is alive.
+
+#### Scenario: Long review stays fresh
+
+- **GIVEN** a dashboard-spawned review producing output over many minutes
+- **WHEN** the command-runner observes stdout activity
+- **THEN** it SHALL bump the parent row's `last_heartbeat_at` (throttled to avoid write amplification)
+- **AND** the row SHALL NOT be classified "stalled" while the process is healthy
+
+### Requirement: Watchdog Reaping of Wedged Processes
+
+The command-runner SHALL run a per-execution watchdog that terminates a process whose work is done but which will not exit, and one that is alive past a hard deadline — finalizing the row deterministically rather than waiting on stdio EOF.
+
+#### Scenario: Work done but process will not exit
+
+- **GIVEN** the vendor emitted its terminal `result` event for an execution
+- **AND** the process is still alive after a grace window
+- **THEN** the watchdog SHALL reap the whole process tree and finalize the execution
+
+#### Scenario: Work done but the process already exited (close withheld)
+
+- **GIVEN** the vendor emitted its terminal `result` event and the child process has exited, but `close` is withheld (e.g. a leaked grandchild holds an inherited pipe in pipe-fallback mode)
+- **WHEN** the grace window passes
+- **THEN** the watchdog SHALL finalize the execution with the result's true verdict WITHOUT reaping (the PID may be recycled; escaped descendants have reparented and are unreachable)
+- **AND** the watchdog SHALL NOT refresh the heartbeat of an exited child, so a no-result dead child remains claimable by the liveness sweep
+
+#### Scenario: Sentinel-less hosts are exempt from result-driven finalization (capability-gated)
+
+- **GIVEN** a workflow on a host whose adapter advertises that it emits no terminal sentinel (an adapter capability, e.g. `emitsTerminalSentinel: false` — OpenCode is the current such host: its `step_finish` is per-step, not an end-of-run `result`)
+- **THEN** finalization SHALL be driven by the file-stdio'd process `close` and the hard deadline, NOT a `result` event (mapping a per-step event to `result` would arm the grace reap against healthy agents)
+- **AND** the exemption SHALL key off the adapter capability, not a host name — any future sentinel-less host inherits it, and a host that later adds an end-of-run event drops it by flipping the capability
+
+#### Scenario: Alive past the hard deadline
+
+- **GIVEN** an execution alive beyond the configured hard deadline with no result
+- **THEN** the watchdog SHALL reap the tree and finalize with a distinct terminal exit code (`-5`), separate from cancelled (`-2`/`-4`) and orphaned-dead (`-3`)
+
+### Requirement: Auto-Finalize a Completed-But-Open Session
+
+A wedged session whose current round/run is provably complete (its `round_completed`/`map_completed` event exists) but whose `status` is still `active` — left when an agent finishes its round but dies before `ocr state finish` — SHALL be driven to `closed` automatically through the guarded close path, not left open forever.
+
+**Terminology (the two `active`-strand signatures).** A **wedged session** is `active` with its work *done* — a `round_completed`/`map_completed` event exists but the close was missed; it is handled by this requirement. A **stranded session** is `active` with its work *unfinished* — no terminal artifact event and the owning turn is dead mid-pipeline; it is handled by `Forward-Resume of a Stranded Mid-Pipeline Run`. These two are disjoint and exhaustive over `active` strandings. (The `dashboard` and `sqlite-state` specs use these same two terms.) Finalization SHALL be a no-op unless the session is `active`, the completion invariant holds, AND no dependent execution is still in flight, so it is safe to attempt on every execution exit. It SHALL be reachable both per-execution (when a dashboard-spawned execution finalizes) and via a startup/periodic sweep (recovering sessions whose finishing execution ran while no server was up). It SHALL NOT close an incomplete session and never abort.
+
+This requirement handles ONLY the *artifact-present* stranding (work done, close missed). The disjoint *artifact-absent but resumable* stranding (work unfinished, turn dead mid-pipeline) is delegated to `Forward-Resume of a Stranded Mid-Pipeline Run`. Together the two are exhaustive over `active` strandings: a run with a terminal artifact event is auto-finalized; a run without one is forward-resumed (or, on cap exhaustion, closed non-success). To avoid racing a forward-resume continuation that is about to emit `round_completed`, Auto-Finalize SHALL NOT close a session while a live resume lease (an unreleased `forward_resume` lease within the lease TTL) exists for it, even if a `round_completed` event has just appeared — it defers until the lease is released.
+
+#### Scenario: A finished round left active is closed
+
+- **GIVEN** a session that is `active` with a `round_completed` event for its current round and no in-flight executions
+- **WHEN** reconciliation runs (per-execution exit or sweep)
+- **THEN** the session SHALL be closed through the guarded close path (completion invariant + cascade intact)
+- **AND** its `completeness_state` SHALL become `complete`
+
+#### Scenario: An incomplete or busy session is left alone
+
+- **GIVEN** a session that is `active` but whose current round has no terminal artifact event, OR that still has an in-flight dependent execution
+- **WHEN** reconciliation runs
+- **THEN** it SHALL make no change (no close, no abort)
+
+#### Scenario: An incomplete, dead, mid-pipeline session is delegated to forward-resume
+
+- **GIVEN** a session that is `active`, whose current round has NO terminal artifact event, with no in-flight dependent execution and positive death evidence on the owning turn
+- **WHEN** reconciliation runs
+- **THEN** auto-finalize SHALL make no change (it never closes an incomplete session)
+- **AND** the run SHALL be eligible for `Forward-Resume of a Stranded Mid-Pipeline Run` rather than left inert
+
+#### Scenario: Auto-Finalize defers to a live resume lease
+
+- **GIVEN** a session with a live resume lease (an unreleased `forward_resume` lease within the lease TTL)
+- **WHEN** reconciliation runs, even if a `round_completed` event has just appeared
+- **THEN** Auto-Finalize SHALL NOT close the session until the lease is released
+
+### Requirement: Finalization Is First-Wins Idempotent
+
+An execution's finalization MAY be triggered by the `result` event, the process `close`, the watchdog, or cancel. Exactly one SHALL take effect; the rest SHALL be no-ops, so a row is never double-finalized or double-emitted.
+
+#### Scenario: Result then close
+
+- **WHEN** an execution is finalized by one trigger and another fires later
+- **THEN** the later trigger SHALL not overwrite the recorded exit code or re-emit completion
+
+### Requirement: Forward-Resume of a Stranded Mid-Pipeline Run
+
+A stranded mid-pipeline run SHALL be forward-resumable from its current phase by an entity that outlives the agent turn. The **stranded session** signature is a session that is `active`, whose current round has **no** terminal `round_completed` event, and whose owning agent turn has ended — left when the turn ends between phases (e.g. after entering `reviews`, before reaching `complete-round`). This is the missing twin of `Auto-Finalize a Completed-But-Open Session`: that requirement advances a run whose work is *done*; this one advances a run whose work is *unfinished*. It applies to the **review** workflow only; stranded `map` runs are out of scope for this change.
+
+**Forward target — the event-sourced `current_phase`, never a re-derived "validated phase".** The resume target SHALL be the session's `current_phase` as projected from the latest `phase_transition` event (which is emitted at phase *entry*). Forward-resume SHALL re-enter `current_phase` and drive the pipeline forward to `round_completed`; it SHALL NOT regress `current_phase` to an earlier phase. The system makes **no** event-log claim that a phase's *artifact* is "validated" (the event log records only phase entry and the terminal `round_completed`/`map_completed`); instead, re-running `current_phase` is **idempotent by virtue of the workflow's own phase execution** — e.g. Phase 4 re-spawns only the reviewers whose outputs are not already present. Forward-resume thus reuses already-produced artifacts as a property of the workflow, not as a guarantee derived from the event log.
+
+**Forward-resume continues from `current_phase`; it SHALL NOT re-initialize the round.** Forward-resume continues an *in-progress* round from its `current_phase`. It SHALL NOT go through the `ocr state begin` re-open path, which is reserved for starting the *next* round on a completed session and resets the phase to the workflow's initial phase (`context`); routing a stranded mid-pipeline run through `begin` would regress `current_phase` and is forbidden.
+
+**Single-writer resume lease (the concurrency guard).** Because the resume continuation runs as a long-lived agent turn *outside* any single database transaction, mutual exclusion SHALL be enforced by a **resume lease**, not by inferring it from finalization of an unrelated execution row. The lease is a `session_resumed` event carrying metadata `{kind: "forward_resume"}` (the same event type already used by `begin`'s new-round re-open, *discriminated by metadata* — like `session_auto_closed_stale {reason}` — so no new event type is introduced). The attempt count and the lease predicate SHALL consider only `session_resumed` events whose `kind` is `forward_resume`, never the new-round re-open events. Each forward-resume SHALL, in one transaction, append such a lease event admitted only if ALL hold: (a) there is no live `forward_resume` lease within the lease TTL (`runtime.forward_resume_lease_seconds`); and (b) the count of `forward_resume` leases for the current round is below the cap. The continuation (skill re-invocation or host spawn) SHALL proceed only if this insert wins. Because the lease event is appended *before* the continuation starts, the attempt is counted even if the continuation dies before doing any work.
+
+**Lease projection invariants (two distinct guards, both required).** These are not equivalent — one is enforced at append, the other at fold — and they cover different attack surfaces:
+
+- **Write-side invariant.** A `forward_resume` lease event SHALL be appended with a NULL `phase`, NULL `phase_number`, and NULL `round` column.
+- **Read-side invariant.** Any projection that derives `current_phase`/`phase_number`/`current_round` from `session_resumed` events SHALL discriminate on `metadata.kind` and SHALL treat `kind = forward_resume` as a no-op for phase/round purposes (see `sqlite-state`'s projection-fold requirements).
+
+This is load-bearing: a lease event that moved `current_phase` would defeat the forward-only rule via its own bookkeeping, so neither guard alone is sufficient.
+
+**Lease lifetime spans the whole continuation, not one hop.** The lease SHALL be held until the continuation emits `round_completed` (success) or the TTL elapses (presumed dead); it SHALL be **renewed** on each `phase_transition` the continuation emits (a heartbeat), NOT released on the first one — otherwise a multi-phase resume (the normal case, e.g. `reviews → aggregation → discourse → synthesis`) would run unprotected after its first transition. `runtime.forward_resume_lease_seconds` SHALL be chosen ≥ the longest expected single-phase duration so a slow-but-alive continuation renews before expiry. Should the TTL nonetheless lapse while a continuation is still alive, a second admitted owner is bounded by the cap and harmless: both continuations are forward-only, reuse present artifacts, and `complete-round` is idempotent (at most one `round_completed` is ever recorded), so a transient double-drive cannot corrupt completion.
+
+**Bounded with an honest non-success terminal.** The attempt count is the number of `forward_resume` lease events for the current round, bounded by `runtime.forward_resume_max_attempts` (default 2). On cap exhaustion the run SHALL be driven to a terminal **non-success close** through the guarded close path using the already-permitted `session_auto_closed_stale` reason event, with metadata recording `{reason: "forward_resume_exhausted", attempts: N}`; its child `agent_sessions` rows are reclassified `orphaned` per `Orphan Reclassification`. This terminal SHALL NOT be reported as a successful completion (no fabricated `round_completed`) and SHALL NOT use `session_aborted`. All on-disk artifacts are preserved so a human can start a fresh review that reuses them. (No new `event_type` is introduced; the closed taxonomy and close-guard are unchanged.)
+
+**Who writes the close (no orphaned writer responsibility):** whichever tier detects exhaustion writes it. On the dashboard tier the watchdog writes it; on the baseline (no-daemon) tier the `ocr review --resume` command writes it when it detects the cap is exhausted (see `Resume Flag on Existing Review Command`). A human-only cap exhaustion therefore never leaves the session inert-`active`, preserving the "exhaustive over `active` strandings" guarantee.
+
+**Positive death evidence (canonical definition).** "Positive death evidence" for an owning turn means every journaled `agent_sessions` instance for the workflow is either ended (`finished_at` set) OR has a PID confirmed dead by the shared liveness probe. A stale heartbeat alone SHALL NOT count as death evidence (a live-but-quiet process must never be force-resumed), and a pid-less, unfinished instance therefore does not qualify. A clean parent-execution exit counts. This definition is load-bearing for both tiers and is referenced (not re-defined) by the dashboard watchdog.
+
+**Discriminated-union event metadata.** This requirement introduces the discriminator pattern twice, both over an existing `event_type`'s `metadata` field (no new `event_type`):
+- `session_resumed.metadata.kind` — legal values: `forward_resume` (a resume lease). Absent/other = `begin`'s new-round re-open.
+- `session_auto_closed_stale.metadata.reason` — legal values include `forward_resume_exhausted` (cap reached) alongside the existing reconcile reasons. The `reason` field is an **open** vocabulary (new reasons MAY be added); consumers SHALL switch on known values and treat unknown reasons as a generic stale close.
+
+**Two tiers.**
+- **Baseline (all hosts, no daemon):** forward-resume is the human re-invoking the review skill. Its Phase 0 reads `ocr state status --json`, observes `next_action = forward_resume`, and continues forward from `current_phase`. This needs **no** vendor resume adapter, **no** captured vendor session id, and **no** death-evidence gate (a human initiating it is the liveness signal). It works identically on all four hosts.
+- **Dashboard-enhanced:** the watchdog auto-detects the stranded-session signature and auto-spawns the host to continue, gated on positive death evidence for the owning turn (a clean parent-execution exit counts as positive death evidence). Auto-spawn uses the per-vendor adapter and is therefore available only on hosts with a resume adapter (Claude Code, OpenCode today); on a host with no adapter the dashboard SHALL surface the "Pick up in terminal" handoff (i.e. the baseline path) rather than auto-spawn.
+
+#### Scenario: A stranded-at-reviews run is classified forward-resumable
+
+- **GIVEN** an `active` session whose current round has `current_phase = reviews` and no `round_completed` event, whose owning turn has ended
+- **WHEN** the stranded-mid-pipeline predicate is evaluated
+- **THEN** the run SHALL be classified forward-resumable with `current_phase = reviews` and a non-empty remaining-phase list through `complete`
+
+#### Scenario: Forward-resume re-enters current_phase and never regresses
+
+- **GIVEN** a forward-resumable run with `current_phase = reviews`
+- **WHEN** forward-resume runs
+- **THEN** it SHALL re-enter `reviews` and drive forward through the remaining phases to `round_completed`
+- **AND** it SHALL NOT regress `current_phase` below `reviews`
+- **AND** re-running `reviews` SHALL reuse already-present reviewer outputs (the workflow re-spawns only missing reviewers)
+
+#### Scenario: The resume lease admits a single writer under concurrency
+
+- **GIVEN** two forward-resume attempts (e.g. a human re-invocation and a dashboard auto-spawn) racing on the same `active` row
+- **WHEN** each tries to append its `forward_resume` lease event
+- **THEN** at most one SHALL be admitted (the others fail the lease predicate and do not start a continuation)
+- **AND** no two continuations SHALL run the same round's remaining phases concurrently
+
+#### Scenario: An attempt that dies before doing work still consumes the cap
+
+- **GIVEN** a forward-resume whose continuation dies before emitting any `phase_transition`
+- **WHEN** the next attempt is considered
+- **THEN** the earlier `forward_resume` lease event SHALL still count toward the cap (no uncounted, unbounded retry)
+
+#### Scenario: The lease event does not regress current_phase
+
+- **GIVEN** a forward-resumable run with `current_phase = reviews`
+- **WHEN** a `forward_resume` lease event is appended
+- **THEN** the projected `current_phase` SHALL remain `reviews` (the lease carries no `phase`/`round` column and the projection ignores `forward_resume`-tagged `session_resumed` for phase/round purposes)
+
+#### Scenario: The lease spans every remaining phase, renewed per transition
+
+- **GIVEN** a forward-resume continuation crossing multiple phases (`reviews → aggregation → discourse → synthesis`)
+- **WHEN** it emits each `phase_transition`
+- **THEN** the lease SHALL be renewed (not released) and SHALL be held until `round_completed` or TTL expiry
+- **AND** no second continuation SHALL be admitted while the lease is live
+
+#### Scenario: Cap exhaustion closes non-success, never as success or abort
+
+- **GIVEN** a run whose current round already has `forward_resume_max_attempts` `forward_resume` lease events without reaching `round_completed`
+- **WHEN** another forward-resume is considered
+- **THEN** the run SHALL be closed via the guarded path with a `session_auto_closed_stale` reason event carrying `{reason: "forward_resume_exhausted"}`
+- **AND** it SHALL NOT be closed as a successful completion and SHALL NOT use `session_aborted`
+- **AND** all on-disk artifacts SHALL be preserved
+
+#### Scenario: Baseline forward-resume needs no adapter or token
+
+- **GIVEN** a forward-resumable run on any host with no dashboard daemon running
+- **WHEN** the human re-invokes the review skill
+- **THEN** Phase 0 SHALL read `next_action = forward_resume` and continue forward from `current_phase`
+- **AND** this SHALL require no vendor resume adapter, no captured vendor session id, and no death-evidence gate
+
+#### Scenario: Dashboard auto-resume requires positive death evidence
+
+- **GIVEN** an `active` stranded run and the dashboard daemon running
+- **WHEN** the owning turn has positive death evidence (e.g. a clean parent-execution exit) and a resume adapter exists for the host
+- **THEN** the watchdog MAY auto-spawn the continuation
+- **AND** if the owning turn is still live or lacks positive death evidence, the watchdog SHALL NOT auto-spawn
+- **AND** if no resume adapter exists for the host, the dashboard SHALL surface "Pick up in terminal" instead of auto-spawning
 

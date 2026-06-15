@@ -1201,7 +1201,7 @@ nx build cli
 ### Shared DB Access Layer
 
 The `ocr state` CLI commands and the dashboard server both need to read/write the same SQLite schema. To prevent drift:
-- A shared internal module (e.g., `packages/cli/src/lib/db/` or a future `packages/db/`) contains: schema DDL, migration runner, typed query functions.
+- A shared internal module (`packages/shared/persistence/`) contains: schema DDL, migration runner, typed query functions.
 - The dashboard server imports this module at build time (or bundles it into `server.js`).
 - The CLI uses it directly for `ocr state init|transition|close|sync`.
 

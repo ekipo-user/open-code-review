@@ -9,7 +9,7 @@
       "executor": "nx:run-commands",
       "dependsOn": [],
       "metadata": {
-        "description": "dependsOn: [] is LOAD-BEARING, not cleanup-bait: it overrides targetDefaults' ^build. The task chain dashboard:test -> cli:build -> cli:build:bundle -> dashboard:build is acyclic ONLY because this target does not in turn depend on cli:build (dashboard imports @open-code-review/cli, so ^build would add that edge and create a task cycle). The dashboard build consumes cli SOURCE via vite aliases / --conditions=source, so it genuinely does not need cli's dist."
+        "description": "dependsOn: [] overrides targetDefaults' ^build. The dashboard consumes its workspace deps (@open-code-review/persistence, /config, /platform) as SOURCE — every shared package's `exports` point at src/*.ts and the build runs esbuild --conditions=source — so there is nothing to pre-build. Kept explicit so a future ^build re-add can't silently introduce a build edge. (cli:build:bundle still depends on dashboard:build to embed dashboard/dist; the reverse edge stays absent because the dashboard no longer depends on cli at all.)"
       },
       "options": {
         "command": "pnpm build",
@@ -26,7 +26,6 @@
     "test": {
       "executor": "@nx/vitest:test",
       "outputs": ["{workspaceRoot}/coverage/packages/dashboard"],
-      "dependsOn": [{ "target": "build", "projects": ["cli"] }],
       "options": {
         "config": "packages/dashboard/vitest.config.ts"
       }

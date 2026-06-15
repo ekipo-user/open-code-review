@@ -18,7 +18,7 @@ import {
   listModelsForVendor,
   SUPPORTED_VENDORS,
   type ModelVendor,
-} from "../lib/models.js";
+} from "@open-code-review/config/models";
 
 const vendorList = SUPPORTED_VENDORS.join(" | ");
 

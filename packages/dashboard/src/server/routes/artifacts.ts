@@ -3,7 +3,7 @@
  */
 
 import { Router } from 'express'
-import type { Database } from '@open-code-review/cli/db'
+import type { Database } from '@open-code-review/persistence'
 import { getSession, getArtifact } from '../db.js'
 
 const VALID_ARTIFACT_TYPES = new Set([

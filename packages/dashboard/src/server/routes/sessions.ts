@@ -8,7 +8,7 @@
  */
 
 import { Router } from 'express'
-import type { Database } from '@open-code-review/cli/db'
+import type { Database } from '@open-code-review/persistence'
 import {
   type SessionRow,
   getAllSessions,

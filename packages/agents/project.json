@@ -4,6 +4,15 @@
   "sourceRoot": "packages/agents",
   "projectType": "library",
   "tags": ["scope:agents", "type:assets"],
+  "targets": {
+    "typecheck": {
+      "executor": "nx:run-commands",
+      "options": {
+        "command": "tsc -p tsconfig.typecheck.json",
+        "cwd": "{projectRoot}"
+      }
+    }
+  },
   "release": {
     "version": {
       "versionActions": "./packages/agents/release/version-actions.ts"

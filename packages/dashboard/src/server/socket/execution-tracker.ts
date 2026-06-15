@@ -8,12 +8,12 @@
  */
 
 import type { Server as SocketIOServer } from 'socket.io'
-import type { Database } from '@open-code-review/cli/db'
+import type { Database } from '@open-code-review/persistence'
 import {
   generateCommandUid,
   appendCommandLog,
   type CommandLogEntry,
-} from '@open-code-review/cli/db'
+} from '@open-code-review/persistence'
 
 export type TrackedExecution = {
   executionId: number
@@ -92,11 +92,16 @@ export function startTrackedExecution(
     finish(exitCode: number | null) {
       const finishedAt = new Date().toISOString()
 
-      // Clear PID so completed commands aren't mistaken for orphans
+      // Clear PID so completed commands aren't mistaken for orphans.
+      // First-wins CAS (`AND finished_at IS NULL`): a row can legitimately reach
+      // finish() more than once (e.g. a `proc.on('close')` AND a `proc.on('error')`
+      // path), and without the guard the second call clobbers the first's recorded
+      // exit code + output. Mirrors finalizer.ts's de-dup so every finalize path in
+      // this package is first-wins.
       db.run(
         `UPDATE command_executions
          SET exit_code = ?, finished_at = ?, output = ?, pid = NULL
-         WHERE id = ?`,
+         WHERE id = ? AND finished_at IS NULL`,
         [exitCode, finishedAt, outputBuffer, executionId],
       )
 

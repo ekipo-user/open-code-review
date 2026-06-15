@@ -42,10 +42,17 @@ context: |
   
   ## Architecture
   
-  Three-package monorepo:
+  Monorepo layout — two application packages over a set of source-only shared libraries:
   - `packages/agents/` — Skills, commands, reviewer personas (pure markdown)
-  - `packages/cli/` — TypeScript CLI for installation, session management, and dashboard hosting
-  - `packages/dashboard/` — React + Socket.IO dashboard for interactive session exploration
+  - `packages/cli/` — TypeScript CLI for installation, session management, and dashboard hosting (app)
+  - `packages/dashboard/` — React + Socket.IO dashboard for interactive session exploration (app)
+  - `packages/shared/platform/` — cross-platform/runtime utilities (process supervision, spawn, verdict/counts)
+  - `packages/shared/persistence/` — the node:sqlite adapter (`db`) + workflow-state lifecycle (`state`) + test-support + vendor-resume + node:sqlite runtime-checks
+  - `packages/shared/config/` — runtime-config + team-config + model catalog
+  Apps depend on the shared libraries, never on each other. The shared packages are
+  `private`, source-only (every `exports` condition points at `src/*.ts`, no build/dist),
+  inlined into each app bundle by esbuild, and excluded from the release set — they are
+  not published; only `cli` + `agents` release.
   
   Key patterns:
   - Config-based context discovery (.ocr/config.yaml)

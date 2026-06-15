@@ -12,7 +12,8 @@ import {
   insertEvent,
   insertSession,
   type Database,
-} from '@open-code-review/cli/db'
+} from '@open-code-review/persistence'
+import { normalizeVerdict, resolveRoundCounts } from '@open-code-review/platform'
 import type { Server as SocketIOServer } from 'socket.io'
 import { parseMapMd } from './parsers/map-parser.js'
 import { parseReviewerOutput } from './parsers/reviewer-parser.js'
@@ -213,6 +214,54 @@ export class FilesystemSync {
     }
   }
 
+  // ── Terminal-completion evidence (defect D1) ──
+  //
+  // The dashboard read/sync path NEVER originates terminal workflow completion.
+  // A `final.md` / `map.md` artifact on disk is evidence of the **synthesis**
+  // phase only; terminal completion is the CLI's to declare and is recognized
+  // solely from the CLI-produced evidence — a `round_completed` / `map_completed`
+  // orchestration event. Closing on artifact presence alone is the fabrication
+  // these helpers exist to prevent.
+
+  /** Whether the CLI has recorded a `round_completed` event for this round. */
+  private hasRoundCompletedEvent(sessionId: string, round: number): boolean {
+    return (
+      queryFirst(
+        this.db,
+        `SELECT 1 FROM orchestration_events
+           WHERE session_id = ? AND event_type = 'round_completed' AND round = ? LIMIT 1`,
+        [sessionId, round],
+      ) != null
+    )
+  }
+
+  /** Whether the CLI has recorded a `map_completed` event for this map run. */
+  private hasMapCompletedEvent(sessionId: string, mapRun: number): boolean {
+    return (
+      queryFirst(
+        this.db,
+        `SELECT 1 FROM orchestration_events
+           WHERE session_id = ? AND event_type = 'map_completed' AND round = ? LIMIT 1`,
+        [sessionId, mapRun],
+      ) != null
+    )
+  }
+
+  /**
+   * Full CLI terminal evidence for a review round: a `round_completed` event AND
+   * a validated `round-meta.json` on disk. Used by the backfill reconciler to
+   * decide whether a discovered-on-disk session is genuinely complete.
+   */
+  private hasTerminalRoundEvidence(sessionId: string, round: number, roundDir: string): boolean {
+    return existsSync(join(roundDir, 'round-meta.json')) && this.hasRoundCompletedEvent(sessionId, round)
+  }
+
+  /** Full CLI terminal evidence for a map run: a `map_completed` event AND a
+   *  validated `map-meta.json` on disk. */
+  private hasTerminalMapEvidence(sessionId: string, mapRun: number, runDir: string): boolean {
+    return existsSync(join(runDir, 'map-meta.json')) && this.hasMapCompletedEvent(sessionId, mapRun)
+  }
+
   // ── Session Backfill ──
 
   private ensureSessionRow(sessionId: string, sessionDir: string): void {
@@ -242,19 +291,32 @@ export class FilesystemSync {
     }
 
     // Derive phase/status from filesystem artifacts.
-    // Default to 'closed' — backfilled sessions are historical artifacts.
-    // Only sessions with incomplete workflows might be active, but those
-    // are created by stateInit, not filesystem discovery.
+    // Default to 'active' — terminal completion is the CLI's, never fabricated
+    // from on-disk artifacts (defect D1). Only the two branches below that find
+    // full CLI terminal evidence (final.md/map.md + round_completed/map_completed
+    // event + meta) may flip status to 'closed'. A `final.md`/`map.md` present
+    // without that event is a synthesis-phase round left for the CLI to heal.
     let phase = 'context'
     let phaseNumber = 1
-    let status: 'active' | 'closed' = 'closed'
+    let status: 'active' | 'closed' = 'active'
 
     if (workflowType === 'review' && hasRoundsDir) {
       const roundDir = join(sessionDir, 'rounds', `round-${currentRound}`)
-      if (existsSync(join(roundDir, 'final.md'))) {
+      if (
+        existsSync(join(roundDir, 'final.md')) &&
+        this.hasTerminalRoundEvidence(sessionId, currentRound, roundDir)
+      ) {
+        // Terminal completion only with the CLI's validated evidence
+        // (round_completed event + round-meta.json), never from final.md alone.
         phase = 'complete'
         phaseNumber = 8
         status = 'closed'
+      } else if (existsSync(join(roundDir, 'final.md'))) {
+        // final.md present but no terminal evidence: synthesis phase only. The
+        // session is NOT closed — healing a legacy round into a completed state
+        // is left to the CLI's `ocr state reconcile` (defect D1).
+        phase = 'synthesis'
+        phaseNumber = 7
       } else if (existsSync(join(roundDir, 'discourse.md'))) {
         phase = 'synthesis'
         phaseNumber = 7
@@ -271,10 +333,19 @@ export class FilesystemSync {
       }
     } else if (workflowType === 'map' && hasMapDir) {
       const runDir = join(mapRunsDir, `run-${currentMapRun}`)
-      if (existsSync(join(runDir, 'map.md'))) {
+      if (
+        existsSync(join(runDir, 'map.md')) &&
+        this.hasTerminalMapEvidence(sessionId, currentMapRun, runDir)
+      ) {
+        // Terminal completion only with the CLI's validated evidence
+        // (map_completed event + map-meta.json), never from map.md alone.
         phase = 'complete'
         phaseNumber = 6
         status = 'closed'
+      } else if (existsSync(join(runDir, 'map.md'))) {
+        // map.md present but no terminal evidence: synthesis phase only, not closed.
+        phase = 'synthesis'
+        phaseNumber = 5
       } else if (existsSync(join(runDir, 'requirements-mapping.md'))) {
         phase = 'synthesis'
         phaseNumber = 5
@@ -550,15 +621,22 @@ export class FilesystemSync {
       }
     }
 
-    // Safety net: if map.md exists but the session is stuck at an earlier phase,
-    // advance to "complete". Handles cases where the AI agent wrote map.md
-    // but crashed or was cancelled before calling `ocr state advance`.
+    // Safety net: recover a map session whose CLI finalize landed the terminal
+    // `map_completed` event but crashed before the close ran. Closes ONLY when
+    // that terminal event exists — map.md presence alone never originates
+    // completion (defect D1). A run with map.md but no `map_completed` event is
+    // left for the CLI to heal, not fabricated complete here.
     const session = queryFirst(
       this.db,
       'SELECT current_phase, phase_number, workflow_type FROM sessions WHERE id = ?',
       [sessionId],
     )
-    if (session && session['workflow_type'] === 'map' && (session['current_phase'] !== 'complete' || (session['phase_number'] as number) < 6)) {
+    if (
+      session &&
+      session['workflow_type'] === 'map' &&
+      this.hasMapCompletedEvent(sessionId, runNumber) &&
+      (session['current_phase'] !== 'complete' || (session['phase_number'] as number) < 6)
+    ) {
       // Bounded reconciler close: route through the CLI's commitReasonClose
       // so the reason event lands BEFORE the status flip in one transaction,
       // satisfying the close-guard trigger. This is one of filesystem-sync's
@@ -791,14 +869,18 @@ export class FilesystemSync {
       return
     }
 
-    // Compute counts — prefer explicit synthesis_counts (deduplicated) over derived
-    const allFindings = meta.reviewers.flatMap((r) => r.findings ?? [])
-    const sc = meta.synthesis_counts
-    const blockerCount = sc?.blockers ?? allFindings.filter((f) => f.category === 'blocker').length
-    const shouldFixCount = sc?.should_fix ?? allFindings.filter((f) => f.category === 'should_fix').length
-    const suggestionCount = sc?.suggestions ?? allFindings.filter((f) => f.category === 'suggestion').length
-    const reviewerCount = meta.reviewers.length
-    const totalFindingCount = allFindings.length
+    // Normalize the verdict to the canonical merge-gate vocabulary at the read
+    // boundary. Legacy rows (e.g. `accept_with_followups`) and minor spelling
+    // drift collapse to a canonical state; an unmappable value is stored raw so
+    // the banner renders its neutral fallback rather than inventing a gate.
+    const normalizedVerdict = normalizeVerdict(meta.verdict) ?? meta.verdict
+
+    // Compute counts via the SINGLE shared rule (defect D3) so the dashboard
+    // reader and the CLI writer cannot derive counts differently: prefer the
+    // deduplicated synthesis_counts when present, else derive per-category from
+    // findings[].category.
+    const { blockerCount, shouldFixCount, suggestionCount, reviewerCount, totalFindingCount } =
+      resolveRoundCounts(meta)
 
     // ── Begin transaction for atomic multi-step mutation ──
     this.db.run('BEGIN TRANSACTION')
@@ -810,7 +892,7 @@ export class FilesystemSync {
              reviewer_count = ?, total_finding_count = ?, source = 'orchestrator', parsed_at = ?
          WHERE session_id = ? AND round_number = ?`,
         [
-          meta.verdict,
+          normalizedVerdict,
           blockerCount,
           suggestionCount,
           shouldFixCount,
@@ -932,7 +1014,7 @@ export class FilesystemSync {
     this.io?.to(`session:${sessionId}`).emit('round:updated', {
       sessionId,
       roundNumber,
-      verdict: meta.verdict,
+      verdict: normalizedVerdict,
       blockerCount,
       shouldFixCount,
       suggestionCount,
@@ -1162,11 +1244,18 @@ export class FilesystemSync {
       // Fallback parser path: no orchestrator data, parse markdown for counts
       const parsed = parseFinalMd(content)
 
+      // Same read-boundary normalization as the orchestrator path: collapse
+      // legacy/aliased verdicts to the canonical gate, keep raw for unmappable.
+      // The parser may yield null (no verdict line) — leave that untouched.
+      const parsedVerdict = parsed.verdict
+        ? (normalizeVerdict(parsed.verdict) ?? parsed.verdict)
+        : parsed.verdict
+
       this.db.run(
         `UPDATE review_rounds SET verdict = ?, blocker_count = ?, suggestion_count = ?, should_fix_count = ?, final_md_path = ?, parsed_at = ?, source = 'parser'
          WHERE session_id = ? AND round_number = ?`,
         [
-          parsed.verdict,
+          parsedVerdict,
           parsed.blockerCount,
           parsed.suggestionCount,
           parsed.shouldFixCount,
@@ -1194,15 +1283,22 @@ export class FilesystemSync {
       }
     }
 
-    // Safety net: if final.md exists but the session is stuck at an earlier phase,
-    // advance to "complete". This handles cases where the AI agent wrote final.md
-    // but crashed or was cancelled before calling `ocr state finish`.
+    // Safety net: recover a session whose CLI finalize landed the terminal
+    // `round_completed` event but crashed before `ocr state finish` flipped the
+    // status. This closes ONLY when that terminal event exists — final.md
+    // presence alone never originates completion (defect D1). A round with
+    // final.md but no `round_completed` event is left for the CLI's
+    // `ocr state reconcile` to heal, not fabricated complete here.
     const session = queryFirst(
       this.db,
       'SELECT current_phase, phase_number, status FROM sessions WHERE id = ?',
       [sessionId],
     )
-    if (session && (session['current_phase'] !== 'complete' || (session['phase_number'] as number) < 8)) {
+    if (
+      session &&
+      this.hasRoundCompletedEvent(sessionId, roundNumber) &&
+      (session['current_phase'] !== 'complete' || (session['phase_number'] as number) < 8)
+    ) {
       // Bounded reconciler close: route through the CLI's commitReasonClose
       // so the reason event lands BEFORE the status flip in one transaction,
       // satisfying the close-guard trigger. This is one of filesystem-sync's

@@ -32,7 +32,10 @@ export function RoundPage() {
   const roundNumber = parseInt(roundStr ?? '0', 10)
 
   const { data: round, isLoading } = useRound(sessionId ?? '', roundNumber)
-  const { data: findings } = useRoundFindings(sessionId ?? '', roundNumber)
+  const { data: findings, isLoading: findingsLoading } = useRoundFindings(
+    sessionId ?? '',
+    roundNumber,
+  )
 
   const { data: finalArtifact } = useArtifact(sessionId ?? '', 'final')
   const { data: finalHumanArtifact } = useArtifact(sessionId ?? '', 'final-human')
@@ -81,22 +84,29 @@ export function RoundPage() {
         <div>
           <div className="flex items-center gap-3">
             <h1 className="text-2xl font-semibold">Round {round.round_number}</h1>
-            <select
-              value={round.progress?.status ?? 'needs_review'}
-              onChange={(e) =>
-                updateStatus.mutate({
-                  roundId: round.id,
-                  status: e.target.value as RoundTriage,
-                })
-              }
-              className="rounded-md border border-zinc-300 bg-white px-2 py-1 text-xs dark:border-zinc-700 dark:bg-zinc-900"
-            >
-              {ROUND_STATUS_OPTIONS.map((opt) => (
-                <option key={opt.value} value={opt.value}>
-                  {opt.label}
-                </option>
-              ))}
-            </select>
+            {/* Axis 2 — your triage status for this round. Distinct from the
+                verdict (the AI's merge gate, shown in the banner below) and from
+                per-finding triage (in the findings table). Labeled so the three
+                are never conflated. */}
+            <label className="flex items-center gap-1.5 text-xs text-zinc-500 dark:text-zinc-400">
+              Your triage
+              <select
+                value={round.progress?.status ?? 'needs_review'}
+                onChange={(e) =>
+                  updateStatus.mutate({
+                    roundId: round.id,
+                    status: e.target.value as RoundTriage,
+                  })
+                }
+                className="rounded-md border border-zinc-300 bg-white px-2 py-1 text-xs text-zinc-900 dark:border-zinc-700 dark:bg-zinc-900 dark:text-zinc-100"
+              >
+                {ROUND_STATUS_OPTIONS.map((opt) => (
+                  <option key={opt.value} value={opt.value}>
+                    {opt.label}
+                  </option>
+                ))}
+              </select>
+            </label>
           </div>
           <p className="mt-1 text-sm text-zinc-500 dark:text-zinc-400">
             {(round.reviewer_outputs ?? []).length} reviewer
@@ -145,10 +155,12 @@ export function RoundPage() {
         />
       )}
 
-      {/* Verdict Banner */}
+      {/* Axis 1 — the merge gate. The banner normalizes the raw verdict to the
+          canonical 3-state vocabulary and carries residual work as a subordinate
+          chip, so the gate and the outstanding-work counts can't contradict. */}
       {round.verdict && (
         <VerdictBanner
-          verdict={round.verdict as 'APPROVE' | 'REQUEST CHANGES' | 'NEEDS DISCUSSION'}
+          verdict={round.verdict}
           blockerCount={round.blocker_count}
           suggestionCount={round.suggestion_count}
           shouldFixCount={round.should_fix_count}
@@ -172,15 +184,15 @@ export function RoundPage() {
         </div>
       </div>
 
-      {/* Findings Table */}
-      {findings && findings.length > 0 && (
-        <div className="rounded-lg border border-zinc-200 bg-white p-6 dark:border-zinc-800 dark:bg-zinc-900">
-          <h2 className="mb-4 text-sm font-medium text-zinc-900 dark:text-zinc-100">
-            Findings ({findings.length})
-          </h2>
-          <FindingsTable findings={findings} />
-        </div>
-      )}
+      {/* Axis 3 — per-finding triage. Always rendered; the table owns its own
+          loading / empty / degraded states so a round with no findings reads as
+          a deliberate "clean" outcome rather than a missing section. */}
+      <div className="rounded-lg border border-zinc-200 bg-white p-6 dark:border-zinc-800 dark:bg-zinc-900">
+        <h2 className="mb-4 text-sm font-medium text-zinc-900 dark:text-zinc-100">
+          Findings{findings ? ` (${findings.length})` : ''}
+        </h2>
+        <FindingsTable findings={findings ?? []} isLoading={findingsLoading} />
+      </div>
 
       {/* Discourse Section */}
       {discourseArtifact && (

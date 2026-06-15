@@ -30,7 +30,7 @@ import {
   pruneDb,
   pruneBackups,
   type DbHealthReport,
-} from "../lib/db/index.js";
+} from "@open-code-review/persistence";
 
 function fail(message: string): never {
   console.error(chalk.red(`Error: ${message}`));

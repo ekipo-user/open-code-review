@@ -24,7 +24,7 @@ import {
   CANCELLED_EXIT_CODE as CANCEL_EXIT_CODE,
   CASCADE_CLOSE_EXIT_CODE,
   WATCHDOG_DEADLINE_EXIT_CODE,
-} from '@open-code-review/cli/db'
+} from '@open-code-review/persistence'
 import type { CommandOutcome } from '../../shared/types.js'
 
 /**

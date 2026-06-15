@@ -11,8 +11,8 @@ import { join, dirname } from "node:path";
 import { createRequire } from "node:module";
 import type { AIToolConfig } from "./config";
 import { ensureGitignore } from "./gitignore.js";
-import type { ReviewersMeta, ReviewerMeta, ReviewerTier } from "./state/types.js";
-import { parseTeamConfigYaml } from "./team-config.js";
+import type { ReviewersMeta, ReviewerMeta, ReviewerTier } from "@open-code-review/persistence/state";
+import { parseTeamConfigYaml } from "@open-code-review/config/team-config";
 import { defaultIconFor } from "@open-code-review/platform";
 
 const require = createRequire(import.meta.url);

@@ -1,0 +1,23 @@
+{
+  "name": "persistence",
+  "$schema": "../../../node_modules/nx/schemas/project-schema.json",
+  "sourceRoot": "packages/shared/persistence/src",
+  "projectType": "library",
+  "tags": ["scope:shared", "type:util"],
+  "targets": {
+    "test": {
+      "executor": "@nx/vitest:test",
+      "outputs": ["{workspaceRoot}/coverage/packages/shared/persistence"],
+      "options": {
+        "config": "packages/shared/persistence/vitest.config.ts"
+      }
+    },
+    "typecheck": {
+      "executor": "nx:run-commands",
+      "options": {
+        "command": "tsc -p tsconfig.typecheck.json",
+        "cwd": "{projectRoot}"
+      }
+    }
+  }
+}

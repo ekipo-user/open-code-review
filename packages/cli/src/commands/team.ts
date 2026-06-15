@@ -30,7 +30,7 @@ import {
   loadTeamConfig,
   resolveTeamComposition,
   type ReviewerInstance,
-} from "../lib/team-config.js";
+} from "@open-code-review/config/team-config";
 import { generateReviewersMeta } from "../lib/installer.js";
 
 // ── Helpers ──

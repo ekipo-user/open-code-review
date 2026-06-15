@@ -15,14 +15,14 @@ import {
   loadTeamConfig,
   resolveTeamComposition,
   type ReviewerInstance,
-} from '@open-code-review/cli/team-config'
+} from '@open-code-review/config/team-config'
 import {
   detectActiveVendor,
   isModelVendor,
   listModelsForVendor,
   SUPPORTED_VENDORS,
   type ModelVendor,
-} from '@open-code-review/cli/models'
+} from '@open-code-review/config/models'
 import { execBinary, type ExecError } from '@open-code-review/platform'
 import { dirname } from 'node:path'
 
