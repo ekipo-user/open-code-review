@@ -1,8 +1,14 @@
-<p align="center">
+<!--
+  The cover banner IS the H1: a real, indexable <h1> element whose accessible /
+  scraped name comes from the image alt ("Open Code Review"). This keeps the
+  semantic heading for SEO + screen readers + the document outline while removing
+  the visually-redundant text line that duplicated the wordmark already in the
+  cover. (GitHub strips inline `style`, so a CSS-hidden <h1> is not an option —
+  wrapping the banner in the heading is the GitHub-valid equivalent.)
+-->
+<h1 align="center">
   <img src="assets/OCR-Github-Cover.png" alt="Open Code Review" width="100%" />
-</p>
-
-<h1 align="center">Open Code Review</h1>
+</h1>
 
 <p align="center">
   <strong>Customizable multi-agent code review for AI-assisted development</strong>
