@@ -84,12 +84,12 @@ Resume SHALL be **forward-only and idempotent**: the continuation reads `current
 - **THEN** the system SHALL look up the most recent agent-session for that workflow with a non-null `vendor_session_id`
 - **AND** SHALL spawn the host CLI with its vendor-native resume flag, the captured `vendor_session_id`, and the fixed CONTROL prompt
 
-#### Scenario: Resume without a captured vendor id spawns a fresh forward-driving turn
+#### Scenario: Resume without a captured vendor id hands off to the baseline skill path
 
-- **GIVEN** a workflow whose host has a resume adapter but for which no `vendor_session_id` was ever captured (e.g. it crashed before the first `session_id` event)
+- **GIVEN** a workflow for which no `vendor_session_id` (and thus no resume adapter binding) was ever captured (e.g. it crashed before the first `session_id` event, or ran on a host with no resume adapter)
 - **WHEN** user runs `ocr review --resume <workflow-session-id>`
-- **THEN** the system SHALL spawn a fresh host turn bound to the existing OCR session, driven by the CONTROL prompt, so forward progress still occurs (continuity is lost but work is not)
-- **AND** the baseline alternative (re-invoking the review skill) SHALL remain available with no flag
+- **THEN** the system SHALL hold the resume lease (so a concurrent auto-resume cannot double-drive) and direct the operator to re-invoke the review skill (`/ocr-review`), whose Phase 0 reads `ocr state status --json` and continues forward from `current_phase` with no adapter — work is preserved, continuity is not required
+- **AND** it SHALL exit zero (this is the honest baseline path, not an error)
 
 #### Scenario: Resume is forward-only and reuses prior work
 

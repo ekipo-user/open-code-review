@@ -40,6 +40,10 @@ import type { WorkflowType } from "@open-code-review/persistence/state";
 import { replayCommandLog } from "@open-code-review/persistence";
 import { ensureDatabase, reconcileLegacyState } from "@open-code-review/persistence";
 import {
+  getForwardResumeMaxAttempts,
+  getAgentHeartbeatSeconds,
+} from "@open-code-review/config/runtime-config";
+import {
   getDb,
   isBusyError,
   linkDashboardInvocationToWorkflow,
@@ -601,12 +605,21 @@ const statusSubcommand = new Command("status")
     requireOcrSetup(targetDir);
     const ocrDir = join(targetDir, ".ocr");
     try {
-      const result = await stateStatus(ocrDir, options.sessionId);
+      // Pass the forward-resume config so a stranded mid-pipeline run (incomplete
+      // + owning turn dead) is classified `forward_resume` / `abort_or_fresh`
+      // with its remaining phases and attempts left.
+      const result = await stateStatus(ocrDir, options.sessionId, {
+        maxAttempts: getForwardResumeMaxAttempts(ocrDir),
+        heartbeatMs: getAgentHeartbeatSeconds(ocrDir) * 1000,
+      });
       if (options.json) {
         console.log(JSON.stringify(result, null, 2));
       } else {
         console.log(`${result.session_id}: ${result.completeness_state}`);
         console.log(chalk.dim(`  next: ${result.next_action}`));
+        if (result.remaining_phases?.length) {
+          console.log(chalk.dim(`  remaining: ${result.remaining_phases.join(" → ")}`));
+        }
       }
     } catch (error) {
       exitFromStateError(error, "Failed to read status");
