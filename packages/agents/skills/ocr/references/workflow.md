@@ -808,7 +808,7 @@ See `references/discourse.md` for detailed instructions.
 
    > **Do NOT write `round-meta.json` directly** — always pipe through the CLI so the schema is validated and the event is recorded atomically.
 
-   > **The CLI fails fast (exit 7, nothing written) — self-correct and re-pipe** if: the `verdict` is not one of the three canonical values; any finding `title` is shorter than 8 characters (a degenerate title like `"s"` carries no information); or a `synthesis_counts` value **exceeds** the number of findings of that category present (you cannot dedup to *more* than you started with — a count ≤ the tally is fine, that's the legitimate cross-reviewer dedup case).
+   > **The CLI fails fast (exit 7, nothing written) — self-correct and re-pipe** if: the `verdict` is not one of the three canonical values; any finding `title` is shorter than 8 characters (a degenerate title like `"s"` carries no information); a `synthesis_counts` value **exceeds** the number of findings of that category present (you cannot dedup to *more* than you started with — a count ≤ the tally is fine, that's the legitimate cross-reviewer dedup case); or the `verdict` contradicts the deduplicated **blocker count** — `APPROVE` requires **0** blockers and `REQUEST CHANGES` requires **≥ 1** (`NEEDS DISCUSSION` is unconstrained). If nothing is a blocker, use `APPROVE` and carry the work as `should_fix`/`suggestion`; if something must block merge, categorize it `blocker` and use `REQUEST CHANGES`.
 
 8. **Write the final review file**:
    ```bash

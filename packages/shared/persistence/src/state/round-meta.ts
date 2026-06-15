@@ -159,6 +159,29 @@ export function validateRoundMeta(meta: unknown): RoundMeta {
     }
   }
 
+  // Directional verdict <-> blocker-count cross-check. The verdict is the merge
+  // gate; it must point the same direction as the blocker count:
+  //   APPROVE          => zero blockers (a mergeable gate cannot coexist with a must-fix)
+  //   REQUEST CHANGES  => >= 1 blocker  (there must be something to block on)
+  //   NEEDS DISCUSSION => unconstrained (undecided pending a human question)
+  // The blocker count is the *deduplicated* `resolveRoundCounts().blockerCount`
+  // (which honors `synthesis_counts.blockers`), NOT the raw category tally — so a
+  // round whose raw blocker findings legitimately dedup to 0 is treated as having
+  // 0 blockers, and this check can never contradict the dedup cross-check above.
+  const { blockerCount } = resolveRoundCounts(obj as RoundMeta);
+  if (verdict === "APPROVE" && blockerCount > 0) {
+    throw new Error(
+      `round-meta.json verdict "APPROVE" is inconsistent with ${blockerCount} blocker finding(s); ` +
+        `APPROVE requires zero blockers (use "REQUEST CHANGES", or carry residual work as should_fix/suggestion/style)`,
+    );
+  }
+  if (verdict === "REQUEST CHANGES" && blockerCount === 0) {
+    throw new Error(
+      `round-meta.json verdict "REQUEST CHANGES" requires at least one blocker finding; found ${blockerCount} ` +
+        `(use "APPROVE" if there is nothing to block on, or "NEEDS DISCUSSION")`,
+    );
+  }
+
   return meta as RoundMeta;
 }
 

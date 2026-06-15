@@ -928,8 +928,11 @@ describe("ocr state complete-round --stdin (async drainer, multi-KB payload)", (
       summary: `Detailed explanation number ${i}: ${"detail ".repeat(25)}`,
     }));
     const roundMeta = {
+      // APPROVE: the 50 findings are all `should_fix` (residual work, zero
+      // blockers), so the merge gate is open — REQUEST CHANGES would require a
+      // blocker under the directional verdict↔blocker-count contract.
       schema_version: 1,
-      verdict: "REQUEST CHANGES",
+      verdict: "APPROVE",
       reviewers: [{ type: "principal", instance: 1, findings }],
     };
     const payload = JSON.stringify(roundMeta);
@@ -959,7 +962,7 @@ describe("ocr state complete-round --stdin (async drainer, multi-KB payload)", (
       reviewers: Array<{ findings: unknown[] }>;
     };
     expect(written.schema_version).toBe(1);
-    expect(written.verdict).toBe("REQUEST CHANGES");
+    expect(written.verdict).toBe("APPROVE");
     expect(written.reviewers[0]?.findings).toHaveLength(50);
   });
 });

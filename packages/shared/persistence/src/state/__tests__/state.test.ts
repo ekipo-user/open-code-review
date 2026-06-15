@@ -1201,6 +1201,71 @@ describe("validateRoundMeta", () => {
     });
     expect(validateRoundMeta(meta)).toBe(meta);
   });
+
+  // ── Directional verdict ↔ blocker-count contract ──
+
+  it("rejects APPROVE when the blocker count is non-zero", () => {
+    // makeRoundMeta() default has 1 blocker finding; APPROVE is inconsistent.
+    expect(() =>
+      validateRoundMeta(makeRoundMeta({ verdict: "APPROVE" })),
+    ).toThrow(/verdict "APPROVE" is inconsistent with 1 blocker/);
+  });
+
+  it("rejects REQUEST CHANGES when the blocker count is zero", () => {
+    // Only should_fix/suggestion findings → zero blockers → nothing to block on.
+    expect(() =>
+      validateRoundMeta({
+        schema_version: 1,
+        verdict: "REQUEST CHANGES",
+        reviewers: [
+          {
+            type: "principal",
+            instance: 1,
+            findings: [
+              { title: "Should fix this", category: "should_fix", severity: "medium", summary: "x" },
+            ],
+          },
+        ],
+      }),
+    ).toThrow(/verdict "REQUEST CHANGES" requires at least one blocker finding; found 0/);
+  });
+
+  it("accepts APPROVE when blocker findings deduplicate to zero via synthesis_counts", () => {
+    // Raw blocker tally is 1, but the deduplicated synthesis count is 0, so the
+    // directional check uses 0 and APPROVE is consistent — no contradiction with
+    // the "synthesis_count <= derived tally" rule.
+    const meta = {
+      schema_version: 1,
+      verdict: "APPROVE",
+      synthesis_counts: { blockers: 0, should_fix: 0, suggestions: 0 },
+      reviewers: [
+        {
+          type: "principal",
+          instance: 1,
+          findings: [
+            { title: "Dup blocker one", category: "blocker", severity: "high", summary: "x" },
+          ],
+        },
+      ],
+    };
+    expect(validateRoundMeta(meta)).toBe(meta);
+  });
+
+  it("accepts REQUEST CHANGES with at least one blocker", () => {
+    const meta = makeRoundMeta(); // default: REQUEST CHANGES + 1 blocker
+    expect(validateRoundMeta(meta)).toBe(meta);
+  });
+
+  it("accepts NEEDS DISCUSSION regardless of blocker count", () => {
+    const withBlocker = makeRoundMeta({ verdict: "NEEDS DISCUSSION" });
+    expect(validateRoundMeta(withBlocker)).toBe(withBlocker);
+    const withoutBlocker = {
+      schema_version: 1,
+      verdict: "NEEDS DISCUSSION",
+      reviewers: [],
+    };
+    expect(validateRoundMeta(withoutBlocker)).toBe(withoutBlocker);
+  });
 });
 
 describe("stateCompleteRound (atomic finalize)", () => {
@@ -1492,12 +1557,14 @@ describe("stateCompleteRound — canonical verdict contract (exit 7)", () => {
 
     // Two should_fix findings present (same issue from two reviewers); the
     // deduplicated synthesis count of 1 is legitimate and must complete.
+    // Verdict is APPROVE: there are zero blockers, only residual should_fix work,
+    // so the merge gate is open (REQUEST CHANGES would require a blocker).
     const result = await stateCompleteRound({
       source: "stdin",
       ocrDir,
       data: JSON.stringify({
         schema_version: 1,
-        verdict: "REQUEST CHANGES",
+        verdict: "APPROVE",
         synthesis_counts: { blockers: 0, should_fix: 1, suggestions: 0 },
         reviewers: [
           {

@@ -1,4 +1,4 @@
-import { CheckCircle2, XCircle, MessageCircle, HelpCircle } from 'lucide-react'
+import { CheckCircle2, XCircle, MessageCircle, HelpCircle, AlertTriangle } from 'lucide-react'
 import { normalizeVerdict, type CanonicalVerdict } from '@open-code-review/platform/verdict'
 import { cn } from '../../lib/utils'
 
@@ -76,6 +76,23 @@ function resolveConfig(verdict: string): VerdictConfig {
   return { ...UNKNOWN_VERDICT_CONFIG, label: label || 'Verdict' }
 }
 
+/**
+ * Whether a verdict contradicts its blocker count in *direction*. This is a
+ * legacy-row concern only: the CLI's directional gate now prevents new rows where
+ * `APPROVE` carries a non-zero blocker count or `REQUEST CHANGES` carries zero.
+ * Older rows, written before that gate, can still disagree — surface a hint
+ * rather than rewrite the stored row. Returns false when the blocker count is
+ * unknown, when the verdict is unmappable, or for `NEEDS DISCUSSION` (which is
+ * unconstrained on blockers).
+ */
+export function hasVerdictMismatch(verdict: string, blockerCount?: number): boolean {
+  if (blockerCount == null) return false
+  const canonical = normalizeVerdict(verdict)
+  if (canonical === 'APPROVE') return blockerCount > 0
+  if (canonical === 'REQUEST CHANGES') return blockerCount === 0
+  return false
+}
+
 export function VerdictBanner({
   verdict,
   blockerCount,
@@ -85,6 +102,7 @@ export function VerdictBanner({
 }: VerdictBannerProps) {
   const config = resolveConfig(verdict)
   const Icon = config.icon
+  const mismatch = hasVerdictMismatch(verdict, blockerCount)
 
   return (
     <div
@@ -101,6 +119,15 @@ export function VerdictBanner({
         <span className={cn('text-lg font-semibold', config.text)}>
           {config.label}
         </span>
+        {mismatch && (
+          <span
+            className="flex items-center gap-1 text-xs font-medium text-amber-600 dark:text-amber-400"
+            title="This verdict disagrees with the blocker count. It predates the directional verdict gate; the stored value is shown as-is."
+          >
+            <AlertTriangle className="h-3.5 w-3.5" />
+            verdict/finding mismatch
+          </span>
+        )}
       </div>
 
       {/* Axis 2 — residual work, visually subordinate to the gate. */}
