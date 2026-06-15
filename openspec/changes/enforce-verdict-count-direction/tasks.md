@@ -19,4 +19,4 @@
 ## 3. Validation
 
 - [x] 3.1 `openspec validate enforce-verdict-count-direction --strict` passes
-- [ ] 3.2 Full suite green; no regression in the existing enum / title / count checks
+- [x] 3.2 Full suite green; no regression in the existing enum / title / count checks
