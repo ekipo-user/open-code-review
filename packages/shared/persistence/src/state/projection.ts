@@ -13,6 +13,7 @@
 
 import type { Database } from "../db/engine.js";
 import { getEventsForSession } from "../db/index.js";
+import { isForwardResumeLease } from "./forward-resume.js";
 
 /**
  * The terminal "reason" event types — non-artifact terminals that explain a
@@ -78,6 +79,12 @@ export function rebuildSessionProjection(
   };
 
   for (const e of events) {
+    // A forward-resume lease is a `session_resumed` event tagged
+    // `{kind: "forward_resume"}`. It is a concurrency annotation, NOT a
+    // lifecycle transition — folding it (like a new-round re-open) would set
+    // status/active and, if it carried a phase, regress `current_phase`. Skip
+    // it entirely so the lease can never move the projection.
+    if (isForwardResumeLease(e)) continue;
     switch (e.event_type) {
       case "session_created":
       case "session_resumed":

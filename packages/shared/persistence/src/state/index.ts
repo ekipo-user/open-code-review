@@ -61,8 +61,13 @@ import { STATE_EXIT, StateError, CASCADE_CLOSE_EXIT_CODE } from "./exit-codes.js
 import {
   phaseNumberFor,
   validatePhaseTransition,
+  initialPhaseFor,
 } from "./phase-graph.js";
 import { validateRoundMeta, computeRoundCounts } from "./round-meta.js";
+import {
+  deriveStrandedStatus,
+  type StrandedConfig,
+} from "./forward-resume.js";
 import { validateMapMeta, computeMapCounts } from "./map-meta.js";
 import {
   hasCompletionInvariant,
@@ -141,6 +146,29 @@ export {
   getCompletenessState,
 } from "./projection.js";
 export type { DerivedLifecycle } from "./projection.js";
+
+// Forward-resume of a stranded mid-pipeline run.
+export {
+  FORWARD_RESUME_KIND,
+  FORWARD_RESUME_EXHAUSTED_REASON,
+  isForwardResumeLease,
+  remainingPhasesAfter,
+  hasTerminalArtifactEvent,
+  countForwardResumeLeases,
+  forwardResumeLeaseState,
+  tryAcquireForwardResumeLease,
+  closeForwardResumeExhausted,
+  hasLiveOwningTurn,
+  deriveStrandedStatus,
+} from "./forward-resume.js";
+export type {
+  StrandedAction,
+  StrandedStatus,
+  StrandedConfig,
+  LeaseState,
+  AcquireOptions,
+  AcquireResult,
+} from "./forward-resume.js";
 
 /**
  * Re-export of the atomic reason-close primitive. It physically lives in the
@@ -246,6 +274,23 @@ export async function stateInit(params: InitParams): Promise<string> {
         `Cannot re-open session ${sessionId} as workflow_type "${workflowType}": ` +
           `existing workflow_type is "${existing.workflow_type}". ` +
           `Maps and reviews have disjoint phase graphs.`,
+      );
+    }
+
+    // Begin's re-open path is for starting the NEXT round on a session whose
+    // current round is complete (or a closed session) — it resets the phase to
+    // the workflow's initial phase. Routing a STILL-ACTIVE, INCOMPLETE run
+    // through it would regress `current_phase` to `context` and silently throw
+    // away mid-pipeline progress. Refuse it: a stranded mid-pipeline run is
+    // recovered by forward-resume (re-invoke the review skill / `ocr review
+    // --resume`), which continues from `current_phase`, not by `begin`.
+    if (existing.status === "active" && !hasCompletionInvariant(db, existing)) {
+      throw new StateError(
+        STATE_EXIT.INVARIANT_UNMET,
+        `Session ${sessionId} is active and its current round is not complete — ` +
+          `'begin' would reset it to "${initialPhaseFor(workflowType)}" and lose progress. ` +
+          `Forward-resume instead: re-run the review (it continues from current_phase via ` +
+          `'ocr state status --json'), or 'ocr review --resume ${sessionId}'.`,
       );
     }
 
@@ -1073,6 +1118,8 @@ export type NextActionKind =
   | "advance"
   | "wait"
   | "reopen"
+  | "forward_resume"
+  | "abort_or_fresh"
   | "none";
 
 export type StatusResult = {
@@ -1094,15 +1141,29 @@ export type StatusResult = {
    */
   next_action: string;
   next_action_kind: NextActionKind;
+  /** For a forward-resumable stall: the ordered phases remaining through
+   *  `complete`. Empty/absent otherwise. */
+  remaining_phases?: string[];
+  /** For a forward-resumable stall: forward-resume attempts left before the
+   *  run is closed non-success. Absent otherwise. */
+  forward_resume_attempts_remaining?: number;
 };
 
 /**
  * Report whether a session is complete and, if not, the next action — the
  * resume-time "what's missing" query backed by the session_completeness view.
+ *
+ * When `forwardResume` config is supplied, an `active` session whose current
+ * round has no terminal artifact AND whose owning turn has ended is classified
+ * `forward_resume` (or `abort_or_fresh` when the cap is exhausted), with the
+ * remaining phases and attempts left. Omitting the config preserves the legacy
+ * behavior (advance / complete_round / wait) for callers that don't care about
+ * the stranded distinction.
  */
 export async function stateStatus(
   ocrDir: string,
   sessionId?: string,
+  forwardResume?: StrandedConfig,
 ): Promise<StatusResult> {
   const db = await ensureDatabase(ocrDir);
   const resolved = resolveSession(db, sessionId);
@@ -1117,6 +1178,8 @@ export async function stateStatus(
 
   let nextAction: string;
   let nextActionKind: NextActionKind;
+  let remainingPhases: string[] | undefined;
+  let attemptsRemaining: number | undefined;
   switch (completenessState) {
     case "complete":
       nextAction = "none — session is complete";
@@ -1137,12 +1200,34 @@ export async function stateStatus(
       if (hasTerminalArtifact) {
         nextAction = "run 'ocr state finish' to close the workflow";
         nextActionKind = "finish";
-      } else if (resolved.current_phase === "synthesis") {
-        nextAction = "pipe round metadata to 'ocr state complete-round --stdin'";
-        nextActionKind = "complete_round";
       } else {
-        nextAction = "advance through the phases, then 'ocr state complete-round'";
-        nextActionKind = "advance";
+        // Incomplete. If a forward-resume config was supplied and the owning
+        // turn has ended, this is a stranded mid-pipeline run: classify it
+        // forward_resume / abort_or_fresh rather than the live-run advance.
+        const stranded =
+          forwardResume && resolved.status === "active"
+            ? deriveStrandedStatus(db, resolved, forwardResume)
+            : null;
+        if (stranded) {
+          remainingPhases = stranded.remainingPhases;
+          attemptsRemaining = stranded.attemptsRemaining;
+          if (stranded.action === "forward_resume") {
+            nextAction =
+              `forward-resume from '${resolved.current_phase}': re-run the review ` +
+              `(it continues via 'ocr state status --json'), or 'ocr review --resume ${resolved.id}'`;
+            nextActionKind = "forward_resume";
+          } else {
+            nextAction =
+              "forward-resume attempts exhausted — abort with 'ocr state finish --abort' or start a fresh review";
+            nextActionKind = "abort_or_fresh";
+          }
+        } else if (resolved.current_phase === "synthesis") {
+          nextAction = "pipe round metadata to 'ocr state complete-round --stdin'";
+          nextActionKind = "complete_round";
+        } else {
+          nextAction = "advance through the phases, then 'ocr state complete-round'";
+          nextActionKind = "advance";
+        }
       }
   }
 
@@ -1160,6 +1245,10 @@ export async function stateStatus(
     dependents_settled: (row?.[3] as number) === 1,
     next_action: nextAction,
     next_action_kind: nextActionKind,
+    ...(remainingPhases ? { remaining_phases: remainingPhases } : {}),
+    ...(attemptsRemaining !== undefined
+      ? { forward_resume_attempts_remaining: attemptsRemaining }
+      : {}),
   };
 }
 

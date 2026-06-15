@@ -5,8 +5,12 @@ import { describe, it, expect, beforeEach, afterEach } from "vitest";
 import {
   DEFAULT_AGENT_HEARTBEAT_SECONDS,
   DEFAULT_WORKFLOW_HARD_DEADLINE_MINUTES,
+  DEFAULT_FORWARD_RESUME_MAX_ATTEMPTS,
+  DEFAULT_FORWARD_RESUME_LEASE_SECONDS,
   getAgentHeartbeatSeconds,
   getWorkflowHardDeadlineMs,
+  getForwardResumeMaxAttempts,
+  getForwardResumeLeaseMs,
 } from "../runtime-config.js";
 
 let tmpDir: string;
@@ -117,5 +121,57 @@ describe("getWorkflowHardDeadlineMs", () => {
     expect(getWorkflowHardDeadlineMs(ocrDir)).toBe(
       DEFAULT_WORKFLOW_HARD_DEADLINE_MINUTES * 60 * 1000,
     );
+  });
+});
+
+describe("getForwardResumeMaxAttempts", () => {
+  it("returns the default when config.yaml does not exist", () => {
+    expect(getForwardResumeMaxAttempts(ocrDir)).toBe(
+      DEFAULT_FORWARD_RESUME_MAX_ATTEMPTS,
+    );
+  });
+
+  it("reads runtime.forward_resume_max_attempts", () => {
+    writeFileSync(
+      join(ocrDir, "config.yaml"),
+      `runtime:\n  forward_resume_max_attempts: 3\n`,
+    );
+    expect(getForwardResumeMaxAttempts(ocrDir)).toBe(3);
+  });
+
+  it("falls back to the safe default for a value < 1 (never a coerced 0)", () => {
+    writeFileSync(
+      join(ocrDir, "config.yaml"),
+      `runtime:\n  forward_resume_max_attempts: 0\n`,
+    );
+    expect(getForwardResumeMaxAttempts(ocrDir)).toBe(
+      DEFAULT_FORWARD_RESUME_MAX_ATTEMPTS,
+    );
+  });
+
+  it("falls back to the safe default for a non-integer value", () => {
+    writeFileSync(
+      join(ocrDir, "config.yaml"),
+      `runtime:\n  forward_resume_max_attempts: "abc"\n`,
+    );
+    expect(getForwardResumeMaxAttempts(ocrDir)).toBe(
+      DEFAULT_FORWARD_RESUME_MAX_ATTEMPTS,
+    );
+  });
+});
+
+describe("getForwardResumeLeaseMs", () => {
+  it("returns the default (in ms) when config.yaml does not exist", () => {
+    expect(getForwardResumeLeaseMs(ocrDir)).toBe(
+      DEFAULT_FORWARD_RESUME_LEASE_SECONDS * 1000,
+    );
+  });
+
+  it("reads runtime.forward_resume_lease_seconds and converts to ms", () => {
+    writeFileSync(
+      join(ocrDir, "config.yaml"),
+      `runtime:\n  forward_resume_lease_seconds: 900\n`,
+    );
+    expect(getForwardResumeLeaseMs(ocrDir)).toBe(900 * 1000);
   });
 });

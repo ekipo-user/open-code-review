@@ -18,6 +18,23 @@ export const DEFAULT_AGENT_HEARTBEAT_SECONDS = 60;
 export const DEFAULT_WORKFLOW_HARD_DEADLINE_MINUTES = 60;
 
 /**
+ * Max forward-resume attempts per round before a stranded mid-pipeline run is
+ * closed non-success. A small bound: two automatic recoveries, then the run is
+ * driven to a recorded `forward_resume_exhausted` terminal (artifacts preserved
+ * for a manual fresh start) rather than retried forever.
+ */
+export const DEFAULT_FORWARD_RESUME_MAX_ATTEMPTS = 2;
+
+/**
+ * Single-writer resume-lease TTL, in seconds. The lease is renewed on each
+ * `phase_transition`, so this need only exceed the longest expected SINGLE
+ * phase (e.g. a cold-cache `reviews` fan-out), not the whole pipeline. A
+ * generous default avoids a slow-but-alive continuation losing its lease and
+ * admitting a second owner.
+ */
+export const DEFAULT_FORWARD_RESUME_LEASE_SECONDS = 1800;
+
+/**
  * Read a `runtime.<key>` positive-integer tunable from `.ocr/config.yaml`.
  *
  * Returns `defaultValue` when the file is absent/unreadable, the key is
@@ -95,5 +112,34 @@ export function getWorkflowHardDeadlineMs(ocrDir: string): number {
     ) *
     60 *
     1000
+  );
+}
+
+/**
+ * Max forward-resume attempts per round. Falls back to
+ * {@link DEFAULT_FORWARD_RESUME_MAX_ATTEMPTS}; a non-integer or value < 1 is
+ * rejected (warned) and the safe default is used — the cap can never be coerced
+ * to an unsafe 0/negative.
+ */
+export function getForwardResumeMaxAttempts(ocrDir: string): number {
+  return readRuntimePositiveInt(
+    ocrDir,
+    "forward_resume_max_attempts",
+    DEFAULT_FORWARD_RESUME_MAX_ATTEMPTS,
+  );
+}
+
+/**
+ * Single-writer resume-lease TTL in MILLISECONDS. Configured as
+ * `runtime.forward_resume_lease_seconds`; falls back to
+ * {@link DEFAULT_FORWARD_RESUME_LEASE_SECONDS}.
+ */
+export function getForwardResumeLeaseMs(ocrDir: string): number {
+  return (
+    readRuntimePositiveInt(
+      ocrDir,
+      "forward_resume_lease_seconds",
+      DEFAULT_FORWARD_RESUME_LEASE_SECONDS,
+    ) * 1000
   );
 }
