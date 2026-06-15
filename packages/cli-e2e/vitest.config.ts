@@ -15,8 +15,11 @@ export default defineConfig({
     testTimeout: 60_000,
     // hookTimeout covers the ONE-TIME synthesis fixture build (~7 real CLI spawns
     // ≈ up to ~55s on a cold Windows runner). Generous on purpose: it is a single
-    // amortized setup, not a per-test budget, so 2x headroom here costs nothing
-    // and the per-test flake surface is gone.
-    hookTimeout: 120_000,
+    // amortized setup, not a per-test budget, so headroom here costs nothing and
+    // the per-test flake surface is gone. 180s (~3.3x the observed build) absorbs
+    // the Windows long tail — a single 30s outlier on any one of the seven cold
+    // spawns would cross a tighter 120s and abort the whole file with a noisy
+    // fixture-setup error, which is worse than the per-test timeout it replaced.
+    hookTimeout: 180_000,
   },
 });

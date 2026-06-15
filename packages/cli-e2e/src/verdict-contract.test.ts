@@ -43,7 +43,7 @@ const SESSION_ID = "2026-06-12-feat-verdict-contract";
 let fixture: SynthesisFixture;
 
 beforeAll(async () => {
-  fixture = await buildSynthesisFixture(SESSION_ID);
+  fixture = await buildSynthesisFixture(SESSION_ID, "feat/verdict-contract");
 });
 beforeEach(() => fixture.restore());
 afterAll(() => fixture?.project.cleanup());
@@ -153,7 +153,7 @@ describe("complete-round idempotency (D2)", () => {
   it("re-run with the artifact present is a no-op that does not re-advance the round", async () => {
     const { project } = fixture;
 
-    const payloadPath = resolve(project.dir, "payload.json");
+    const payloadPath = resolve(project.dir, "payload-idempotency-noop.json");
     writeFileSync(payloadPath, validRoundMeta());
 
     const first = await spawnCli(
@@ -182,7 +182,7 @@ describe("complete-round idempotency (D2)", () => {
   it("re-run after the artifact is deleted re-materializes it without re-advancing the round", async () => {
     const { project } = fixture;
 
-    const payloadPath = resolve(project.dir, "payload.json");
+    const payloadPath = resolve(project.dir, "payload-idempotency-heal.json");
     writeFileSync(payloadPath, validRoundMeta());
 
     const first = await spawnCli(
@@ -259,5 +259,10 @@ describe("verdict fail-fast at complete-round", () => {
     const state = await showState(project, SESSION_ID);
     expect(state.session.current_round).toBe(1);
     expect(state.session.current_phase).toBe("synthesis");
+    // Event-table assertion (strictly stronger than round/phase above): the
+    // fail-fast path must reject the write WITHOUT first committing a
+    // round_completed event. Catches a regression where the event lands before
+    // the schema check fails.
+    expect(roundCompletedCount(state)).toBe(0);
   });
 });

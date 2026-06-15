@@ -1,6 +1,12 @@
 /**
  * Black-box synthesis fixture (amortized arrange) — Khorikov-classical.
  *
+ * This is a **Persistent Fixture** (Meszaros, *xUnit Test Patterns*) realized
+ * via on-disk snapshot/restore: a costly arrangement is built ONCE, snapshotted,
+ * and reset between tests. Candidate for graduation to
+ * `packages/shared/persistence/test-support` if a second e2e suite adopts the
+ * pattern (see CLAUDE.md, "graduation by cause, not by count").
+ *
  * WHY: e2e cases that finalize a round must first walk a review session to the
  * `synthesis` phase. Done per-test, that arrangement is ~7 cold CLI spawns
  * (`state begin` + 6× `state advance`), each booting node + the bundled CLI +
@@ -18,10 +24,16 @@
  * `session_dir`, so the snapshot is only valid for the directory it was built
  * in. The helper therefore only ever writes back into `fixture.project.dir`.
  *
- * Safe to snapshot the DB as plain files: every `ocr` subprocess TRUNCATE-
- * checkpoints the WAL on close, so once the last arrange spawn has exited,
- * `.ocr/data/ocr.db` is a quiesced, complete artifact (the `-wal`/`-shm`
- * sidecars are empty/folded). We copy the whole `data` dir regardless.
+ * Why snapshotting the DB as plain files is safe: `cpSync({ recursive: true })`
+ * copies `ocr.db` together with its `-wal`/`-shm` sidecars as a CONSISTENT SET
+ * after every writer subprocess has exited, and the next reader replays the WAL
+ * transparently on open. (It is NOT safe because the WAL is folded on exit — the
+ * `state` commands the fixture drives never invoke `closeAllDatabases()`, the
+ * only path that runs `PRAGMA wal_checkpoint(TRUNCATE)`; that is `ocr dashboard`
+ * only. So un-checkpointed pages typically still live in `-wal` at exit.) The
+ * consistency guarantee is the copy-them-together-after-quiesce, not a folded
+ * WAL — which is exactly why `restore()` and the snapshot copy the WHOLE `data`
+ * dir, never just `ocr.db`.
  */
 
 import { cpSync, rmSync } from "node:fs";
@@ -29,7 +41,16 @@ import { join, resolve } from "node:path";
 import { spawnCli } from "./spawn-cli.js";
 import { createInitializedProject, type TempProject } from "./temp-project.js";
 
-/** The review phase graph, walked in order to reach `synthesis`. */
+/**
+ * The review phase graph, walked in order to reach `synthesis`.
+ *
+ * NOTE: kept in lockstep with the `change-context → synthesis` spine of
+ * `REVIEW_PHASE_GRAPH` / `REVIEW_PHASE_NUMBERS` in
+ * `packages/shared/persistence/src/state/phase-graph.ts` — the production source
+ * of truth for which phases `state advance` accepts. Black-box duplication on
+ * purpose (this suite imports no internal modules); the build's "doubles as an
+ * integration canary" guarantee below only holds while these stay in sync.
+ */
 const REVIEW_PHASES = [
   "change-context",
   "analysis",
@@ -45,9 +66,12 @@ export interface SynthesisFixture {
   project: TempProject;
   sessionId: string;
   /**
-   * Reset the project's `.ocr` state back to the post-synthesis snapshot, in
-   * place. Call in `beforeEach` so every test starts from an identical, clean
-   * synthesis state regardless of what the previous test mutated.
+   * Reset `.ocr/data` and `.ocr/sessions/{sessionId}` to the post-synthesis
+   * snapshot, in place. Only those two subtrees are restored — anything a test
+   * writes elsewhere in `project.dir` (e.g. payload JSON next to `.ocr/`)
+   * persists across tests. Use a fixed filename per write so re-runs overwrite
+   * cleanly. Call in `beforeEach` so every test starts from an identical, clean
+   * synthesis state regardless of what the previous test mutated under `.ocr/`.
    */
   restore: () => void;
 }
@@ -56,48 +80,54 @@ export interface SynthesisFixture {
  * Build one review session to `synthesis` via the real CLI, then snapshot it.
  * Returns the project, the session id, and an in-place `restore()`.
  *
+ * `branch` is required so the helper carries no consumer-specific identity.
+ *
  * Throws if any arrange spawn fails — surfacing a real `begin`/`advance`
  * regression loudly (this build doubles as the integration check for the
  * arrange chain, so no separate full-chain canary test is needed).
  */
 export async function buildSynthesisFixture(
   sessionId: string,
-  branch = "feat/verdict-contract",
+  branch: string,
 ): Promise<SynthesisFixture> {
   const project = createInitializedProject();
 
-  const begin = await spawnCli(
-    [
-      "state",
-      "begin",
-      "--session-id",
-      sessionId,
-      "--branch",
-      branch,
-      "--workflow-type",
-      "review",
-      "--json",
-    ],
-    { cwd: project.dir },
-  );
-  if (begin.exitCode !== 0) {
-    throw new Error(`synthesis fixture: 'state begin' failed: ${begin.stderr}`);
-  }
-
-  for (const phase of REVIEW_PHASES) {
-    const adv = await spawnCli(
-      ["state", "advance", "--session-id", sessionId, "--phase", phase],
-      { cwd: project.dir },
-    );
-    if (adv.exitCode !== 0) {
+  // Run a CLI subcommand and throw with the exit code + output on failure. The
+  // exit code is the diagnostic that matters (e.g. "exit 7" = SCHEMA_INVALID),
+  // and `--json` mode prints to stdout, so stderr can be empty on a logic fail.
+  const runOrThrow = async (label: string, argv: string[]): Promise<void> => {
+    const r = await spawnCli(argv, { cwd: project.dir });
+    if (r.exitCode !== 0) {
       throw new Error(
-        `synthesis fixture: 'state advance --phase ${phase}' failed: ${adv.stderr}`,
+        `synthesis fixture: ${label} failed (exit ${r.exitCode}): ${r.stderr || r.stdout}`,
       );
     }
+  };
+
+  await runOrThrow("state begin", [
+    "state",
+    "begin",
+    "--session-id",
+    sessionId,
+    "--branch",
+    branch,
+    "--workflow-type",
+    "review",
+    "--json",
+  ]);
+
+  for (const phase of REVIEW_PHASES) {
+    await runOrThrow(`state advance --phase ${phase}`, [
+      "state",
+      "advance",
+      "--session-id",
+      sessionId,
+      "--phase",
+      phase,
+    ]);
   }
 
-  // All arrange subprocesses have exited (WAL truncate-checkpointed on close),
-  // so `.ocr` is a complete, quiesced artifact. Snapshot it.
+  // Snapshot the quiesced .ocr/ (see file header on consistency semantics).
   const ocrDir = resolve(project.dir, ".ocr");
   const snapshotDir = resolve(project.dir, SNAPSHOT_DIRNAME);
   cpSync(ocrDir, snapshotDir, { recursive: true });
