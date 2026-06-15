@@ -1,0 +1,29 @@
+import type { SVGProps } from 'react'
+
+/**
+ * The OCR brand monogram (the interlocking-chevron mark from the brand assets).
+ *
+ * Inlined with `fill="currentColor"` from a single source so it (a) follows the
+ * surrounding text color — matching the wordmark exactly in both light and dark
+ * themes with zero JS and no second asset request — and (b) needs no public
+ * asset wiring. Geometry is verbatim from `assets/OCR-Logo-Icon-{Dark,Light}.svg`
+ * (the two variants differ only in fill, which `currentColor` subsumes).
+ *
+ * Decorative by default (`aria-hidden`); pair it with visible text, or pass an
+ * `aria-label` + `role="img"` when it stands alone.
+ */
+export function OcrLogoIcon(props: SVGProps<SVGSVGElement>) {
+  return (
+    <svg
+      viewBox="0 0 224 372"
+      fill="currentColor"
+      xmlns="http://www.w3.org/2000/svg"
+      aria-hidden="true"
+      {...props}
+    >
+      <path d="M89.8869 121.506C90.7975 127.755 88.7034 134.067 84.2381 138.532L39.604 183.166C31.7936 190.977 31.7936 203.64 39.604 211.451L139.425 311.271C142.772 314.619 144.824 319.045 145.214 323.763L148.305 361.09C148.612 364.803 144.124 366.883 141.49 364.249L5.85787 228.617C2.10714 224.866 0 219.779 0 214.475V180.143C0 174.838 2.10714 169.751 5.85786 166.001L79.2214 92.637C81.5484 90.3099 85.5334 91.632 86.008 94.8886L89.8869 121.506Z" />
+      <path d="M133.868 250.458C132.957 244.209 135.051 237.897 139.517 233.431L184.151 188.797C191.961 180.987 191.961 168.324 184.151 160.513L84.3302 60.6925C80.9827 57.345 78.9311 52.9185 78.5405 48.2006L75.4501 10.8735C75.1427 7.16103 79.6307 5.08094 82.2649 7.71505L217.897 143.347C221.648 147.098 223.755 152.185 223.755 157.489V191.821C223.755 197.126 221.648 202.213 217.897 205.963L144.534 279.327C142.206 281.654 138.221 280.332 137.747 277.075L133.868 250.458Z" />
+      <path d="M68.5498 211.08L127.488 152.142C135.298 144.332 147.961 144.332 155.772 152.142L159.337 155.707L100.399 214.645C92.5886 222.455 79.9253 222.455 72.1148 214.645L68.5498 211.08Z" />
+    </svg>
+  )
+}

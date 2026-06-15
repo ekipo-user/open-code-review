@@ -2,6 +2,7 @@ import { useEffect } from 'react'
 import { Link, useLocation } from 'react-router-dom'
 import { Home, GitBranch, FileSearch, Terminal, Users } from 'lucide-react'
 import { cn } from '../../lib/utils'
+import { OcrLogoIcon } from '../ocr-logo'
 import { useSocket } from '../../providers/socket-provider'
 import { useCommandState } from '../../providers/command-state-provider'
 import { useIdeConfig } from '../../hooks/use-ide-config'
@@ -38,8 +39,8 @@ export function Sidebar() {
 
   return (
     <aside className="flex h-full w-56 flex-col border-r border-zinc-200 bg-zinc-50 dark:border-zinc-800 dark:bg-zinc-950">
-      <div className="group/brand relative flex h-14 items-center gap-2 border-b border-zinc-200 px-4 dark:border-zinc-800">
-        <FileSearch className="h-5 w-5 shrink-0 text-zinc-700 dark:text-zinc-300" />
+      <div className="group/brand relative flex h-14 items-center gap-2.5 border-b border-zinc-200 px-4 dark:border-zinc-800">
+        <OcrLogoIcon className="h-6 w-auto shrink-0 text-zinc-900 dark:text-zinc-100" />
         <div className="min-w-0 flex-1">
           <span className="text-sm font-semibold text-zinc-900 dark:text-zinc-100">
             OCR Dashboard
