@@ -9,7 +9,7 @@ import express from 'express'
 import { createServer } from 'node:http'
 import { existsSync, readFileSync, writeFileSync, unlinkSync, mkdirSync } from 'node:fs'
 import { join, dirname, resolve } from 'node:path'
-import { reapTree, isProcessAlive, execBinary } from '@open-code-review/platform'
+import { reapTree, isProcessAlive, execBinary, spawnBinary } from '@open-code-review/platform'
 import { fileURLToPath } from 'node:url'
 import { randomBytes } from 'node:crypto'
 import { Server as SocketIOServer } from 'socket.io'
@@ -50,7 +50,11 @@ import {
   sqliteUtcMs,
   CANCELLED_EXIT_CODE,
 } from '@open-code-review/persistence'
-import { getAgentHeartbeatSeconds } from '@open-code-review/config/runtime-config'
+import {
+  getAgentHeartbeatSeconds,
+  getForwardResumeMaxAttempts,
+} from '@open-code-review/config/runtime-config'
+import { runForwardResumeSweep } from './services/forward-resume-sweep.js'
 import { reconcileCompletedSessions } from '@open-code-review/persistence/state'
 
 import { homedir } from 'node:os'
@@ -423,6 +427,42 @@ export async function startServer(options: StartServerOptions = {}): Promise<voi
   }
   await reconcileCompleted()
 
+  // ── Forward-resume sweep ──
+  // Recover INCOMPLETE stranded mid-pipeline runs (the #146 class) that
+  // Auto-Finalize deliberately leaves alone: active, no terminal artifact, and a
+  // positively-dead owning turn. Runs AFTER the liveness + completed-but-open
+  // passes so only genuinely-incomplete, dead runs remain. Triggers the SAME CLI
+  // primitive a human would (`ocr review --resume`), which owns the lease/cap/
+  // adapter; the sweep owns only the death-evidence gate and the cap-close.
+  const forwardResumeMaxAttempts = getForwardResumeMaxAttempts(ocrDir)
+  const spawnResume = (sessionId: string): void => {
+    // Detached, fire-and-forget. The CLI command re-checks liveness + acquires
+    // the single-writer lease, so a duplicate trigger cannot double-drive.
+    const child = spawnBinary('ocr', ['review', '--resume', sessionId], {
+      cwd: ocrDir.replace(/\.ocr$/, '') || process.cwd(),
+      stdio: 'ignore',
+      detached: true,
+    })
+    child.on('error', (err) => {
+      console.error(`[ForwardResume] spawn failed for ${sessionId}:`, err.message)
+    })
+    child.unref()
+  }
+  const runForwardResume = (): void => {
+    try {
+      runForwardResumeSweep({
+        db,
+        config: { maxAttempts: forwardResumeMaxAttempts, heartbeatMs: heartbeatSeconds * 1000 },
+        maxAttempts: forwardResumeMaxAttempts,
+        spawnResume,
+        log: (m) => console.log(`  ${m}`),
+      })
+    } catch (err) {
+      console.error('[ForwardResume] sweep failed:', err)
+    }
+  }
+  runForwardResume()
+
   // ── Periodic sweep timer ──
   // Runs every 5 minutes inside the running dashboard so liveness and
   // stale-session cleanup keep happening without a restart. Each sweep
@@ -436,6 +476,8 @@ export async function startServer(options: StartServerOptions = {}): Promise<voi
       // Fire-and-forget: liveness sweep (sync, above) may have just finalized a
       // dead workflow's last execution, making its completed session eligible.
       void reconcileCompleted()
+      // And recover any incomplete stranded mid-pipeline runs.
+      runForwardResume()
     } catch (err) {
       console.error('[sweep] periodic sweep failed:', err)
     }

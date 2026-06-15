@@ -160,6 +160,7 @@ export {
   closeForwardResumeExhausted,
   hasLiveOwningTurn,
   deriveStrandedStatus,
+  strandedActionByCap,
 } from "./forward-resume.js";
 export type {
   StrandedAction,

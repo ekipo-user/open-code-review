@@ -255,15 +255,34 @@ export function deriveStrandedStatus(
 ): StrandedStatus | null {
   const nowMs = cfg.nowMs ?? Date.now();
   if (hasLiveOwningTurn(db, session.id, cfg.heartbeatMs, nowMs)) return null;
+  return strandedActionByCap(db, session, cfg.maxAttempts);
+}
 
+/**
+ * The stranded action keyed ONLY on the cap (forward_resume while attempts
+ * remain, else abort_or_fresh), for a run already KNOWN to be stranded. Callers
+ * with their own, stronger liveness authority (e.g. the dashboard sweep's
+ * PID-confirmed death evidence) use this directly rather than re-applying the
+ * heartbeat gate in {@link deriveStrandedStatus}.
+ */
+export function strandedActionByCap(
+  db: Database,
+  session: {
+    workflow_type: string;
+    current_phase: string;
+    current_round: number;
+    id: string;
+  },
+  maxAttempts: number,
+): StrandedStatus {
   const events = getEventsForSession(db, session.id);
   const leaseCount = countForwardResumeLeases(events, session.current_round);
   const workflowType: WorkflowKind =
     session.workflow_type === "map" ? "map" : "review";
   return {
-    action: leaseCount >= cfg.maxAttempts ? "abort_or_fresh" : "forward_resume",
+    action: leaseCount >= maxAttempts ? "abort_or_fresh" : "forward_resume",
     remainingPhases: remainingPhasesAfter(workflowType, session.current_phase),
-    attemptsRemaining: Math.max(0, cfg.maxAttempts - leaseCount),
+    attemptsRemaining: Math.max(0, maxAttempts - leaseCount),
   };
 }
 
