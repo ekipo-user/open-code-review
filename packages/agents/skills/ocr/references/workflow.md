@@ -4,6 +4,8 @@ Complete 8-phase process for multi-agent code review.
 
 > **CRITICAL**: You MUST call `ocr state advance` **BEFORE starting work** on each phase. The `ocr progress` CLI reads session state for real-time tracking. Transition the `current_phase` and `phase_number` immediately when entering a new phase—do not wait until the phase is complete.
 
+> **DON'T STRAND THE PIPELINE**: Once you start the reviewers (Phase 4), drive the workflow all the way to `ocr state complete-round` **within the same turn**. Do **not** voluntarily end the turn between phases (e.g. spawning reviewers in the background and ending the turn to "wait" for them) — a turn that ends mid-pipeline leaves the round incomplete until it is forward-resumed. This is host-neutral guidance: it does not require or forbid any specific spawning primitive; it just keeps phases 4→7 in one continuous turn. (If a turn does end early anyway, recovery is the forward-resume control loop in Phase 0.)
+
 > **PREREQUISITE**: The `ocr` CLI must be installed (`npm install -g @open-code-review/cli`) or accessible via `npx`. Every phase transition calls `ocr state advance`, which requires the CLI.
 
 ---
@@ -89,6 +91,25 @@ When starting a new round (CURRENT_ROUND > 1), pass the `--current-round` flag t
 - **State exists, files match**: Resume from `current_phase` shown by `ocr state show`
 - **State and files mismatch**: Ask user which to trust
 - **No session exists**: Create session directory and start Phase 1
+
+> **Forward-resume control loop (a stranded mid-pipeline run).** If a prior turn
+> ended between phases (crash, token limit, disconnect, `Ctrl-C`, or a host that
+> finalized the turn on its own), the session is left `active` with no
+> `round_completed`. To recover it, run `ocr state status --json` and **act on
+> `next_action`** — do not infer state from the filesystem:
+> - `next_action = "forward_resume"`: re-enter `current_phase` and continue
+>   **forward** through `remaining_phases` to `complete-round`. **Never regress**
+>   to an earlier phase and **never re-run a phase whose artifact already
+>   exists** — Phase 4 re-spawns only the reviewers whose output files are
+>   missing; aggregation/discourse/synthesis pick up from what's on disk.
+> - `next_action = "abort_or_fresh"`: automatic recovery is exhausted — tell the
+>   user to start a fresh review or `ocr state finish --abort`.
+> - `next_action = "finish"` / `"none"`: the round is complete; just
+>   `ocr state finish` (or nothing).
+>
+> Do **NOT** call `ocr state begin` on an active, incomplete session — it is for
+> starting the *next* round and will be refused (it would reset the phase to
+> `context` and lose progress).
 
 ### Step 5: Report to user
 
