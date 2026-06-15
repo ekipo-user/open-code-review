@@ -9,6 +9,11 @@
  *      Items can be `### Title` sub-headings or `- bullet` list items.
  */
 
+import {
+  normalizeVerdict,
+  CANONICAL_VERDICTS,
+} from '@open-code-review/platform/verdict'
+
 export type ParsedFinal = {
   verdict: string | null
   blockerCount: number
@@ -22,43 +27,34 @@ const SHOULD_FIX_RE = /^\*\*Should\s*Fix\*\*\s*:?\s*(\d+)/im
 const SUGGESTIONS_RE = /^\*\*Suggestions?\*\*\s*:?\s*(\d+)/im
 
 /**
- * Verdict label whitelist. Matched case-insensitively against the start of
- * the captured verdict string so reviewers can write
- * `**Verdict**: REQUEST CHANGES — long-form rationale...` and the parsed
- * `verdict` field stays a short status label suitable for the session-card
- * badge. Order matters: longer phrases must come first so
- * `CHANGES REQUESTED` doesn't lose its second word to a `CHANGES` prefix.
- */
-const KNOWN_VERDICTS = [
-  'REQUEST CHANGES',
-  'CHANGES REQUESTED',
-  'NEEDS DISCUSSION',
-  'NEEDS WORK',
-  'APPROVED',
-  'APPROVE',
-  'LGTM',
-  'BLOCK',
-  'REJECT',
-] as const
-
-/**
- * Reduces a captured verdict line to a short status label.
+ * Reduces a captured verdict line to a short status label for the session-card
+ * badge. Aliases are canonicalized by the SINGLE shared `normalizeVerdict`
+ * (`@open-code-review/platform/verdict`) — no second alias table lives here
+ * (the old local `KNOWN_VERDICTS` was the exact D3 single-source-of-truth
+ * hazard the design eliminated for counts).
  *
- * - Strips wrapping bold markers (`**APPROVED**` → `APPROVED`).
- * - If the cleaned text starts with a known verdict keyword, returns just
- *   the keyword (so `REQUEST CHANGES — long rationale` → `REQUEST CHANGES`).
- * - Otherwise returns the text up to the first sentence break (`—`, `:`,
- *   `.`), capped at 40 chars so unfamiliar verdict phrasings still render
- *   as a badge rather than a paragraph.
+ * - Strips wrapping bold markers (`**APPROVE**` → `APPROVE`).
+ * - If the cleaned text canonicalizes (exact or a known alias like `APPROVED`,
+ *   `LGTM`, `CHANGES REQUESTED`), returns the canonical 3-state verdict.
+ * - Else if it *starts with* a canonical verdict, returns that keyword (so
+ *   `REQUEST CHANGES — long rationale` → `REQUEST CHANGES`).
+ * - Otherwise returns the text up to the first sentence break (`—`, `:`, `.`),
+ *   capped at 40 chars so unfamiliar phrasings still render as a badge.
  */
-function normalizeVerdict(raw: string): string {
+function extractVerdictLabel(raw: string): string {
   const cleaned = raw
     .trim()
     .replace(/^\*+|\*+$/g, '')
     .trim()
 
+  // Single source of truth for alias → canonical mapping.
+  const canonical = normalizeVerdict(cleaned)
+  if (canonical) return canonical
+
+  // Prefix match against the canonical vocabulary for "VERDICT — rationale"
+  // lines the canonicalizer's exact/alias match won't catch.
   const upper = cleaned.toUpperCase()
-  for (const verdict of KNOWN_VERDICTS) {
+  for (const verdict of CANONICAL_VERDICTS) {
     if (upper.startsWith(verdict)) return verdict
   }
 
@@ -77,7 +73,7 @@ export function parseFinalMd(content: string): ParsedFinal {
   if (verdictMatch) {
     const captured = (verdictMatch[1] ?? '').trim()
     if (captured.length > 0) {
-      verdict = normalizeVerdict(captured)
+      verdict = extractVerdictLabel(captured)
     }
   }
 

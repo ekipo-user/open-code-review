@@ -628,6 +628,12 @@ function spawnAiCommand(
         finishExecution(io, db, ocrDir, executionId, decision.exitCode, entry.outputBuffer)
         return
       }
+      default: {
+        // Exhaustive-switch guard: a new WatchdogTickDecision action surfaces
+        // here at compile time rather than silently falling through at runtime.
+        const _exhaustive: never = decision
+        throw new Error(`unhandled watchdog action: ${JSON.stringify(_exhaustive)}`)
+      }
     }
   }, WATCHDOG_TICK_MS)
   entry.watchdog.unref()

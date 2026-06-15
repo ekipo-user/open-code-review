@@ -2,6 +2,8 @@
  * Types for OCR state management.
  */
 
+import type { CanonicalVerdict } from "@open-code-review/platform";
+
 export type WorkflowType = "review" | "map";
 
 export type SessionStatus = "active" | "closed";
@@ -97,7 +99,12 @@ export type SynthesisCounts = {
 
 export type RoundMeta = {
   schema_version: number;
-  verdict: string;
+  // The write-boundary verdict is always one of the canonical 3 states —
+  // `validateRoundMeta` is the only producer of a RoundMeta and rejects anything
+  // off-vocabulary (exit 7). Encoding that in the type makes any future write
+  // path that bypasses validation a compile error. (The READ boundary — DB DTOs
+  // like `latest_verdict` — stays `string` for legacy tolerance.)
+  verdict: CanonicalVerdict;
   reviewers: RoundMetaReviewer[];
   /** Post-synthesis counts matching final.md. Preferred over derived counts. */
   synthesis_counts?: SynthesisCounts;

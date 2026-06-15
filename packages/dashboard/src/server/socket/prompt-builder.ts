@@ -187,8 +187,9 @@ export function buildPrompt(opts: BuildPromptOptions): {
       } else if (arg === '--reviewer' && i + 1 < subArgs.length) {
         const raw = subArgs[i + 1] ?? ''
         const countMatch = raw.match(/^(\d+):(.+)$/)
-        if (countMatch) {
-          reviewerDescriptions.push({ description: countMatch[2]!, count: parseInt(countMatch[1]!, 10) })
+        const [, countStr, description] = countMatch ?? []
+        if (countStr && description) {
+          reviewerDescriptions.push({ description, count: parseInt(countStr, 10) })
         } else {
           reviewerDescriptions.push({ description: raw, count: 1 })
         }

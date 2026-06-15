@@ -18,6 +18,11 @@ export default defineConfig({
   // not a retry-masked band-aid.
   fullyParallel: false,
   workers: 1,
+  // Pin retries to 0 on BOTH sides of the CI boundary. The Nx preset defaults to
+  // `retries: process.env.CI ? 2 : 0`, which would silently retry — and hide —
+  // real flakes on CI, exactly where they matter most. The contract is "retries
+  // stay 0 so real flakes surface"; make it hold everywhere, not just locally.
+  retries: 0,
   use: {
     baseURL,
     trace: "on-first-retry",

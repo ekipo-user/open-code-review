@@ -50,8 +50,11 @@ export function validateRoundMeta(meta: unknown): RoundMeta {
   // (e.g. `accept_with_followups`) is rejected so the orchestrator self-corrects.
   const verdict = sanitizeMetadataString(obj.verdict).trim();
   if (!isCanonicalVerdict(verdict)) {
+    // Echo the RAW value the caller sent (not the sanitized form) so the
+    // operator sees exactly what was rejected — matching the title/category/
+    // severity error paths below.
     throw new Error(
-      `round-meta.json verdict "${verdict}" is not one of: ${CANONICAL_VERDICTS.join(", ")}`,
+      `round-meta.json verdict "${String(obj.verdict)}" is not one of: ${CANONICAL_VERDICTS.join(", ")}`,
     );
   }
   obj.verdict = verdict;
