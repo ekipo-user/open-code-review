@@ -1,3 +1,26 @@
+## 2.3.0 (2026-06-15)
+
+### 🚀 Features
+
+- **brand:** integrate new OCR logo/cover assets in READMEs + dashboard ([52b8483](https://github.com/spencermarx/open-code-review/commit/52b8483))
+- **cli:** forward-only, lease-guarded review --resume + status forward-resume ([6fb6541](https://github.com/spencermarx/open-code-review/commit/6fb6541))
+- **state:** enforce directional verdict↔blocker-count consistency ([a2c829a](https://github.com/spencermarx/open-code-review/commit/a2c829a))
+- **dashboard:** process supervision and database integrity hardening ([4481077](https://github.com/spencermarx/open-code-review/commit/4481077))
+- **verdict:** canonical 3-state verdict contract enforced end to end ([278b308](https://github.com/spencermarx/open-code-review/commit/278b308))
+- **cli:** argv-safety syntax classes for model ids and vendor session ids ([#43](https://github.com/spencermarx/open-code-review/pull/43))
+
+### 🩹 Fixes
+
+- **cli:** externalize ./index.js from the test-support bundle so the DB cache stays a singleton ([#41](https://github.com/spencermarx/open-code-review/pull/41))
+- **cli:** share one vendor-session-id syntax class across bind and capture ([#43](https://github.com/spencermarx/open-code-review/pull/43))
+- migrate raw child_process call sites to the platform wrappers ([#43](https://github.com/spencermarx/open-code-review/pull/43))
+- **platform:** spawn via cross-spawn — argv is data on every platform ([#43](https://github.com/spencermarx/open-code-review/pull/43))
+
+### ❤️ Thank You
+
+- claude-flow @agentic-org
+- Spencer Marx
+
 ## 2.2.1 (2026-06-11)
 
 ### 🩹 Fixes

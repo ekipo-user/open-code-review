@@ -1,3 +1,31 @@
+## 2.3.0 (2026-06-15)
+
+### 🚀 Features
+
+- **brand:** integrate new OCR logo/cover assets in READMEs + dashboard ([52b8483](https://github.com/spencermarx/open-code-review/commit/52b8483))
+- **cli:** argv-safety syntax classes for model ids and vendor session ids ([#43](https://github.com/spencermarx/open-code-review/pull/43))
+- **cli:** forward-only, lease-guarded review --resume + status forward-resume ([6fb6541](https://github.com/spencermarx/open-code-review/commit/6fb6541))
+- **dashboard:** process supervision and database integrity hardening ([4481077](https://github.com/spencermarx/open-code-review/commit/4481077))
+- **dashboard:** auto-forward-resume sweep + exhausted-state recovery UI ([d85333f](https://github.com/spencermarx/open-code-review/commit/d85333f))
+- **state:** enforce directional verdict↔blocker-count consistency ([a2c829a](https://github.com/spencermarx/open-code-review/commit/a2c829a))
+- **state:** forward-resume core for stranded mid-pipeline runs ([#146](https://github.com/spencermarx/open-code-review/issues/146))
+- **verdict:** canonical 3-state verdict contract enforced end to end ([278b308](https://github.com/spencermarx/open-code-review/commit/278b308))
+
+### 🩹 Fixes
+
+- migrate raw child_process call sites to the platform wrappers ([#43](https://github.com/spencermarx/open-code-review/pull/43))
+- **cli:** share one vendor-session-id syntax class across bind and capture ([#43](https://github.com/spencermarx/open-code-review/pull/43))
+- **cli:** externalize ./index.js from the test-support bundle so the DB cache stays a singleton ([#41](https://github.com/spencermarx/open-code-review/pull/41))
+- **dashboard:** deliver prompts over stdin for both adapters ([#43](https://github.com/spencermarx/open-code-review/pull/43))
+- **dashboard:** refuse to spawn an agent CLI with an empty prompt ([#43](https://github.com/spencermarx/open-code-review/pull/43))
+- **dashboard:** run 'ocr team set' from the project root on every platform ([#41](https://github.com/spencermarx/open-code-review/pull/41))
+- **platform:** spawn via cross-spawn — argv is data on every platform ([#43](https://github.com/spencermarx/open-code-review/pull/43))
+
+### ❤️ Thank You
+
+- claude-flow @agentic-org
+- Spencer Marx
+
 ## 2.2.1 (2026-06-11)
 
 ### 🩹 Fixes
