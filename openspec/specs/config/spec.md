@@ -1,7 +1,13 @@
 # config Specification
 
 ## Purpose
-TBD - created by archiving change add-review-map. Update Purpose after archive.
+
+The config capability owns OCR's runtime tunables and team/model configuration:
+the `runtime.*` knobs read from `.ocr/config.yaml` (liveness heartbeat, workflow
+hard deadline, forward-resume cap and lease), the reviewer team configuration,
+and the model catalog. It is a source-only, private shared package
+(`@open-code-review/config`) consumed by the CLI and the dashboard.
+
 ## Requirements
 ### Requirement: Code Review Map Configuration
 
@@ -210,7 +216,7 @@ The system SHALL support an optional `runtime.agent_heartbeat_seconds` setting i
 
 ### Requirement: Configurable Forward-Resume Cap and Lease
 
-The system SHALL expose runtime configuration governing forward-resume bounds, mirroring the existing `runtime.*` key conventions (default, override, invalid-input handling). It SHALL provide `runtime.forward_resume_max_attempts` (the maximum number of forward-resume attempts per round before a run is closed non-success) defaulting to `2`, and `runtime.forward_resume_lease_seconds` (the single-writer resume-lease TTL) defaulting to a positive value sized to exceed the longest single phase. Consistent with the existing `runtime.*` readers, an out-of-domain value (non-integer, or attempts < 1) SHALL fall back to the safe built-in default with a stderr warning rather than be silently coerced to an unsafe value — a bad config never yields a `0`/negative cap and never blocks the CLI.
+The system SHALL expose runtime configuration governing forward-resume bounds, mirroring the existing `runtime.*` key conventions (default, override, invalid-input handling). It SHALL provide `runtime.forward_resume_max_attempts` (the maximum number of forward-resume attempts per round before a run is closed non-success) defaulting to `2`, and `runtime.forward_resume_lease_seconds` (the single-writer resume-lease TTL) defaulting to `1800` (30 minutes — sized to exceed the longest expected single phase, e.g. a cold-cache `reviews` fan-out, since the lease renews on each `phase_transition`). Consistent with the existing `runtime.*` readers, an out-of-domain value (non-integer, or attempts < 1) SHALL fall back to the safe built-in default with a stderr warning rather than be silently coerced to an unsafe value — a bad config never yields a `0`/negative cap and never blocks the CLI.
 
 #### Scenario: Defaults apply when unset
 

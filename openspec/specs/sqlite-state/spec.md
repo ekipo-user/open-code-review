@@ -137,7 +137,8 @@ The system SHALL maintain an append-only event log in the `orchestration_events`
 #### Scenario: Round completed event
 
 - **WHEN** `ocr state round-complete` runs
-- **THEN** a row is inserted with `event_type = 'round_completed'`, the round number in the `round` column, and metadata JSON containing derived counts (`blocker_count`, `critical_count`, `major_count`, `suggestion_count`, `nitpick_count`, `reviewer_count`) and `source: "orchestrator"`
+- **THEN** a row is inserted with `event_type = 'round_completed'`, the round number in the `round` column, and metadata JSON containing the per-round counts in the canonical **category** vocabulary (`blocker_count`, `should_fix_count`, `suggestion_count`, `reviewer_count`, `total_finding_count`) and `source: "orchestrator"`
+- **AND** those per-category counts SHALL be the values returned by the shared `Canonical Round Count Derivation` helper — this scenario records them, it does NOT define a second derivation (the retired `critical_count`/`major_count`/`nitpick_count` fields mixed the severity vocabulary and are not written)
 
 #### Scenario: Map completed event
 
@@ -148,7 +149,7 @@ The system SHALL maintain an append-only event log in the `orchestration_events`
 
 - **GIVEN** events exist in `orchestration_events`
 - **WHEN** any consumer accesses the table
-- **THEN** rows SHALL never be updated or deleted
+- **THEN** rows SHALL NOT be updated or deleted
 - **AND** new events are always appended
 
 #### Scenario: Timeline reconstruction
@@ -407,7 +408,7 @@ The `orchestration_events` log SHALL be the single source of truth for session l
 
 - **WHEN** a lifecycle mutation occurs (e.g. phase advance, round completion, finish)
 - **THEN** the corresponding `orchestration_events` row and the `sessions` projection update SHALL be committed in a single `node:sqlite` transaction
-- **AND** the projection SHALL never reflect a lifecycle fact absent from the event log
+- **AND** the projection SHALL NOT reflect a lifecycle fact absent from the event log
 
 #### Scenario: Completion is derived, not asserted
 
@@ -547,8 +548,14 @@ Per-round finding counts SHALL be derived by a single shared rule, defined once
 and consumed by every producer and consumer of those counts, so the count
 representation cannot drift between the CLI writer and the dashboard reader. The
 rule SHALL be a pure function in `@open-code-review/platform`, exported on a
-Node-free subpath (the same bundle-hygiene discipline as the canonical verdict
-module) so the browser bundle can import it without dragging in Node built-ins.
+Node-free subpath per `package-architecture`'s `Browser-consumed shared code is
+exported on Node-free subpaths` requirement, so the dashboard browser bundle can
+import it without dragging in Node built-ins.
+
+The value the rule returns for the `blocker` category is the **canonical round
+blocker count** — the domain term used by every consumer (the CLI's directional
+verdict check, the synthesizer guidance, the dashboard's mismatch hint) so no
+consumer re-derives it or names a TypeScript symbol in its contract.
 
 The rule SHALL key off the canonical finding-category vocabulary
 (`blocker / should_fix / suggestion / style`) — not ad-hoc count-field names or
@@ -609,7 +616,7 @@ Re-parsing an unchanged or changed markdown artifact SHALL NOT increase the row 
 
 ### Requirement: Orphan Temp File Hygiene
 
-Stale `ocr.db.<pid>.tmp` atomic-write orphans (from the retired sql.js engine, no longer produced) SHALL be reaped on dashboard startup, guarded so that only files whose PID is dead and whose mtime is older than a short window are removed. The live `ocr.db` / `-wal` / `-shm` set SHALL never be touched.
+Stale `ocr.db.<pid>.tmp` atomic-write orphans (from the retired sql.js engine, no longer produced) SHALL be reaped on dashboard startup, guarded so that only files whose PID is dead and whose mtime is older than a short window are removed. The live `ocr.db` / `-wal` / `-shm` set SHALL NOT be touched.
 
 #### Scenario: Startup removes dead temps
 
@@ -620,7 +627,7 @@ Stale `ocr.db.<pid>.tmp` atomic-write orphans (from the retired sql.js engine, n
 
 ### Requirement: Operator Database Maintenance Commands
 
-OCR SHALL provide first-class, on-demand database hygiene via `ocr db doctor / vacuum / prune / prune-backups`, productizing the one-time corruption remediation so any operator's database can be inspected and healed without a migration. `doctor` SHALL report size, reclaimable freelist, `integrity_check`, `foreign_key_check` violations, markdown duplicates, and orphan temp/backup files; `doctor --fix` SHALL run the FK-orphan sweep, markdown dedup, orphan-temp reap, and `VACUUM`. The FK-orphan sweep SHALL toggle `PRAGMA foreign_keys` only in autocommit (never inside a transaction) and SHALL NEVER delete from the system-of-record tables (`sessions`, `orchestration_events`, `agent_sessions`, `command_executions`) — a violation there SHALL be reported for manual review, not auto-deleted. Every mutating operation SHALL snapshot the database file first, and the lock-taking operations (`vacuum`, `doctor --fix`) SHALL refuse to run while a live dashboard owns the database unless explicitly forced. `prune-backups` SHALL delete `<db>.bak.*` snapshots while retaining the N most-recent (default 1) as a safety net, supporting `--dry-run`, and SHALL never touch the live database file — the explicit, operator-driven counterpart to `doctor` merely *reporting* backups.
+OCR SHALL provide first-class, on-demand database hygiene via `ocr db doctor / vacuum / prune / prune-backups`, productizing the one-time corruption remediation so any operator's database can be inspected and healed without a migration. `doctor` SHALL report size, reclaimable freelist, `integrity_check`, `foreign_key_check` violations, markdown duplicates, and orphan temp/backup files; `doctor --fix` SHALL run the FK-orphan sweep, markdown dedup, orphan-temp reap, and `VACUUM`. The FK-orphan sweep SHALL toggle `PRAGMA foreign_keys` only in autocommit (never inside a transaction) and SHALL NOT delete from the system-of-record tables (`sessions`, `orchestration_events`, `agent_sessions`, `command_executions`) — a violation there SHALL be reported for manual review, not auto-deleted. Every mutating operation SHALL snapshot the database file first, and the lock-taking operations (`vacuum`, `doctor --fix`) SHALL refuse to run while a live dashboard owns the database unless explicitly forced. `prune-backups` SHALL delete `<db>.bak.*` snapshots while retaining the N most-recent (default 1) as a safety net, supporting `--dry-run`, and SHALL NOT touch the live database file — the explicit, operator-driven counterpart to `doctor` merely *reporting* backups.
 
 #### Scenario: prune-backups reclaims old snapshots but keeps the newest
 
@@ -643,7 +650,7 @@ OCR SHALL provide first-class, on-demand database hygiene via `ocr db doctor / v
 
 ### Requirement: Artifact Retention Prunes Only Derived Data
 
-`ocr db prune` SHALL remove only the cascade-artifact subtree of OLD CLOSED sessions (bounded by `--older-than` and/or `--keep-sessions`), and SHALL NEVER delete a `sessions` row or any `orchestration_events` — so a pruned session remains fully auditable from its immutable event log. Pruning SHALL require an explicit bound (it does nothing otherwise), SHALL support `--dry-run` to print the exact plan without deleting, and SHALL snapshot before mutating.
+`ocr db prune` SHALL remove only the cascade-artifact subtree of OLD CLOSED sessions (bounded by `--older-than` and/or `--keep-sessions`), and SHALL NOT delete a `sessions` row or any `orchestration_events` — so a pruned session remains fully auditable from its immutable event log. Pruning SHALL require an explicit bound (it does nothing otherwise), SHALL support `--dry-run` to print the exact plan without deleting, and SHALL snapshot before mutating.
 
 #### Scenario: Prune drops artifacts but keeps the audit trail
 
@@ -679,6 +686,17 @@ The **next_action** SHALL be a closed enum, one of:
 - `finish` — the current round/run is complete but the session is still `active` (the `Auto-Finalize` case);
 - `forward_resume` — the run is stranded mid-pipeline (`active`, no `round_completed`, owning turn ended, attempts below cap) and forward-resumable from `current_phase`;
 - `abort_or_fresh` — the run cannot be advanced forward (the cap is exhausted, or there is no legal forward edge), so the operator must abort or start a fresh review.
+
+**"Owning turn ended" is evaluated from the caller's perspective**: it means no
+agent-session instance *other than the caller* is currently advancing the run
+(none unended with a fresh heartbeat). A human re-invoking the review skill is
+itself the takeover signal — Phase 0 reads `status --json` before journaling its
+own new instance, so the prior turn registers as ended and the caller reads
+`next_action = forward_resume` for an incomplete round. The derivation therefore
+does NOT require a *globally* dead workflow (which would wrongly read `none`
+while the caller is alive); it requires only that no OTHER live turn owns the
+round. (The dashboard tier additionally gates auto-spawn on positive death
+evidence — see `Forward-Resume of a Stranded Mid-Pipeline Run`.)
 
 #### Scenario: Derivation reports the current phase and remaining phases
 

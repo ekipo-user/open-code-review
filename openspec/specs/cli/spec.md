@@ -886,7 +886,7 @@ The CLI SHALL provide an `ocr session` subcommand family used by the AI to journ
 
 ### Requirement: Resume Flag on Existing Review Command
 
-The CLI's `ocr review` command SHALL accept a `--resume <workflow-session-id>` flag that re-spawns the host AI CLI to continue a workflow. This flag is the **optional convenience** path used by the dashboard ("Continue here") and by a terminal handoff; the baseline forward-resume path is simply re-invoking the review skill, which needs no flag, no adapter, and no captured vendor id. When a vendor resume adapter exists for the host (Claude Code and OpenCode today) and a `vendor_session_id` was captured, `--resume` SHALL dispatch through that adapter's resume primitive to preserve conversational continuity; otherwise it SHALL spawn a fresh host turn bound to the existing OCR session so forward progress is still possible. In all cases the re-spawned turn is driven by a fixed CONTROL prompt ("read `ocr state status --json`; act on `next_action`"), never by injected review context, and the prompt is identical across hosts with all delivery differences confined to the adapter.
+The CLI's `ocr review` command SHALL accept a `--resume <workflow-session-id>` flag that re-spawns the host AI CLI to continue a workflow. This flag is the **optional convenience** path used by the dashboard ("Continue here") and by a terminal handoff; the baseline forward-resume path is simply re-invoking the review skill, which needs no flag, no adapter, and no captured vendor id. When a vendor resume adapter exists for the host (Claude Code and OpenCode today) and a `vendor_session_id` was captured, `--resume` SHALL dispatch through that adapter's resume primitive to preserve conversational continuity; otherwise it SHALL spawn a fresh host turn bound to the existing OCR session so forward progress is still possible. In all cases the re-spawned turn is driven by the **canonical CONTROL prompt** (defined once in review-orchestration `Atomic Completion Contract`), never by injected review context, and the prompt is identical across hosts with all delivery differences confined to the adapter.
 
 Resume SHALL be **forward-only and idempotent**: the continuation reads `current_phase` from `ocr state status --json` and drives forward, never regressing `current_phase` and never appending a duplicate terminal event. Resume SHALL acquire the single-writer resume lease (`Forward-Resume of a Stranded Mid-Pipeline Run`) before driving forward, and is bounded by `runtime.forward_resume_max_attempts`; when the cap is exhausted it SHALL refuse and direct the operator to `ocr state finish --abort` or a fresh review.
 
@@ -915,7 +915,8 @@ Resume SHALL be **forward-only and idempotent**: the continuation reads `current
 
 - **GIVEN** a stranded run whose current round already has `forward_resume_max_attempts` `forward_resume` lease events
 - **WHEN** user runs `ocr review --resume <workflow-session-id>`
-- **THEN** the command SHALL refuse, exit non-zero, and direct the operator to `ocr state finish --abort` or to start a fresh review
+- **THEN** the command SHALL, in addition to refusing and exiting non-zero, drive the run to the terminal non-success close through the guarded close path (the same `session_auto_closed_stale {reason: "forward_resume_exhausted"}` close the dashboard watchdog would write) — so a no-daemon, human-only cap exhaustion never leaves the session inert-`active`
+- **AND** it SHALL direct the operator to start a fresh review (the run is now closed)
 
 ### Requirement: Instruction File Injection
 
@@ -1046,13 +1047,13 @@ The CLI SHALL provide a semantic, atomic porcelain for workflow lifecycle so tha
 
 - **WHEN** `complete-round` completes successfully for a round
 - **THEN** the canonical `round-meta.json` for that round SHALL be present on disk
-- **AND** there SHALL be no success path on which the `round_completed` event and phase transition are committed while the artifact is absent
+- **AND** there SHALL be no success path on which, **at commit time**, the `round_completed` event and phase transition are committed while the artifact is absent (the invariant binds the commit boundary; a later out-of-band `rm round-meta.json` is recovered by the self-heal path below, not a retroactive violation)
 
 #### Scenario: Re-running complete-round is a safe no-op or self-heals the artifact
 
 - **WHEN** an agent re-runs `complete-round` for a round that already has a `round_completed` event
 - **THEN** if the canonical `round-meta.json` is present, the command SHALL be a safe no-op (no duplicate event, no re-advance)
-- **AND** if the canonical `round-meta.json` is absent, the command SHALL re-materialize it from the recorded round metadata without appending a duplicate `round_completed` event or re-advancing the round
+- **AND** if the canonical `round-meta.json` is absent, the command SHALL re-materialize it **from the recorded round metadata in the `round_completed` event payload** (the source of truth) without appending a duplicate `round_completed` event or re-advancing the round
 
 #### Scenario: Complete-map is atomic for map runs
 
@@ -1069,7 +1070,7 @@ The CLI SHALL provide a semantic, atomic porcelain for workflow lifecycle so tha
 
 - **WHEN** an agent runs `ocr state finish --abort`
 - **THEN** the session SHALL be closed with a `session_aborted` event
-- **AND** the closed session SHALL never be reported as a successful completion
+- **AND** the closed session SHALL NOT be reported as a successful completion
 
 #### Scenario: Status reports completeness and what is missing
 
@@ -1141,7 +1142,7 @@ All OCR process spawning SHALL go through the shared platform wrappers
 (`execBinary`, `execBinaryAsync`, `spawnBinary`), which SHALL pass arguments
 verbatim as argv on every platform — never through an interpreting shell —
 while still resolving Windows `.cmd`/`.bat` shims. Free-text content (prompts,
-requirements, reviewer descriptions) SHALL never be required to be
+requirements, reviewer descriptions) SHALL NOT be required to be
 shell-safe: safety is the spawn layer's job.
 
 #### Scenario: Arguments are not shell-interpreted on Windows

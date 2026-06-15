@@ -390,9 +390,9 @@ The dashboard server SHALL run a FilesystemSync service that parses markdown art
 
 - **WHEN** FilesystemSync processes an artifact
 - **THEN** it SHALL use `INSERT OR REPLACE` (upsert) for artifact tables
-- **AND** it SHALL never delete existing rows
-- **AND** it SHALL never touch user interaction tables (`user_file_progress`, `user_finding_progress`, `user_notes`)
-- **AND** it SHALL never touch orchestration tables (`sessions`, `orchestration_events`)
+- **AND** it SHALL NOT delete existing rows
+- **AND** it SHALL NOT touch user interaction tables (`user_file_progress`, `user_finding_progress`, `user_notes`)
+- **AND** it SHALL NOT touch orchestration tables (`sessions`, `orchestration_events`)
 
 #### Scenario: Skip unchanged files
 
@@ -1719,9 +1719,9 @@ never trigger it.
 
 ### Requirement: DbSyncWatcher Auto-Forward-Resume of Stranded Sessions
 
-In the dashboard-enhanced tier, the `DbSyncWatcher` SHALL detect a stranded mid-pipeline run (per `Forward-Resume of a Stranded Mid-Pipeline Run`) at its existing sweep trigger points and auto-spawn the host to continue, reusing the same `ocr review --resume` primitive a terminal operator would run — the watchdog owns only *triggering* and *bounding*, not a second resume code path. The auto-spawned turn is driven by the fixed CONTROL prompt ("read `ocr state status --json`; act on `next_action`").
+In the dashboard-enhanced tier, the `DbSyncWatcher` SHALL detect a stranded mid-pipeline run (per `Forward-Resume of a Stranded Mid-Pipeline Run`) at its existing sweep trigger points and auto-spawn the host to continue, reusing the same `ocr review --resume` primitive a terminal operator would run — the watchdog owns only *triggering* and *bounding*, not a second resume code path. The auto-spawned turn is driven by the **canonical CONTROL prompt** (defined once in review-orchestration `Atomic Completion Contract`).
 
-Auto-forward-resume SHALL fire only after positive death evidence exists for the owning turn (a clean parent-execution exit counts as positive death evidence; a stale heartbeat alone SHALL NEVER suffice). It SHALL acquire the single-writer resume lease before spawning, SHALL be forward-only (never regressing `current_phase`), and SHALL be bounded by `runtime.forward_resume_max_attempts`; on cap exhaustion it SHALL drive the run to the non-success terminal close (`session_auto_closed_stale` with `{reason: "forward_resume_exhausted"}`) rather than retry. It SHALL never fabricate terminal completion from `final.md` presence. Auto-spawn requires a per-vendor resume adapter; on a host with no adapter the watchdog SHALL NOT auto-spawn and SHALL instead surface the "Pick up in terminal" handoff.
+Auto-forward-resume SHALL fire only after positive death evidence exists for the owning turn (a clean parent-execution exit counts as positive death evidence; a stale heartbeat alone SHALL NOT suffice). It SHALL acquire the single-writer resume lease before spawning, SHALL be forward-only (never regressing `current_phase`), and SHALL be bounded by `runtime.forward_resume_max_attempts`; on cap exhaustion it SHALL drive the run to the non-success terminal close (`session_auto_closed_stale` with `{reason: "forward_resume_exhausted"}`) rather than retry. It SHALL NOT fabricate terminal completion from `final.md` presence. Auto-spawn requires a per-vendor resume adapter; on a host with no adapter the watchdog SHALL NOT auto-spawn and SHALL instead surface the "Pick up in terminal" handoff.
 
 #### Scenario: Watchdog auto-resumes a dead, incomplete, mid-pipeline run
 

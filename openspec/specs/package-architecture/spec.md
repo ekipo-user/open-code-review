@@ -1,7 +1,14 @@
 # package-architecture Specification
 
 ## Purpose
-TBD - created by archiving change refactor-extract-shared-packages. Update Purpose after archive.
+
+The package-architecture capability defines the workspace dependency graph:
+applications (`cli`, `dashboard`) depend on shared libraries under
+`packages/shared/*` and never on one another; shared libraries are source-only,
+private, and inlined into each application's published bundle rather than
+published to npm; and modules graduate from an application into a shared package
+by cross-boundary consumption, not by an export-count threshold.
+
 ## Requirements
 ### Requirement: Applications depend on shared libraries, not on each other
 
@@ -27,12 +34,25 @@ shared between applications SHALL live in dedicated library packages under
 ### Requirement: Shared layers are separated by concern
 
 The extracted shared code SHALL be organized into packages aligned with their
-architectural concern rather than bundled into a single package: persistence (the
-SQLite adapter, the workflow-state lifecycle, and their fixtures) and configuration
-(runtime/team/model configuration). The SQLite adapter (`db`) and the workflow-state
-lifecycle (`state`) SHALL reside in the **same** package because their type modules
-are mutually recursive, so any package boundary between them would form a dependency
-cycle.
+architectural concern rather than bundled into a single package. The shared
+packages and their inhabitants are:
+
+- **`@open-code-review/platform`** — cross-platform/runtime utilities and the
+  browser-safe domain helpers (the canonical verdict and round-count modules,
+  process/liveness probes, spawn helpers). It is itself private and inlined (it
+  is not a public-API exception; see `Shared packages are private and inlined,
+  not published`).
+- **`@open-code-review/persistence`** — the SQLite adapter (`db`), the
+  workflow-state lifecycle (`state`), `test-support`, `vendor-resume`, and the
+  `node:sqlite` runtime preconditions (`runtime-checks`).
+- **`@open-code-review/config`** — `runtime-config`, `team-config`, and the
+  model catalog (`models`).
+
+The SQLite adapter (`db`) and the workflow-state lifecycle (`state`) SHALL reside
+in the **same** package because their type modules are *currently* mutually
+recursive and the connection-cache singleton requires a single module instance;
+a future refactor that breaks the type cycle while preserving the single-cache
+invariant MAY split them.
 
 #### Scenario: db and state share one package without a cycle
 
@@ -75,6 +95,23 @@ release set, mirroring `@open-code-review/platform`.
 - **AND** the published `cli` does not list any `packages/shared/*` package as a
   runtime dependency
 
+### Requirement: Browser-consumed shared code is exported on Node-free subpaths
+
+Any shared module the dashboard **browser** bundle imports SHALL be exported on a
+**Node-free subpath** — a package export condition whose transitive imports
+include no `node:*` built-ins — so the browser bundle builds and runs without
+Node polyfills or a stray `node:fs`/`node:child_process` crash. This is the
+bundle-hygiene discipline established by the canonical verdict module
+(`@open-code-review/platform/verdict`) and extended to the canonical round-count
+module (`@open-code-review/platform/counts`). The package barrel (`.`) MAY pull
+in Node built-ins; the browser SHALL import the Node-free subpath instead.
+
+#### Scenario: A browser-imported helper has no Node built-ins on its subpath
+
+- **WHEN** the dashboard client imports a shared domain helper (e.g. the verdict normalizer or the round-count derivation)
+- **THEN** it imports it from a Node-free subpath export, not the package barrel
+- **AND** the resulting browser bundle contains no `node:*` import from that helper
+
 ### Requirement: Extraction preserves observable behavior
 
 Moving modules out of `cli` into shared packages SHALL NOT change observable
@@ -108,4 +145,19 @@ own code. The prior "extract at the 9th subpath" rule is removed.
 
 - **WHEN** a module is imported only by its owning application's own code
 - **THEN** it remains in that application package and does not earn a shared package
+
+#### Scenario: An e2e package consuming an app module is a cross-boundary trigger
+
+- **WHEN** a module in an application package is imported by that app's e2e package (e.g. `cli-e2e` importing a `cli` module)
+- **THEN** it is a cross-boundary consumption and the module is a graduation candidate, the same as consumption by another application
+
+#### Scenario: Graduation by necessity (single-instance) is also legitimate
+
+- **WHEN** a module must share a single runtime instance with an already-shared module (e.g. `test-support` draining the `db` connection-cache singleton)
+- **THEN** it MAY live in the shared package by *necessity* even if not itself cross-app consumed — co-residence required by a single-instance invariant is a valid cause
+
+#### Scenario: A transitive dependency follows its consumer
+
+- **WHEN** a module graduates to a shared package and depends on another app-internal module
+- **THEN** that transitive dependency SHALL also move to a shared package (an app→shared dependency edge is forbidden in reverse: shared code SHALL NOT import app-internal code)
 
