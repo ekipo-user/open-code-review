@@ -1,3 +1,12 @@
+<p align="center">
+  <a href="https://github.com/spencermarx/open-code-review">
+    <picture>
+      <source media="(prefers-color-scheme: dark)" srcset="https://raw.githubusercontent.com/spencermarx/open-code-review/main/assets/OCR-Logo-Text-Light.png">
+      <img src="https://raw.githubusercontent.com/spencermarx/open-code-review/main/assets/OCR-Logo-Text-Dark.png" alt="Open Code Review" width="300">
+    </picture>
+  </a>
+</p>
+
 # @open-code-review/dashboard
 
 Local web interface for browsing OCR sessions, running reviews, triaging findings, and posting to GitHub. Bundled into the `@open-code-review/cli` package — not published separately.

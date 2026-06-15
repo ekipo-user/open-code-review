@@ -1,5 +1,5 @@
 <p align="center">
-  <img src="assets/open-code-review-logo.png" alt="Open Code Review" width="400" />
+  <img src="assets/OCR-Github-Cover.png" alt="Open Code Review" width="100%" />
 </p>
 
 <h1 align="center">Open Code Review</h1>
