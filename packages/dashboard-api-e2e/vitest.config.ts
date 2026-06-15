@@ -6,10 +6,10 @@ export default defineConfig({
     globals: true,
     environment: "node",
     include: ["src/**/*.test.ts"],
-    // Matches cli-e2e: these cases drive the real CLI/server over child
-    // processes, which are markedly slower to spawn on the Windows runner. Give
-    // 120s/60s headroom so Windows variance does not flake the API E2E job.
-    testTimeout: 120_000,
+    // Fail-fast liveness ceilings (this suite never flaked; the 120s bump was
+    // sympathetic over-inflation). testTimeout 60s is ≥3x the real worst case;
+    // hookTimeout 60s covers the server-boot beforeAll with margin on Windows.
+    testTimeout: 60_000,
     hookTimeout: 60_000,
     pool: "forks",
     poolOptions: {
