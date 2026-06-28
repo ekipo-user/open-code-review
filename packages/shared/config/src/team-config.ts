@@ -345,3 +345,117 @@ export function resolveTeamComposition(
   }
   return result;
 }
+
+// ── Session `--team` shorthand ──
+
+/**
+ * Reviewer-id grammar shared by the `--team` shorthand and reviewer filenames:
+ * lowercase letters/digits separated by single hyphens (e.g. `principal`,
+ * `martin-fowler`). Anchored; rejects leading/trailing/double hyphens and any
+ * uppercase or path-unsafe character.
+ */
+const REVIEWER_ID_PATTERN = /^[a-z0-9]+(?:-[a-z0-9]+)*$/;
+
+/**
+ * Parses the `--team` session override shorthand into a `ReviewerInstance[]`.
+ *
+ * This is the single bridge from the user-facing `--team` flag (a slash-command
+ * argument the AI passes through verbatim — it must NOT parse team specs itself;
+ * the CLI is the one source of truth for the team schema) to the resolved
+ * composition. A `--team` spec REPLACES `default_team` wholesale.
+ *
+ * Strict grammar — the schema is fixed; anything off-spec throws with a precise
+ * message rather than being silently coerced:
+ *
+ *   spec        := entry ( "," entry )*
+ *   entry       := reviewer-id ":" count
+ *   reviewer-id := /^[a-z0-9]+(?:-[a-z0-9]+)*$/   (matches reviewer filenames)
+ *   count       := positive integer ( /^[0-9]+$/, >= 1 )
+ *
+ * The `:count` is REQUIRED (no bare ids), each reviewer-id may appear at most
+ * once, and there is no per-instance model syntax — model customization stays in
+ * `default_team` (the three YAML forms) or `--session-override`. Surrounding
+ * whitespace on the spec and on each entry/token is trimmed; that is hygiene,
+ * not leniency. Every entry expands to `count` instances named `{persona}-{i}`
+ * with the workspace default model applied, so `--team principal:2` resolves
+ * identically to `default_team: { principal: 2 }`.
+ *
+ * Note: this validates the spec's SHAPE, not reviewer existence — a persona id
+ * with no matching `references/reviewers/{id}.md` is a downstream concern (the
+ * spec may legitimately name a project-local custom reviewer).
+ *
+ * @param spec         The raw `--team` value, e.g. `"principal:2,architect:1"`.
+ * @param aliases      User-defined model aliases, for default-model expansion.
+ * @param defaultModel Workspace default model (alias-expanded), or null.
+ */
+export function parseTeamSpec(
+  spec: string,
+  aliases: Record<string, string> = {},
+  defaultModel: string | null = null,
+): ReviewerInstance[] {
+  const trimmed = spec.trim();
+  if (trimmed.length === 0) {
+    throw new Error(
+      "--team spec is empty; expected reviewer-id:count[,reviewer-id:count...]",
+    );
+  }
+
+  const seen = new Set<string>();
+  const result: ReviewerInstance[] = [];
+
+  for (const rawEntry of trimmed.split(",")) {
+    const entry = rawEntry.trim();
+    if (entry.length === 0) {
+      throw new Error(
+        `--team has an empty entry (stray or trailing comma) in "${spec}"`,
+      );
+    }
+
+    const colon = entry.indexOf(":");
+    if (colon === -1) {
+      throw new Error(
+        `--team entry "${entry}" must be "reviewer-id:count" — the :count is required`,
+      );
+    }
+
+    const persona = entry.slice(0, colon).trim();
+    const countRaw = entry.slice(colon + 1).trim();
+
+    if (!REVIEWER_ID_PATTERN.test(persona)) {
+      throw new Error(
+        `--team reviewer id "${persona}" is invalid; expected lowercase letters, digits, and single hyphens (e.g. principal, martin-fowler)`,
+      );
+    }
+    if (seen.has(persona)) {
+      throw new Error(
+        `--team lists "${persona}" more than once; combine its instances into a single entry (e.g. ${persona}:2)`,
+      );
+    }
+    if (!/^[0-9]+$/.test(countRaw)) {
+      throw new Error(
+        `--team count for "${persona}" must be a positive integer (got "${countRaw}")`,
+      );
+    }
+    const count = Number(countRaw);
+    if (count < 1) {
+      throw new Error(
+        `--team count for "${persona}" must be >= 1 (got ${count})`,
+      );
+    }
+
+    seen.add(persona);
+    const model = resolveModel(null, null, aliases, defaultModel);
+    if (model !== null) assertSafeModelId(model, `--team ${persona}`);
+
+    for (let i = 0; i < count; i++) {
+      result.push({
+        persona,
+        instance_index: i + 1,
+        name: `${persona}-${i + 1}`,
+        model,
+      });
+    }
+  }
+
+  return result;
+}

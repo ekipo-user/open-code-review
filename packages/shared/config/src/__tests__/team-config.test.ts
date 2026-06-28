@@ -2,6 +2,7 @@ import { describe, it, expect } from "vitest";
 import {
   assertSafeModelId,
   parseTeamConfigYaml,
+  parseTeamSpec,
   resolveTeamComposition,
   type ReviewerInstance,
 } from "../team-config.js";
@@ -261,5 +262,78 @@ describe("assertSafeModelId — vendor-id syntax class (issue #43)", () => {
     const { team } = parseTeamConfigYaml(`default_team:\n  security: 1\n`);
     expect(team[0]!.model).toBeNull();
     expect(() => resolveTeamComposition([], team)).not.toThrow();
+  });
+});
+
+describe("parseTeamSpec — `--team` session shorthand", () => {
+  it("expands reviewer-id:count into named instances", () => {
+    expect(parseTeamSpec("principal:2,quality:1")).toEqual([
+      { persona: "principal", instance_index: 1, name: "principal-1", model: null },
+      { persona: "principal", instance_index: 2, name: "principal-2", model: null },
+      { persona: "quality", instance_index: 1, name: "quality-1", model: null },
+    ]);
+  });
+
+  it("resolves identically to the default_team Form-1 shorthand", () => {
+    const { team } = parseTeamConfigYaml(`default_team:\n  principal: 2\n`);
+    expect(parseTeamSpec("principal:2")).toEqual(team);
+  });
+
+  it("accepts hyphenated and custom (non-default_team) reviewer ids", () => {
+    const spec = parseTeamSpec("architect:1,martin-fowler:1,infrastructure:1,ai:1");
+    expect(spec.map((i) => i.name)).toEqual([
+      "architect-1",
+      "martin-fowler-1",
+      "infrastructure-1",
+      "ai-1",
+    ]);
+  });
+
+  it("trims surrounding whitespace on the spec and each entry/token", () => {
+    // Mirrors a real slash-command invocation: `principal:1, quality:1, ai:1`.
+    const spec = parseTeamSpec("  principal:1 , quality:1 ,  ai:1  ");
+    expect(spec.map((i) => i.persona)).toEqual(["principal", "quality", "ai"]);
+  });
+
+  it("applies the workspace default model (alias-expanded) to every instance", () => {
+    const spec = parseTeamSpec("principal:2", { big: "claude-opus-4-7" }, "big");
+    expect(spec.every((i) => i.model === "claude-opus-4-7")).toBe(true);
+  });
+
+  it("rejects an empty spec", () => {
+    expect(() => parseTeamSpec("   ")).toThrow(/empty/i);
+  });
+
+  it("requires an explicit :count (no bare ids)", () => {
+    expect(() => parseTeamSpec("principal")).toThrow(/:count is required/);
+    expect(() => parseTeamSpec("principal:2,quality")).toThrow(/:count is required/);
+  });
+
+  it("rejects a non-integer or non-positive count", () => {
+    expect(() => parseTeamSpec("principal:0")).toThrow(/>= 1/);
+    expect(() => parseTeamSpec("principal:two")).toThrow(/positive integer/);
+    expect(() => parseTeamSpec("principal:1.5")).toThrow(/positive integer/);
+    expect(() => parseTeamSpec("principal:-1")).toThrow(/positive integer/);
+  });
+
+  it("rejects an invalid reviewer id", () => {
+    expect(() => parseTeamSpec("Principal:1")).toThrow(/invalid/);
+    expect(() => parseTeamSpec("my reviewer:1")).toThrow(/invalid/);
+    expect(() => parseTeamSpec("-bad:1")).toThrow(/invalid/);
+  });
+
+  it("rejects a duplicate reviewer id", () => {
+    expect(() => parseTeamSpec("principal:1,principal:2")).toThrow(/more than once/);
+  });
+
+  it("rejects empty entries from a stray or trailing comma", () => {
+    expect(() => parseTeamSpec("principal:1,")).toThrow(/empty entry/);
+    expect(() => parseTeamSpec("principal:1,,quality:1")).toThrow(/empty entry/);
+  });
+
+  it("rejects a non-vendor-safe resolved default model", () => {
+    expect(() => parseTeamSpec("principal:1", {}, "sonnet|whoami")).toThrow(
+      /--team principal/,
+    );
   });
 });
