@@ -100,10 +100,13 @@ Optional reviewers (added based on change type or user request):
 **Override via natural language**: "add security focus", "use 3 principal reviewers", "include testing"
 
 **Resolving the team at runtime**: Always call `ocr team resolve --json` in Phase 4
-rather than parsing `default_team` yourself. The CLI handles all three schema forms
+rather than parsing the team yourself. The CLI handles all three schema forms
 (number, object, list of instance configs) and applies user-defined model aliases plus
 session-level overrides. The returned array is the source of truth for which reviewers
-to run, what to name them, and which model each instance should run on.
+to run, what to name them, and which model each instance should run on. If the user
+passed a `--team reviewer-id:count,...` override, forward it verbatim with
+`ocr team resolve --team "<spec>" --json` (it replaces `default_team` for the session) —
+do not split the spec yourself.
 
 **Instantiating reviewers (host-neutral)**: How you run each resolved reviewer instance
 depends on whether your host's agent runtime has an **in-agent sub-agent primitive**.
