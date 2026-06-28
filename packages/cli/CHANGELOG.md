@@ -1,3 +1,15 @@
+## 2.4.0 (2026-06-28)
+
+### 🚀 Features
+
+- **skills:** add the OCR Review-to-Approval Loop project skill ([d8146fb](https://github.com/spencermarx/open-code-review/commit/d8146fb))
+- **cli:** honor a session --team override in `team resolve` ([9271257](https://github.com/spencermarx/open-code-review/commit/9271257))
+
+### ❤️ Thank You
+
+- claude-flow @agentic-org
+- Spencer Marx
+
 ## 2.3.0 (2026-06-15)
 
 ### 🚀 Features

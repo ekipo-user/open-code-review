@@ -1,3 +1,20 @@
+## 2.4.0 (2026-06-28)
+
+### 🚀 Features
+
+- **cli:** honor a session --team override in `team resolve` ([9271257](https://github.com/spencermarx/open-code-review/commit/9271257))
+- **config:** add strict --team shorthand parser (parseTeamSpec) ([f0b58e4](https://github.com/spencermarx/open-code-review/commit/f0b58e4))
+- **skills:** add the OCR Review-to-Approval Loop project skill ([d8146fb](https://github.com/spencermarx/open-code-review/commit/d8146fb))
+
+### 🩹 Fixes
+
+- **config:** bound team instance count to prevent a heap-OOM / DoS ([c32ef3e](https://github.com/spencermarx/open-code-review/commit/c32ef3e))
+
+### ❤️ Thank You
+
+- claude-flow @agentic-org
+- Spencer Marx
+
 ## 2.3.0 (2026-06-15)
 
 ### 🚀 Features
