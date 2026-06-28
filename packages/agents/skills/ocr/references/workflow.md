@@ -456,7 +456,7 @@ See `references/context-discovery.md` for detailed algorithm.
 
 5. **Handle `--team` override** (if provided):
 
-   If the user passed `--team reviewer-id:count,...`, use those reviewers **instead of** `default_team` from config. Parse the comma-separated list into reviewer IDs and counts.
+   If the user passed `--team reviewer-id:count,...`, those reviewers are used **instead of** `default_team`. Do **not** parse the spec yourself — carry the exact value through to Phase 4 and pass it to `ocr team resolve --team "<spec>"`. The CLI owns team resolution (the three-form schema, model aliases, and `{persona}-{n}` naming); hand-parsing it here would diverge from `default_team` resolution.
 
 6. **Handle `--reviewer` ephemeral reviewers** (if provided):
 
@@ -491,13 +491,21 @@ instantiation strategy your host CLI supports (parallel sub-agents or sequential
 2. **Resolve the team composition** by calling:
 
    ```bash
+   # Default team from .ocr/config.yaml:
    ocr team resolve --json
+
+   # If the user passed `--team` to the review, forward it verbatim — this
+   # REPLACES default_team for the session:
+   ocr team resolve --team "reviewer-id:count,reviewer-id:count" --json
    ```
 
    This returns a JSON array of `ReviewerInstance` objects, each with `persona`,
    `instance_index`, `name`, and `model` (resolved string or `null`). Use this
    array as the source of truth for which reviewers to spawn and which models to
-   honor — including any session-level overrides the user passed via `--team`.
+   honor. The `--team` spec is the strict shorthand `reviewer-id:count[,...]`
+   (the `:count` is required); the CLI parses and validates it, so never split
+   it yourself. Ephemeral `--reviewer` personas (Phase 3) are added on top of
+   this resolved list.
 
    Example output for a team with two principals on different models:
 
