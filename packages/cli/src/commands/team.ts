@@ -8,7 +8,11 @@
  * `ocr team set` to persist user-edited compositions.
  *
  * Subcommands:
- *   resolve  — Print the resolved ReviewerInstance[] (human or JSON)
+ *   resolve  — Print the resolved ReviewerInstance[] (human or JSON). A
+ *              `--team reviewer-id:count,...` spec replaces `default_team`
+ *              for the session (this is how the AI honors the user's `--team`
+ *              review override — it passes the value through, never parsing it
+ *              itself); `--session-override <json>` merges on top.
  *   set      — Persist a new ReviewerInstance[] (JSON on stdin) to config.yaml
  */
 
@@ -28,6 +32,7 @@ import {
 import { requireOcrSetup } from "../lib/guards.js";
 import {
   loadTeamConfig,
+  parseTeamSpec,
   resolveTeamComposition,
   type ReviewerInstance,
 } from "@open-code-review/config/team-config";
@@ -98,6 +103,10 @@ function parseSessionOverride(raw: string): ReviewerInstance[] {
 const resolveSubcommand = new Command("resolve")
   .description("Resolve and print the team composition for the active workspace")
   .option(
+    "--team <spec>",
+    "Session team override replacing default_team. Format: reviewer-id:count[,reviewer-id:count...] (e.g. principal:2,architect:1)",
+  )
+  .option(
     "--session-override <json>",
     "JSON array of ReviewerInstance overrides applied on top of disk config",
   )
@@ -105,6 +114,7 @@ const resolveSubcommand = new Command("resolve")
   .option("--json", "Emit JSON for programmatic consumption (the AI workflow uses this)")
   .action(
     async (options: {
+      team?: string;
       sessionOverride?: string;
       sessionOverrideStdin?: boolean;
       json?: boolean;
@@ -114,8 +124,17 @@ const resolveSubcommand = new Command("resolve")
       const ocrDir = join(targetDir, ".ocr");
 
       try {
-        const { team } = loadTeamConfig(ocrDir);
+        const { team, aliases, defaultModel } = loadTeamConfig(ocrDir);
 
+        // A `--team` spec replaces default_team wholesale (the AI passes the
+        // user's --team override through verbatim); aliases/defaultModel from
+        // disk still apply so shorthand resolves identically to default_team.
+        const baseTeam = options.team
+          ? parseTeamSpec(options.team, aliases, defaultModel)
+          : team;
+
+        // Keep the dashboard's --session-override path composable with --team:
+        // it merges onto whichever base was chosen above.
         let override: ReviewerInstance[] | undefined;
         if (options.sessionOverride) {
           override = parseSessionOverride(options.sessionOverride);
@@ -126,7 +145,7 @@ const resolveSubcommand = new Command("resolve")
           }
         }
 
-        const resolved = resolveTeamComposition(team, override);
+        const resolved = resolveTeamComposition(baseTeam, override);
 
         if (options.json) {
           console.log(JSON.stringify(resolved, null, 2));

@@ -13,7 +13,7 @@ tags: [ocr, review, code-review]
 **Arguments**
 - `target` (optional): Branch, commit, or file to review. Defaults to staged changes.
 - `--fresh` (optional): Clear any existing session for today's date and start from scratch.
-- `--team` (optional): Override the default reviewer team. Format: `reviewer-id:count,reviewer-id:count`. Example: `--team principal:2,martin-fowler:1`.
+- `--team` (optional): Replace the default reviewer team for this run. Strict format: `reviewer-id:count[,reviewer-id:count...]` — the `:count` is required, each reviewer-id appears once, and ids are lowercase (e.g. `principal`, `martin-fowler`). Example: `--team principal:2,martin-fowler:1`. Forwarded as-is to `ocr team resolve --team`, which parses and validates it.
 - `--reviewer` (optional, repeatable): Add an ephemeral reviewer described in natural language. The Tech Lead will synthesize a focused reviewer persona from the description. Does not persist. Example: `--reviewer "Focus on error handling in the auth flow"`.
 
 **Examples**

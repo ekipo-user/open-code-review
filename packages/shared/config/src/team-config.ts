@@ -8,6 +8,9 @@
  *   2. `principal: { count: 2, model: claude-opus-4-7 }` — object
  *   3. `principal: [{ model: a }, { model: b, name: x }]` — list of instances
  *
+ * A persona may request at most `MAX_INSTANCES_PER_PERSONA` (1–50) instances in
+ * any form; an over-ceiling count is rejected at parse time, not allocated.
+ *
  * All three normalize to a single canonical `ReviewerInstance[]` shape that
  * downstream consumers (the dashboard, `ocr team resolve`, the CLI
  * command-runner) speak. Mixing forms within a single persona key is
@@ -47,6 +50,18 @@ export type ParsedTeamConfig = {
   /** Workspace-level model default if set. */
   defaultModel: string | null;
 };
+
+/**
+ * Upper bound on instances a single persona may request, enforced by EVERY
+ * instance-producing path (the three `default_team` YAML forms and the `--team`
+ * shorthand). Without it a count like `principal:99999999999` passes the
+ * positive-integer gate and then drives an unbounded allocation loop that
+ * OOM-crashes the process — turning a typo or an AI-hallucinated `--team` spec
+ * into a DoS, the opposite of the strict-schema contract. 50 is far above any
+ * real review team; the cap exists to fail fast with a precise error, not to
+ * constrain legitimate use.
+ */
+export const MAX_INSTANCES_PER_PERSONA = 50;
 
 /**
  * Reads `.ocr/config.yaml` and parses the team composition.
@@ -136,6 +151,11 @@ function parseEntry(persona: string, entry: unknown): IntermediateInstance[] {
         `default_team.${persona}: count must be a positive integer (got ${entry})`,
       );
     }
+    if (entry > MAX_INSTANCES_PER_PERSONA) {
+      throw new Error(
+        `default_team.${persona}: count must be <= ${MAX_INSTANCES_PER_PERSONA} (got ${entry})`,
+      );
+    }
     return Array.from({ length: entry }, () => ({}));
   }
 
@@ -144,6 +164,11 @@ function parseEntry(persona: string, entry: unknown): IntermediateInstance[] {
     if (entry.length === 0) {
       throw new Error(
         `default_team.${persona}: list form must contain at least one instance`,
+      );
+    }
+    if (entry.length > MAX_INSTANCES_PER_PERSONA) {
+      throw new Error(
+        `default_team.${persona}: list form must contain <= ${MAX_INSTANCES_PER_PERSONA} instances (got ${entry.length})`,
       );
     }
     return entry.map((item, idx) => parseListItem(persona, idx, item));
@@ -169,6 +194,11 @@ function parseEntry(persona: string, entry: unknown): IntermediateInstance[] {
     if (typeof count !== "number" || !Number.isInteger(count) || count < 1) {
       throw new Error(
         `default_team.${persona}: count must be a positive integer (got ${String(count)})`,
+      );
+    }
+    if (count > MAX_INSTANCES_PER_PERSONA) {
+      throw new Error(
+        `default_team.${persona}: count must be <= ${MAX_INSTANCES_PER_PERSONA} (got ${count})`,
       );
     }
     const teamModel = readOptionalString(obj, "model", `default_team.${persona}.model`);
@@ -343,5 +373,129 @@ export function resolveTeamComposition(
     }
     result.push(inst);
   }
+  return result;
+}
+
+// ── Session `--team` shorthand ──
+
+/**
+ * Reviewer-id grammar shared by the `--team` shorthand and reviewer filenames:
+ * lowercase letters/digits separated by single hyphens (e.g. `principal`,
+ * `martin-fowler`). Anchored; rejects leading/trailing/double hyphens and any
+ * uppercase or path-unsafe character.
+ */
+const REVIEWER_ID_PATTERN = /^[a-z0-9]+(?:-[a-z0-9]+)*$/;
+
+/**
+ * Parses the `--team` session override shorthand into a `ReviewerInstance[]`.
+ *
+ * This is the single bridge from the user-facing `--team` flag (a slash-command
+ * argument the AI passes through verbatim — it must NOT parse team specs itself;
+ * the CLI is the one source of truth for the team schema) to the resolved
+ * composition. A `--team` spec REPLACES `default_team` wholesale.
+ *
+ * Strict grammar — the schema is fixed; anything off-spec throws with a precise
+ * message rather than being silently coerced:
+ *
+ *   spec        := entry ( "," entry )*
+ *   entry       := reviewer-id ":" count
+ *   reviewer-id := /^[a-z0-9]+(?:-[a-z0-9]+)*$/   (matches reviewer filenames)
+ *   count       := integer in [1, MAX_INSTANCES_PER_PERSONA]  ( /^[0-9]+$/ )
+ *
+ * The `:count` is REQUIRED (no bare ids), each reviewer-id may appear at most
+ * once, and there is no per-instance model syntax — model customization stays in
+ * `default_team` (the three YAML forms) or `--session-override`. Surrounding
+ * whitespace on the spec and on each entry/token is trimmed; that is hygiene,
+ * not leniency. Every entry expands to `count` instances named `{persona}-{i}`
+ * with the workspace default model applied, so `--team principal:2` resolves
+ * identically to `default_team: { principal: 2 }`.
+ *
+ * Note: this validates the spec's SHAPE, not reviewer existence — a persona id
+ * with no matching `references/reviewers/{id}.md` is a downstream concern (the
+ * spec may legitimately name a project-local custom reviewer).
+ *
+ * @param spec         The raw `--team` value, e.g. `"principal:2,architect:1"`.
+ * @param aliases      User-defined model aliases, for default-model expansion.
+ * @param defaultModel Workspace default model (alias-expanded), or null.
+ */
+export function parseTeamSpec(
+  spec: string,
+  aliases: Record<string, string> = {},
+  defaultModel: string | null = null,
+): ReviewerInstance[] {
+  const trimmed = spec.trim();
+  if (trimmed.length === 0) {
+    throw new Error(
+      "--team spec is empty; expected reviewer-id:count[,reviewer-id:count...]",
+    );
+  }
+
+  // The shorthand has no per-instance or per-team model syntax — only the
+  // workspace default applies — so the resolved model is identical for every
+  // entry. Resolve and vendor-safety-gate it ONCE here, not per iteration.
+  const model = resolveModel(null, null, aliases, defaultModel);
+  if (model !== null) assertSafeModelId(model, "--team");
+
+  const seen = new Set<string>();
+  const result: ReviewerInstance[] = [];
+
+  for (const rawEntry of trimmed.split(",")) {
+    const entry = rawEntry.trim();
+    if (entry.length === 0) {
+      throw new Error(
+        `--team has an empty entry (stray or trailing comma) in "${spec}"`,
+      );
+    }
+
+    const colon = entry.indexOf(":");
+    if (colon === -1) {
+      throw new Error(
+        `--team entry "${entry}" must be "reviewer-id:count" — the :count is required`,
+      );
+    }
+
+    const persona = entry.slice(0, colon).trim();
+    const countRaw = entry.slice(colon + 1).trim();
+
+    if (!REVIEWER_ID_PATTERN.test(persona)) {
+      throw new Error(
+        `--team reviewer id "${persona}" is invalid; expected lowercase letters, digits, and single hyphens (e.g. principal, martin-fowler)`,
+      );
+    }
+    if (seen.has(persona)) {
+      throw new Error(
+        `--team lists "${persona}" more than once; combine its instances into a single entry (e.g. ${persona}:2)`,
+      );
+    }
+    if (!/^[0-9]+$/.test(countRaw)) {
+      throw new Error(
+        `--team count for "${persona}" must be a positive integer (got "${countRaw}")`,
+      );
+    }
+    const count = Number(countRaw);
+    // The regex already excludes negatives and non-digits; this guard rejects 0.
+    if (count < 1) {
+      throw new Error(
+        `--team count for "${persona}" must be a positive integer (got ${count})`,
+      );
+    }
+    if (count > MAX_INSTANCES_PER_PERSONA) {
+      throw new Error(
+        `--team count for "${persona}" must be <= ${MAX_INSTANCES_PER_PERSONA} (got ${count})`,
+      );
+    }
+
+    seen.add(persona);
+
+    for (let i = 0; i < count; i++) {
+      result.push({
+        persona,
+        instance_index: i + 1,
+        name: `${persona}-${i + 1}`,
+        model,
+      });
+    }
+  }
+
   return result;
 }
