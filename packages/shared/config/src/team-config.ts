@@ -8,6 +8,9 @@
  *   2. `principal: { count: 2, model: claude-opus-4-7 }` — object
  *   3. `principal: [{ model: a }, { model: b, name: x }]` — list of instances
  *
+ * A persona may request at most `MAX_INSTANCES_PER_PERSONA` (1–50) instances in
+ * any form; an over-ceiling count is rejected at parse time, not allocated.
+ *
  * All three normalize to a single canonical `ReviewerInstance[]` shape that
  * downstream consumers (the dashboard, `ocr team resolve`, the CLI
  * command-runner) speak. Mixing forms within a single persona key is

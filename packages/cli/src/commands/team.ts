@@ -133,8 +133,8 @@ const resolveSubcommand = new Command("resolve")
           ? parseTeamSpec(options.team, aliases, defaultModel)
           : team;
 
-        // A --session-override still merges on top of the base — keeps the
-        // dashboard's override path composable with --team.
+        // Keep the dashboard's --session-override path composable with --team:
+        // it merges onto whichever base was chosen above.
         let override: ReviewerInstance[] | undefined;
         if (options.sessionOverride) {
           override = parseSessionOverride(options.sessionOverride);

@@ -395,6 +395,24 @@ describe("ocr team resolve — composed --team base + --session-override merge",
     expect(personaCount(team, "principal")).toBe(2); // from --team, untouched
     expect(team.find((i) => i.persona === "quality")?.model).toBe("claude-opus-4-7"); // overridden
   });
+
+  it("composes a --team base with a --session-override read from stdin", async () => {
+    const project = tracked(createInitializedProject());
+    writeConfigYaml(project, "default_team:\n  data: 3\n");
+
+    const override = JSON.stringify([
+      { persona: "security", instance_index: 1, name: "security-1", model: null },
+    ]);
+    const team = await resolveTeam(
+      project,
+      ["--team", "principal:2", "--session-override-stdin"],
+      { stdin: override },
+    );
+
+    expect(personaCount(team, "data")).toBe(0); // default_team ignored
+    expect(personaCount(team, "principal")).toBe(2); // from --team base
+    expect(personaCount(team, "security")).toBe(1); // merged in via stdin override
+  });
 });
 
 // ── 5. Human-readable output (no --json) ──
@@ -409,6 +427,20 @@ describe("ocr team resolve — human-readable output (no --json)", () => {
     expect(result.stdout).toContain("Resolved team composition");
     expect(result.stdout).toContain("principal-1");
     expect(result.stdout).toContain("(default)"); // no model set
+  });
+
+  it("renders the resolved model string in the table when one is set", async () => {
+    const project = tracked(createInitializedProject());
+    writeConfigYaml(
+      project,
+      "default_team:\n  principal: { count: 1, model: claude-opus-4-7 }\n",
+    );
+
+    const result = await spawnCli(["team", "resolve"], { cwd: project.dir });
+    expect(result.exitCode).toBe(0);
+    expect(result.stdout).toContain("principal-1");
+    expect(result.stdout).toContain("claude-opus-4-7"); // resolved model, not (default)
+    expect(result.stdout).not.toContain("(default)");
   });
 
   it("prints the empty-team message when nothing resolves", async () => {
