@@ -49,6 +49,18 @@ export type ParsedTeamConfig = {
 };
 
 /**
+ * Upper bound on instances a single persona may request, enforced by EVERY
+ * instance-producing path (the three `default_team` YAML forms and the `--team`
+ * shorthand). Without it a count like `principal:99999999999` passes the
+ * positive-integer gate and then drives an unbounded allocation loop that
+ * OOM-crashes the process — turning a typo or an AI-hallucinated `--team` spec
+ * into a DoS, the opposite of the strict-schema contract. 50 is far above any
+ * real review team; the cap exists to fail fast with a precise error, not to
+ * constrain legitimate use.
+ */
+export const MAX_INSTANCES_PER_PERSONA = 50;
+
+/**
  * Reads `.ocr/config.yaml` and parses the team composition.
  * Returns an empty team when the config or `default_team` is absent.
  */
@@ -136,6 +148,11 @@ function parseEntry(persona: string, entry: unknown): IntermediateInstance[] {
         `default_team.${persona}: count must be a positive integer (got ${entry})`,
       );
     }
+    if (entry > MAX_INSTANCES_PER_PERSONA) {
+      throw new Error(
+        `default_team.${persona}: count must be <= ${MAX_INSTANCES_PER_PERSONA} (got ${entry})`,
+      );
+    }
     return Array.from({ length: entry }, () => ({}));
   }
 
@@ -144,6 +161,11 @@ function parseEntry(persona: string, entry: unknown): IntermediateInstance[] {
     if (entry.length === 0) {
       throw new Error(
         `default_team.${persona}: list form must contain at least one instance`,
+      );
+    }
+    if (entry.length > MAX_INSTANCES_PER_PERSONA) {
+      throw new Error(
+        `default_team.${persona}: list form must contain <= ${MAX_INSTANCES_PER_PERSONA} instances (got ${entry.length})`,
       );
     }
     return entry.map((item, idx) => parseListItem(persona, idx, item));
@@ -169,6 +191,11 @@ function parseEntry(persona: string, entry: unknown): IntermediateInstance[] {
     if (typeof count !== "number" || !Number.isInteger(count) || count < 1) {
       throw new Error(
         `default_team.${persona}: count must be a positive integer (got ${String(count)})`,
+      );
+    }
+    if (count > MAX_INSTANCES_PER_PERSONA) {
+      throw new Error(
+        `default_team.${persona}: count must be <= ${MAX_INSTANCES_PER_PERSONA} (got ${count})`,
       );
     }
     const teamModel = readOptionalString(obj, "model", `default_team.${persona}.model`);
@@ -370,7 +397,7 @@ const REVIEWER_ID_PATTERN = /^[a-z0-9]+(?:-[a-z0-9]+)*$/;
  *   spec        := entry ( "," entry )*
  *   entry       := reviewer-id ":" count
  *   reviewer-id := /^[a-z0-9]+(?:-[a-z0-9]+)*$/   (matches reviewer filenames)
- *   count       := positive integer ( /^[0-9]+$/, >= 1 )
+ *   count       := integer in [1, MAX_INSTANCES_PER_PERSONA]  ( /^[0-9]+$/ )
  *
  * The `:count` is REQUIRED (no bare ids), each reviewer-id may appear at most
  * once, and there is no per-instance model syntax — model customization stays in
@@ -399,6 +426,12 @@ export function parseTeamSpec(
       "--team spec is empty; expected reviewer-id:count[,reviewer-id:count...]",
     );
   }
+
+  // The shorthand has no per-instance or per-team model syntax — only the
+  // workspace default applies — so the resolved model is identical for every
+  // entry. Resolve and vendor-safety-gate it ONCE here, not per iteration.
+  const model = resolveModel(null, null, aliases, defaultModel);
+  if (model !== null) assertSafeModelId(model, "--team");
 
   const seen = new Set<string>();
   const result: ReviewerInstance[] = [];
@@ -437,15 +470,19 @@ export function parseTeamSpec(
       );
     }
     const count = Number(countRaw);
+    // The regex already excludes negatives and non-digits; this guard rejects 0.
     if (count < 1) {
       throw new Error(
-        `--team count for "${persona}" must be >= 1 (got ${count})`,
+        `--team count for "${persona}" must be a positive integer (got ${count})`,
+      );
+    }
+    if (count > MAX_INSTANCES_PER_PERSONA) {
+      throw new Error(
+        `--team count for "${persona}" must be <= ${MAX_INSTANCES_PER_PERSONA} (got ${count})`,
       );
     }
 
     seen.add(persona);
-    const model = resolveModel(null, null, aliases, defaultModel);
-    if (model !== null) assertSafeModelId(model, `--team ${persona}`);
 
     for (let i = 0; i < count; i++) {
       result.push({

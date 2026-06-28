@@ -1,6 +1,7 @@
 import { describe, it, expect } from "vitest";
 import {
   assertSafeModelId,
+  MAX_INSTANCES_PER_PERSONA,
   parseTeamConfigYaml,
   parseTeamSpec,
   resolveTeamComposition,
@@ -310,10 +311,27 @@ describe("parseTeamSpec — `--team` session shorthand", () => {
   });
 
   it("rejects a non-integer or non-positive count", () => {
-    expect(() => parseTeamSpec("principal:0")).toThrow(/>= 1/);
+    // All four phrase the one rule identically ("positive integer"), matching
+    // the YAML parseEntry vocabulary.
+    expect(() => parseTeamSpec("principal:0")).toThrow(/positive integer/);
     expect(() => parseTeamSpec("principal:two")).toThrow(/positive integer/);
     expect(() => parseTeamSpec("principal:1.5")).toThrow(/positive integer/);
     expect(() => parseTeamSpec("principal:-1")).toThrow(/positive integer/);
+  });
+
+  it("rejects a count above the per-persona ceiling (the OOM/DoS guard)", () => {
+    // The ceiling, not the allocation loop, must reject these — a count that
+    // passes the positive-integer gate but is absurd would otherwise OOM.
+    expect(() => parseTeamSpec(`principal:${MAX_INSTANCES_PER_PERSONA + 1}`)).toThrow(
+      new RegExp(`<= ${MAX_INSTANCES_PER_PERSONA}`),
+    );
+    expect(() => parseTeamSpec("principal:99999999999")).toThrow(
+      new RegExp(`<= ${MAX_INSTANCES_PER_PERSONA}`),
+    );
+    // The exact ceiling is allowed.
+    expect(parseTeamSpec(`principal:${MAX_INSTANCES_PER_PERSONA}`)).toHaveLength(
+      MAX_INSTANCES_PER_PERSONA,
+    );
   });
 
   it("rejects an invalid reviewer id", () => {
@@ -333,7 +351,7 @@ describe("parseTeamSpec — `--team` session shorthand", () => {
 
   it("rejects a non-vendor-safe resolved default model", () => {
     expect(() => parseTeamSpec("principal:1", {}, "sonnet|whoami")).toThrow(
-      /--team principal/,
+      /--team/,
     );
   });
 });

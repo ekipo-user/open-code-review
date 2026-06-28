@@ -262,6 +262,21 @@ describe("ocr team resolve --team — custom team (replaces default_team)", () =
     expect(result.stderr).toMatch(/:count is required/);
     expect(result.stdout.trim()).toBe("");
   });
+
+  it("rejects an absurd count at the ceiling instead of OOM-ing (DoS guard)", async () => {
+    const project = tracked(createInitializedProject());
+    writeConfigYaml(project, "default_team:\n  principal: 1\n");
+
+    // Without the ceiling this drives an unbounded allocation loop and crashes
+    // the process; the strict schema must reject it with a clean exit 1.
+    const result = await spawnCli(
+      ["team", "resolve", "--team", "principal:99999999999", "--json"],
+      { cwd: project.dir },
+    );
+    expect(result.exitCode).toBe(1);
+    expect(result.stderr).toMatch(/<= \d+/);
+    expect(result.stdout.trim()).toBe("");
+  });
 });
 
 // ── 3. SESSION override: `--session-override` MERGES onto the base ──
